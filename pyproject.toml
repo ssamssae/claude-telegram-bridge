@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-telegram-bridge"
+version = "0.1.0"
+description = "Control an existing interactive Claude Code session from Telegram."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Claude Telegram Bridge contributors" }
+]
+keywords = ["claude", "telegram", "tmux", "bridge", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Communications :: Chat",
+  "Topic :: Software Development"
+]
+dependencies = []
+
+[project.scripts]
+claude-telegram-bridge = "claude_telegram_bridge:main"
+
+[tool.setuptools]
+py-modules = ["claude_telegram_bridge"]
