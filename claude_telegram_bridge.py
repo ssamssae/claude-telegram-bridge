@@ -609,6 +609,7 @@ class Config:
     session_ttl_seconds: int
     egress_ttl_seconds: int
     turn_sequence_fallback_seconds: float
+    active_turn_stale_seconds: float
     transcript_stable_seconds: float
     composer_clear_retries: int
     injection_verify_timeout: float
@@ -661,6 +662,7 @@ class Config:
             session_ttl_seconds=int_env("CLB_SESSION_TTL_SECONDS", 86400, minimum=60),
             egress_ttl_seconds=int_env("CLB_EGRESS_TTL_SECONDS", 900, minimum=60),
             turn_sequence_fallback_seconds=float(env("CLB_TURN_SEQUENCE_FALLBACK_SECONDS", "7200") or "7200"),
+            active_turn_stale_seconds=float(env("CLB_ACTIVE_TURN_STALE_SECONDS", "900") or "900"),
             transcript_stable_seconds=float(env("CLB_TRANSCRIPT_STABLE_SECONDS", "1.0") or "1.0"),
             composer_clear_retries=int_env("CLB_COMPOSER_CLEAR_RETRIES", 2, minimum=1),
             injection_verify_timeout=float(env("CLB_INJECTION_VERIFY_TIMEOUT", "20") or "20"),
@@ -1524,6 +1526,7 @@ class Bridge:
                 self.typing_stop = None
 
     def busy_state(self) -> str:
+        self.release_stale_active_turn_if_idle()
         with self.lock:
             if self.active_turn:
                 return "generating"
@@ -1533,7 +1536,11 @@ class Bridge:
                 if time.time() - binding.transcript_path.stat().st_mtime < self.config.transcript_stable_seconds:
                     return "generating"
             except OSError:
-                return "hook_blocked"
+                with self.lock:
+                    if self.session_binding == binding:
+                        self.session_binding = None
+                        self.session_identity = None
+                        self.session_pos = 0
         try:
             screen = self.repl.capture_pane(80)
         except Exception:
@@ -1544,7 +1551,7 @@ class Bridge:
             return "hook_blocked"
         return "idle"
 
-    def session_occupied_excluding_active(self) -> bool:
+    def session_occupied_excluding_active(self, *, missing_transcript_busy: bool = True) -> bool:
         """Busy signal that ignores our own active_turn.
 
         busy_state() short-circuits to "generating" whenever active_turn is set,
@@ -1561,7 +1568,8 @@ class Bridge:
                 if time.time() - binding.transcript_path.stat().st_mtime < self.config.transcript_stable_seconds:
                     return True
             except OSError:
-                return True
+                if missing_transcript_busy:
+                    return True
         try:
             screen = self.repl.capture_pane(80)
         except Exception:  # noqa: BLE001
@@ -1571,6 +1579,35 @@ class Bridge:
         if screen_has_hook_block(screen):
             return True
         return False
+
+    def release_stale_active_turn_if_idle(self) -> bool:
+        ttl = self.config.active_turn_stale_seconds
+        if ttl <= 0:
+            return False
+        with self.lock:
+            active = self.active_turn
+        if not active or not active.user_uuid:
+            return False
+        if active.pending_answer or active.pending_assistant_uuid or active.pending_outbox_key or active.send_in_progress:
+            return False
+        reference_at = max(active.user_seen_at or 0.0, active.injected_at or 0.0)
+        age = time.time() - reference_at
+        if age < ttl:
+            return False
+        if self.session_occupied_excluding_active(missing_transcript_busy=False):
+            return False
+
+        item = self.queue_item_for_active(active)
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            self.active_turn = None
+        self.stop_typing()
+        self.queue.append_status(item, "stale_released", age_seconds=int(max(age, 0)))
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("STALE", f"released active_turn queue={active.queue_id[:10]} age={int(max(age, 0))}s")
+        return True
 
     def format_metadata(self, metadata: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -2465,6 +2502,11 @@ class Bridge:
                     log("JSONL", f"watch error: {message}")
                     self.last_jsonl_watch_error = message
                     self.last_jsonl_watch_error_log_at = now
+                if isinstance(exc, FileNotFoundError):
+                    with self.lock:
+                        self.session_binding = None
+                        self.session_identity = None
+                        self.session_pos = 0
             self.stop_event.wait(0.5)
 
     def telegram_loop(self) -> None:

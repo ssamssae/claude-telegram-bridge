@@ -95,7 +95,12 @@ CLB_TOKEN_FILE="$HOME/.config/claude-telegram-bridge/token.json"
 CLB_CHAT_ID="123456789"
 CLB_TOKEN_REGISTRY="$HOME/.config/claude-telegram-bridge/token-registry.json"
 CLB_STATE_DIR="$HOME/.local/state/claude-telegram-bridge"
+CLB_ACTIVE_TURN_STALE_SECONDS=900
 ```
+
+`CLB_ACTIVE_TURN_STALE_SECONDS` releases a previously observed Telegram turn
+when Claude is idle but no final reply was captured, so later queued messages
+can continue instead of being blocked behind a stale active turn.
 
 5. Store the token locally:
 
