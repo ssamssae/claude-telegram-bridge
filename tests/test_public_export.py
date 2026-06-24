@@ -213,6 +213,65 @@ class PublicExportTest(unittest.TestCase):
             self.assertEqual(len(repl.pasted), 1)
             self.assertIn("new message", repl.pasted[0])
 
+    def test_sidecar_binding_skips_missing_transcript_even_with_session_id(self):
+        mod = self.load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = mod.Config(
+                node="test",
+                emoji="🤖",
+                token_file=root / "token.json",
+                chat_id="1234",
+                state_dir=root,
+                tmux_bin="tmux",
+                tmux_socket="claude",
+                tmux_session="claude",
+                telegram_chunk=4096,
+                poll_timeout=1,
+                typing_max_seconds=30,
+                audio_transcribe_cmd=None,
+                audio_transcribe_timeout=10,
+                start_at_end=False,
+                state_path=root / "state.json",
+                offset_file=root / "offset",
+                pid_file=root / "pid",
+                queue_path=root / "queue.jsonl",
+                outbox_path=root / "outbox.json",
+                quarantine_path=root / "quarantine.jsonl",
+                session_sidecar_path=root / "sessions.json",
+                egress_sidecar_path=root / "egress.json",
+                token_registry_path=root / "registry.json",
+                token_owner="claude-telegram-bridge",
+                expected_consumer="test",
+                expected_host="test-host",
+                session_ttl_seconds=3600,
+                egress_ttl_seconds=900,
+                turn_sequence_fallback_seconds=3600,
+                active_turn_stale_seconds=900,
+                transcript_stable_seconds=0.1,
+                composer_clear_retries=1,
+                injection_verify_timeout=1.0,
+                send_retry_seconds=0.0,
+                send_max_attempts=3,
+                queue_compact_max_events=1000,
+                outbox_max_entries=1000,
+            )
+            missing = root / "missing.jsonl"
+            existing = root / "existing.jsonl"
+            existing.write_text("", encoding="utf-8")
+            cfg.session_sidecar_path.write_text(
+                '{"sessions":{'
+                f'"missing":{{"transcript_path":"{missing}","sessionId":"missing-sess","pane_pid":123,"updated_at":999}},'
+                f'"existing":{{"transcript_path":"{existing}","sessionId":"existing-sess","pane_pid":123,"updated_at":1}}'
+                "}}",
+                encoding="utf-8",
+            )
+
+            matches = mod.SessionBinder(cfg, repl=object())._resolve_from_sidecar(123)
+
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0].session_id, "existing-sess")
+
 
 if __name__ == "__main__":
     unittest.main()

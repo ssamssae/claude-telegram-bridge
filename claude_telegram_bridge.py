@@ -1049,9 +1049,9 @@ class SessionBinder:
                 continue
             updated_at = float(item.get("updated_at") or 0)
             session_id = str(item.get("sessionId") or item.get("session_id") or "")
+            if not transcript.exists():
+                continue
             if not session_id:
-                if not transcript.exists():
-                    continue
                 session_id = session_id_from_transcript(transcript)
             binding = ClaudeSessionBinding(transcript.resolve(), session_id, pane_pid)
             fresh = bool(updated_at and time.time() - updated_at <= self.config.session_ttl_seconds)
@@ -1086,6 +1086,8 @@ class SessionBinder:
             if not raw_transcript:
                 continue
             transcript = Path(raw_transcript).expanduser()
+            if not transcript.exists():
+                continue
             session_id = str(item.get("sessionId") or item.get("session_id") or transcript.stem)
             matches.append((updated_at, ClaudeSessionBinding(transcript, session_id, pane_pid)))
         matches.sort(key=lambda item: item[0], reverse=True)
