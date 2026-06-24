@@ -1,11 +1,13 @@
 import importlib.util
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
 
 class PublicExportTest(unittest.TestCase):
-    def test_imports_public_bridge(self):
+    def load_module(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
         spec = importlib.util.spec_from_file_location("claude_telegram_bridge", path)
         self.assertIsNotNone(spec)
@@ -13,8 +15,101 @@ class PublicExportTest(unittest.TestCase):
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
+        return mod
+
+    def test_imports_public_bridge(self):
+        mod = self.load_module()
         self.assertEqual(mod.node_defaults()[0], "claude")
         self.assertEqual(mod.BRIDGE_OWNER, "claude-telegram-bridge")
+
+    def test_title_content_copy_payload_splits(self):
+        mod = self.load_module()
+        title = "제목: 클로드를 텔레그램에 연결했다 | 폰에서 Claude Code 자동화 실행하기"
+        content = "내용: Claude Telegram Bridge로 Claude Code 세션을 텔레그램에서 직접 호출합니다."
+
+        self.assertTrue(mod.is_copy_payload_message(title))
+        self.assertTrue(mod.is_copy_payload_message(content))
+        self.assertEqual(mod.split_copy_payload_messages(f"{title}\n\n{content}"), [title, content])
+
+    def test_title_content_copy_payload_send_path_suppresses_reasoning_mirror(self):
+        mod = self.load_module()
+
+        class FakeTelegram:
+            def __init__(self):
+                self.sent = []
+
+            def send(self, text):
+                self.sent.append(text)
+                return [100 + len(self.sent)]
+
+            def send_typing(self):
+                return None
+
+        class FakeRepl:
+            def capture_pane(self, lines=80):
+                return ""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            cfg = mod.Config(
+                node="test",
+                emoji="🤖",
+                token_file=root / "token.json",
+                chat_id="1234",
+                state_dir=root,
+                tmux_bin="tmux",
+                tmux_socket="claude",
+                tmux_session="claude",
+                telegram_chunk=4096,
+                poll_timeout=1,
+                typing_max_seconds=30,
+                audio_transcribe_cmd=None,
+                audio_transcribe_timeout=10,
+                start_at_end=False,
+                state_path=root / "state.json",
+                offset_file=root / "offset",
+                pid_file=root / "pid",
+                queue_path=root / "queue.jsonl",
+                outbox_path=root / "outbox.json",
+                quarantine_path=root / "quarantine.jsonl",
+                session_sidecar_path=root / "sessions.json",
+                egress_sidecar_path=root / "egress.json",
+                token_registry_path=root / "registry.json",
+                token_owner="claude-telegram-bridge",
+                expected_consumer="test",
+                expected_host="test-host",
+                session_ttl_seconds=3600,
+                egress_ttl_seconds=900,
+                turn_sequence_fallback_seconds=3600,
+                transcript_stable_seconds=0.1,
+                composer_clear_retries=1,
+                injection_verify_timeout=1.0,
+                send_retry_seconds=0.0,
+                send_max_attempts=3,
+                queue_compact_max_events=1000,
+                outbox_max_entries=1000,
+            )
+            tg = FakeTelegram()
+            bridge = mod.Bridge(cfg, tg, repl=FakeRepl(), token="123:abc")
+            active = mod.ActiveTurn(
+                queue_id="q1",
+                update_id=1,
+                message_id=1,
+                nonce="clb-" + "a" * 32,
+                injected_at=time.time(),
+                text="제목 내용 따로",
+                pending_reasoning="중간 사고 요약",
+                send_attempts=1,
+                send_in_progress=True,
+            )
+            bridge.active_turn = active
+            title = "제목: 클로드를 텔레그램에 연결했다 | 폰에서 Claude Code 자동화 실행하기"
+            content = "내용: Claude Telegram Bridge로 Claude Code 세션을 텔레그램에서 직접 호출합니다."
+
+            bridge.send_claimed_active_answer(active, "a-final", f"{title}\n\n{content}", "outbox-key")
+
+        self.assertEqual(tg.sent, [title, content])
+        self.assertTrue(all(not message.startswith(mod.REASONING_HEADER) for message in tg.sent))
 
 
 if __name__ == "__main__":

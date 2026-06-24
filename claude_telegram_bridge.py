@@ -338,7 +338,34 @@ def is_copy_payload_message(text: str) -> bool:
     if not body:
         return False
     first_line = body.splitlines()[0].strip()
-    return first_line == "/goal" or first_line.startswith("/goal ") or first_line.startswith("상세스펙:")
+    return (
+        first_line == "/goal"
+        or first_line.startswith("/goal ")
+        or first_line.startswith("상세스펙:")
+        or first_line.startswith("상세 스펙:")
+        or first_line.startswith("상세설명:")
+        or first_line.startswith("상세 설명:")
+        or re.match(r"^제목\s*:", first_line) is not None
+        or re.match(r"^(내용|본문)\s*:", first_line) is not None
+    )
+
+
+def split_copy_payload_messages(text: str) -> list[str]:
+    body = strip_node_emoji_header(text).strip()
+    if not is_copy_payload_message(body):
+        return []
+    split_re = re.compile(
+        r"\n(?=(?:/goal(?:\s|$)|상세\s*스펙:|상세\s*설명:|제목\s*:|(?:내용|본문)\s*:))"
+    )
+    starts = [0, *[match.start() + 1 for match in split_re.finditer(body)]]
+    starts = sorted(set(starts))
+    parts: list[str] = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(body)
+        part = body[start:end].strip()
+        if part and is_copy_payload_message(part):
+            parts.append(part)
+    return parts or [body]
 
 
 def copy_payload_dedup_key(text: str) -> str:
@@ -2201,8 +2228,18 @@ class Bridge:
         key: str,
     ) -> None:
         send_error = "telegram send failed"
+        copy_payload_messages = split_copy_payload_messages(answer)
         try:
-            sent_ids = self.telegram.send(answer)
+            if copy_payload_messages:
+                sent_ids = []
+                for message in copy_payload_messages:
+                    part_ids = self.telegram.send(message)
+                    if part_ids is None:
+                        sent_ids = None
+                        break
+                    sent_ids.extend(part_ids)
+            else:
+                sent_ids = self.telegram.send(answer)
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
             sent_ids = None
@@ -2245,7 +2282,7 @@ class Bridge:
         # 🧠 reasoning mirror — sent once, right after the deduped final answer
         # (sibling of codex-repl-telegram-bridge's 🧠 코덱스 사고). Empty/no-thinking
         # turns produce no block. Failures here never affect answer delivery.
-        reasoning = active.pending_reasoning
+        reasoning = None if copy_payload_messages else active.pending_reasoning
         active.pending_reasoning = None
         if reasoning:
             mirror = format_reasoning_mirror(reasoning)
