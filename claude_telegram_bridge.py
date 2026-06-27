@@ -44,6 +44,31 @@ BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
 NONCE_RE = re.compile(r"clb-[0-9a-f]{24,64}")
 REASONING_HEADER = "\U0001f9e0 클로드 사고"
 REASONING_MIRROR_LIMIT = 3500
+# ⚙️ flow mirror — relays intermediate tool_use steps to Telegram in real time so
+# the user can see the work flow between final answers, not just endpoints. Default
+# OFF (flag-file gated, runtime-toggleable, no restart). Created per-node only.
+FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
+FLOW_MIRROR_LIMIT = 1500
+FLOW_MIRROR_FLAG = os.path.expanduser("~/.choso/claude-bridge-flow-mirror.on")
+# ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
+# cards read like the Korean Codex cards. Unmapped tools keep their original name.
+TOOL_LABEL_KO = {
+    "Bash": "실행",
+    "Read": "읽기",
+    "Write": "작성",
+    "Edit": "편집",
+    "MultiEdit": "편집",
+    "NotebookEdit": "노트북편집",
+    "Grep": "검색",
+    "Glob": "파일찾기",
+    "Task": "위임",
+    "Agent": "위임",
+    "Skill": "스킬",
+    "ToolSearch": "도구검색",
+    "TodoWrite": "할일",
+    "WebFetch": "웹가져오기",
+    "WebSearch": "웹검색",
+}
 APPROVAL_WAIT_RE = re.compile(
     r"\b(approval|do you want|would you like|allow(?:\s+this|\s+command)?|"
     r"approve|permission prompt)\b",
@@ -53,6 +78,10 @@ HOOK_BLOCK_RE = re.compile(
     r"\b(hook\s+(?:blocked|denied|failed)|blocked\s+by\s+hook|"
     r"permission\s+denied\s+by\s+hook|pretooluse\s+(?:blocked|denied|failed))\b",
     re.IGNORECASE,
+)
+ACTIVE_WORK_RE = re.compile(
+    r"(?im)^\s*(?:[✶✻✳*]\s*)?(?:working|germinating|thinking|running|processing)\b"
+    r"|esc\s+to\s+interrupt|still\s+thinking",
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
@@ -290,6 +319,50 @@ def format_reasoning_mirror(text: str) -> str:
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
+def flow_mirror_enabled() -> bool:
+    """⚙️ flow mirror toggle — flag-file gated so it can be turned on/off at
+    runtime without restarting the bridge. Default OFF (flag absent)."""
+    return os.path.exists(FLOW_MIRROR_FLAG)
+
+
+def _tool_detail(name: str, inp: Any) -> str:
+    """Pick the most meaningful single-line descriptor from a tool_use input."""
+    if not isinstance(inp, dict):
+        return ""
+    for key in ("description", "file_path", "path", "command", "query", "url", "pattern", "prompt", "skill"):
+        val = inp.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip().splitlines()[0][:120]
+    return ""
+
+
+def tool_label(name: str) -> str:
+    """⚙️ flow mirror — Korean action label for a harness tool name; unmapped
+    tools keep their original name."""
+    return TOOL_LABEL_KO.get(name, name)
+
+
+def content_tool_summary(content: Any) -> str:
+    """Compact one-line-per-tool summary of tool_use blocks in an assistant
+    message, for the ⚙️ flow mirror. Returns "" when no tool_use present
+    (e.g. thinking-only intermediate records produce no flow message)."""
+    if not isinstance(content, list):
+        return ""
+    lines: list[str] = []
+    for item in content:
+        if not (isinstance(item, dict) and item.get("type") == "tool_use"):
+            continue
+        name = str(item.get("name") or "tool")
+        detail = _tool_detail(name, item.get("input"))
+        lines.append(f"• {tool_label(name)}{' · ' + detail if detail else ''}")
+    return "\n".join(lines).strip()
+
+
+def format_flow_mirror(text: str) -> str:
+    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
+    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+
+
 def screen_status_region(screen: str, tail_lines: int = 16) -> str:
     """Return the current terminal status area, excluding stale scrollback.
 
@@ -307,6 +380,10 @@ def screen_has_approval_wait(screen: str) -> bool:
 
 def screen_has_hook_block(screen: str) -> bool:
     return bool(HOOK_BLOCK_RE.search(screen_status_region(screen)))
+
+
+def screen_has_active_work(screen: str) -> bool:
+    return bool(ACTIVE_WORK_RE.search(screen_status_region(screen)))
 
 
 def strip_inline_node_emoji_header(text: str) -> str:
@@ -523,9 +600,9 @@ class TelegramClient:
 
     def with_emoji_prefix(self, text: str) -> str:
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
-        if first_line in NODE_EMOJI_LINES:
+        if first_line == self.emoji:
             return text
-        text = strip_inline_node_emoji_header(text)
+        text = strip_node_emoji_header(text)
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:
@@ -603,14 +680,17 @@ class Config:
     session_sidecar_path: Path
     egress_sidecar_path: Path
     token_registry_path: Path
+    claude_projects_dir: Path
     token_owner: str
     expected_consumer: str
     expected_host: str
     session_ttl_seconds: int
     egress_ttl_seconds: int
+    pending_transcript_seconds: int
     turn_sequence_fallback_seconds: float
     active_turn_stale_seconds: float
     transcript_stable_seconds: float
+    latest_transcript_fallback_seconds: float
     composer_clear_retries: int
     injection_verify_timeout: float
     send_retry_seconds: float
@@ -656,14 +736,19 @@ class Config:
             token_registry_path=Path(
                 env("CLB_TOKEN_REGISTRY", "~/.config/claude-telegram-bridge/token-registry.json") or ""
             ).expanduser(),
+            claude_projects_dir=Path(env("CLB_CLAUDE_PROJECTS_DIR", "~/.claude/projects") or "").expanduser(),
             token_owner=env("CLB_TOKEN_OWNER", BRIDGE_OWNER) or BRIDGE_OWNER,
             expected_consumer=env("CLB_EXPECTED_CONSUMER", node) or node,
             expected_host=env("CLB_EXPECTED_HOST", os.uname().nodename) or os.uname().nodename,
             session_ttl_seconds=int_env("CLB_SESSION_TTL_SECONDS", 86400, minimum=60),
             egress_ttl_seconds=int_env("CLB_EGRESS_TTL_SECONDS", 900, minimum=60),
+            pending_transcript_seconds=int_env("CLB_PENDING_TRANSCRIPT_SECONDS", 300, minimum=10),
             turn_sequence_fallback_seconds=float(env("CLB_TURN_SEQUENCE_FALLBACK_SECONDS", "7200") or "7200"),
             active_turn_stale_seconds=float(env("CLB_ACTIVE_TURN_STALE_SECONDS", "900") or "900"),
             transcript_stable_seconds=float(env("CLB_TRANSCRIPT_STABLE_SECONDS", "1.0") or "1.0"),
+            latest_transcript_fallback_seconds=float(
+                env("CLB_LATEST_TRANSCRIPT_FALLBACK_SECONDS", "1800") or "1800"
+            ),
             composer_clear_retries=int_env("CLB_COMPOSER_CLEAR_RETRIES", 2, minimum=1),
             injection_verify_timeout=float(env("CLB_INJECTION_VERIFY_TIMEOUT", "20") or "20"),
             send_retry_seconds=float(env("CLB_SEND_RETRY_SECONDS", "5") or "5"),
@@ -869,6 +954,10 @@ class ClaudeRepl:
         out = self.tmux("display-message", "-p", "-t", self.resolve_pane_target(), "#{pane_tty}")
         return out.stdout.strip()
 
+    def pane_current_path(self) -> str:
+        out = self.tmux("display-message", "-p", "-t", self.resolve_pane_target(), "#{pane_current_path}")
+        return out.stdout.strip()
+
     def capture_pane(self, lines: int = 80) -> str:
         out = self.tmux(
             "capture-pane",
@@ -998,6 +1087,13 @@ def session_id_from_transcript(path: Path) -> str:
     return path.stem
 
 
+def claude_project_slug(path: Path) -> str:
+    resolved = str(path.expanduser().resolve())
+    if resolved == "/":
+        return "-"
+    return resolved.replace("/", "-")
+
+
 class SessionBinder:
     def __init__(self, config: Config, repl: ClaudeRepl) -> None:
         self.config = config
@@ -1022,7 +1118,15 @@ class SessionBinder:
                 return tty_fallback[0]
             if len(tty_fallback) > 1:
                 raise RuntimeError("ambiguous transcript fallback for tmux pane tty; refusing latest-jsonl guess")
-            raise RuntimeError("no SessionStart sidecar entry for tmux pane; proc-fd and pane-tty fallback found none")
+            latest_fallback = self._resolve_from_latest_project_transcript(pane_pid)
+            if len(latest_fallback) == 1:
+                self._record_sidecar(latest_fallback[0], "latest-project-jsonl-fallback")
+                return latest_fallback[0]
+            if len(latest_fallback) > 1:
+                raise RuntimeError("ambiguous recent project transcript fallback for tmux pane; refusing latest-jsonl guess")
+            raise RuntimeError(
+                "no SessionStart sidecar entry for tmux pane; proc-fd, pane-tty, and latest-project-jsonl fallback found none"
+            )
         raise RuntimeError("ambiguous transcript fallback for tmux pane; refusing latest-jsonl guess")
 
     def _resolve_from_sidecar(self, pane_pid: int) -> list[ClaudeSessionBinding]:
@@ -1035,7 +1139,8 @@ class SessionBinder:
         else:
             values = []
 
-        scored_matches: list[tuple[bool, float, ClaudeSessionBinding]] = []
+        scored_matches: list[tuple[bool, float, float, ClaudeSessionBinding]] = []
+        now = time.time()
         for item in values:
             transcript_raw = str(item.get("transcript_path") or "")
             if not transcript_raw:
@@ -1051,15 +1156,19 @@ class SessionBinder:
             session_id = str(item.get("sessionId") or item.get("session_id") or "")
             if not transcript.exists():
                 continue
+            try:
+                transcript_mtime = transcript.stat().st_mtime
+            except OSError:
+                continue
             if not session_id:
                 session_id = session_id_from_transcript(transcript)
             binding = ClaudeSessionBinding(transcript.resolve(), session_id, pane_pid)
-            fresh = bool(updated_at and time.time() - updated_at <= self.config.session_ttl_seconds)
-            scored_matches.append((fresh, updated_at, binding))
-        scored_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        if scored_matches and scored_matches[0][1] > 0:
-            return [scored_matches[0][2]]
-        return [item[2] for item in scored_matches]
+            fresh = bool(updated_at and now - updated_at <= self.config.session_ttl_seconds)
+            scored_matches.append((fresh, transcript_mtime, updated_at, binding))
+        scored_matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        if scored_matches and scored_matches[0][2] > 0:
+            return [scored_matches[0][3]]
+        return [item[3] for item in scored_matches]
 
     def _resolve_fresh_sidecar_metadata(self, pane_pid: int) -> list[ClaudeSessionBinding]:
         payload = read_json(self.config.session_sidecar_path) or {}
@@ -1086,7 +1195,7 @@ class SessionBinder:
             if not raw_transcript:
                 continue
             transcript = Path(raw_transcript).expanduser()
-            if not transcript.exists():
+            if not transcript.exists() and time.time() - updated_at > self.config.pending_transcript_seconds:
                 continue
             session_id = str(item.get("sessionId") or item.get("session_id") or transcript.stem)
             matches.append((updated_at, ClaudeSessionBinding(transcript, session_id, pane_pid)))
@@ -1107,6 +1216,30 @@ class SessionBinder:
             return []
         candidates = transcripts_from_process_fds(pids_attached_to_tty(pane_tty))
         return self._bindings_from_transcript_candidates(candidates, pane_pid)
+
+    def _resolve_from_latest_project_transcript(self, pane_pid: int) -> list[ClaudeSessionBinding]:
+        try:
+            pane_cwd = self.repl.pane_current_path()
+        except Exception:
+            return []
+        if not pane_cwd:
+            return []
+        project_dir = self.config.claude_projects_dir / claude_project_slug(Path(pane_cwd))
+        try:
+            candidates = [path for path in project_dir.glob("*.jsonl") if path.is_file()]
+        except OSError:
+            return []
+        cutoff = time.time() - max(1.0, self.config.latest_transcript_fallback_seconds)
+        recent: list[Path] = []
+        for path in candidates:
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    recent.append(path.resolve())
+            except OSError:
+                continue
+        if len(recent) != 1:
+            return self._bindings_from_transcript_candidates(set(recent), pane_pid) if len(recent) > 1 else []
+        return self._bindings_from_transcript_candidates(set(recent), pane_pid)
 
     def _bindings_from_transcript_candidates(
         self,
@@ -1551,6 +1684,8 @@ class Bridge:
             return "approval_wait"
         if screen_has_hook_block(screen):
             return "hook_blocked"
+        if screen_has_active_work(screen):
+            return "generating"
         return "idle"
 
     def session_occupied_excluding_active(self, *, missing_transcript_busy: bool = True) -> bool:
@@ -1579,6 +1714,8 @@ class Bridge:
         if screen_has_approval_wait(screen):
             return True
         if screen_has_hook_block(screen):
+            return True
+        if screen_has_active_work(screen):
             return True
         return False
 
@@ -2032,6 +2169,12 @@ class Bridge:
     def drain_queue(self) -> None:
         state = self.busy_state()
         if state != "idle":
+            # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
+            # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
+            # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 아니키 "백그라운드 작업일 때도
+            # 타이핑"). active typing 루프(begin_typing)가 이미 돌면 중복 안 쏨.
+            if self.typing_stop is None:
+                self.telegram.send_typing()
             log("BUSY", f"skip inject state={state}")
             return
         with self.lock:
@@ -2412,6 +2555,18 @@ class Bridge:
             self.append_reasoning(active, content_text(content))
 
         if stop_reason != "end_turn":
+            # ⚙️ flow mirror — relay intermediate tool_use steps in real time when
+            # the flag is on. Scoped to the active turn (nonce chain) already, and
+            # fully non-fatal: failures here never affect final answer delivery.
+            if flow_mirror_enabled():
+                summary = content_tool_summary(content)
+                if summary:
+                    mirror = format_flow_mirror(summary)
+                    try:
+                        self.telegram.send(mirror)
+                        log("SEND", f"sent flow mirror nonce={active.nonce} len={len(mirror)}")
+                    except Exception as exc:  # noqa: BLE001
+                        log("SEND", f"flow mirror send failed (non-fatal): {exc}")
             return
         if record.get("isSidechain") is not False:
             return

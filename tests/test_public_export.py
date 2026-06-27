@@ -89,6 +89,9 @@ class PublicExportTest(unittest.TestCase):
                 send_max_attempts=3,
                 queue_compact_max_events=1000,
                 outbox_max_entries=1000,
+                claude_projects_dir=root,
+                pending_transcript_seconds=300,
+                latest_transcript_fallback_seconds=120.0,
             )
             tg = FakeTelegram()
             bridge = mod.Bridge(cfg, tg, repl=FakeRepl(), token="123:abc")
@@ -180,6 +183,9 @@ class PublicExportTest(unittest.TestCase):
                 send_max_attempts=3,
                 queue_compact_max_events=1000,
                 outbox_max_entries=1000,
+                claude_projects_dir=root,
+                pending_transcript_seconds=300,
+                latest_transcript_fallback_seconds=120.0,
             )
             repl = FakeRepl()
             bridge = mod.Bridge(cfg, FakeTelegram(), repl=repl, token="123:abc")
@@ -255,6 +261,9 @@ class PublicExportTest(unittest.TestCase):
                 send_max_attempts=3,
                 queue_compact_max_events=1000,
                 outbox_max_entries=1000,
+                claude_projects_dir=root,
+                pending_transcript_seconds=300,
+                latest_transcript_fallback_seconds=120.0,
             )
             missing = root / "missing.jsonl"
             existing = root / "existing.jsonl"
