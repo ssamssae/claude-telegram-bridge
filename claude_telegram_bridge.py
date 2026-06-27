@@ -625,6 +625,10 @@ class TelegramClient:
                 message_ids.append(int(result["message_id"]))
         return message_ids
 
+    def edit(self, message_id: int, text: str) -> None:
+        # ⚙️ flow mirror edit-in-place — update one card instead of sending many.
+        self.call("editMessageText", chat_id=self.chat_id, message_id=message_id, text=text)
+
 
 @dataclass(frozen=True)
 class SessionIdentity:
@@ -824,6 +828,8 @@ class ActiveTurn:
     send_in_progress: bool = False
     pending_reasoning: str | None = None  # transient: 🧠 mirror text for this turn (not persisted)
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
+    flow_message_id: int = 0  # transient: telegram message id of this turn's ⚙️ flow card (edit-in-place)
+    flow_body: str = ""  # transient: accumulated flow lines for this turn's single card
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -2558,15 +2564,29 @@ class Bridge:
             # ⚙️ flow mirror — relay intermediate tool_use steps in real time when
             # the flag is on. Scoped to the active turn (nonce chain) already, and
             # fully non-fatal: failures here never affect final answer delivery.
+            # Edit-in-place: accumulate this turn's steps into ONE growing card
+            # (edit the same message) instead of one card per tool-use message.
             if flow_mirror_enabled():
                 summary = content_tool_summary(content)
                 if summary:
-                    mirror = format_flow_mirror(summary)
-                    try:
-                        self.telegram.send(mirror)
-                        log("SEND", f"sent flow mirror nonce={active.nonce} len={len(mirror)}")
-                    except Exception as exc:  # noqa: BLE001
-                        log("SEND", f"flow mirror send failed (non-fatal): {exc}")
+                    candidate = f"{active.flow_body}\n{summary}".strip() if active.flow_body else summary
+                    if not active.flow_message_id or len(candidate) > FLOW_MIRROR_LIMIT:
+                        # first card of the turn, or overflow -> start a fresh card
+                        active.flow_body = summary
+                        try:
+                            ids = self.telegram.send(format_flow_mirror(active.flow_body))
+                            active.flow_message_id = ids[0] if ids else 0
+                            log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
+                        except Exception as exc:  # noqa: BLE001
+                            log("SEND", f"flow mirror send failed (non-fatal): {exc}")
+                    else:
+                        # same turn -> grow the existing card in place
+                        active.flow_body = candidate
+                        try:
+                            self.telegram.edit(active.flow_message_id, format_flow_mirror(active.flow_body))
+                            log("SEND", f"edited flow mirror nonce={active.nonce} mid={active.flow_message_id}")
+                        except Exception as exc:  # noqa: BLE001
+                            log("SEND", f"flow mirror edit failed (non-fatal): {exc}")
             return
         if record.get("isSidechain") is not False:
             return
