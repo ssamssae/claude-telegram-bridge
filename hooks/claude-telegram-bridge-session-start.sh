@@ -9,11 +9,12 @@ set -u
 
 INPUT="$(cat 2>/dev/null || true)"
 STATE="${CLB_SESSION_SIDECAR:-$HOME/.claude/state/claude-telegram-bridge-sessions.json}"
+HOOK_LOG="${CLB_SESSION_HOOK_LOG:-$HOME/.claude/state/claude-telegram-bridge-session-start.log}"
 TMUX_BIN="${CLB_TMUX_BIN:-tmux}"
 TMUX_SOCKET="${CLB_TMUX_SOCKET:-default}"
 TMUX_SESSION="${CLB_TMUX_SESSION:-claude}"
 
-python3 - "$STATE" "$TMUX_BIN" "$TMUX_SOCKET" "$TMUX_SESSION" "$INPUT" <<'PY' >/dev/null 2>&1
+python3 - "$STATE" "$HOOK_LOG" "$TMUX_BIN" "$TMUX_SOCKET" "$TMUX_SESSION" "$INPUT" <<'PY' >/dev/null 2>&1
 import json
 import os
 import subprocess
@@ -22,16 +23,55 @@ import time
 from pathlib import Path
 
 state = Path(sys.argv[1]).expanduser()
-tmux_bin, tmux_socket, tmux_session = sys.argv[2], sys.argv[3], sys.argv[4]
-raw = sys.argv[5]
+hook_log = Path(sys.argv[2]).expanduser()
+tmux_bin, tmux_socket, tmux_session = sys.argv[3], sys.argv[4], sys.argv[5]
+raw = sys.argv[6]
+
+
+def write_hook_log(event, **fields):
+    safe = {
+        "ts": time.time(),
+        "event": event,
+        "host": os.uname().nodename,
+        "tmux_socket": tmux_socket,
+        "tmux_session": tmux_session,
+    }
+    safe.update(fields)
+    try:
+        hook_log.parent.mkdir(parents=True, exist_ok=True)
+        with hook_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(safe, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 try:
     payload = json.loads(raw or "{}")
 except json.JSONDecodeError:
+    write_hook_log("skip", reason="invalid_json")
     payload = {}
 
-transcript = payload.get("transcript_path") or ""
-session_id = payload.get("session_id") or payload.get("sessionId") or ""
+transcript = (
+    payload.get("transcript_path")
+    or payload.get("transcriptPath")
+    or payload.get("transcript")
+    or payload.get("transcriptFile")
+    or ""
+)
+session_id = (
+    payload.get("session_id")
+    or payload.get("sessionId")
+    or payload.get("sessionID")
+    or ""
+)
 if not transcript or not session_id:
+    write_hook_log(
+        "skip",
+        reason="missing_required_fields",
+        has_transcript=bool(transcript),
+        has_session_id=bool(session_id),
+        payload_keys=sorted(str(key) for key in payload.keys())[:20],
+    )
     raise SystemExit(0)
 
 pane_pid = 0
@@ -72,6 +112,7 @@ def resolve_pane_pid():
 
 
 pane_pid = resolve_pane_pid()
+transcript_path = Path(transcript).expanduser()
 
 state.parent.mkdir(parents=True, exist_ok=True)
 try:
@@ -84,12 +125,12 @@ sessions = current.get("sessions")
 if not isinstance(sessions, dict):
     sessions = {}
 
-key = f"{Path(transcript).expanduser()}|{session_id}"
+key = f"{transcript_path}|{session_id}"
 sessions[key] = {
     "bridge": "claude-telegram-bridge",
     "host": os.uname().nodename,
     "updated_at": time.time(),
-    "transcript_path": str(Path(transcript).expanduser()),
+    "transcript_path": str(transcript_path),
     "sessionId": str(session_id),
     "pane_pid": pane_pid,
     "tmux_socket": tmux_socket,
@@ -98,6 +139,13 @@ sessions[key] = {
 tmp = state.with_name(state.name + ".tmp")
 tmp.write_text(json.dumps({"updated_at": time.time(), "sessions": sessions}, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 tmp.replace(state)
+write_hook_log(
+    "record",
+    pane_pid=pane_pid,
+    transcript_path=str(transcript_path),
+    transcript_exists=transcript_path.exists(),
+    session_id_present=True,
+)
 PY
 
 exit 0

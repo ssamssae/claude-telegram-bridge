@@ -48,8 +48,9 @@ REASONING_MIRROR_LIMIT = 3500
 # the user can see the work flow between final answers, not just endpoints. Default
 # OFF (flag-file gated, runtime-toggleable, no restart). Created per-node only.
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
+AMBIENT_FINAL_HEADER = "✅ 노드 결과"
 FLOW_MIRROR_LIMIT = 1500
-FLOW_MIRROR_FLAG = os.path.expanduser("~/.choso/claude-bridge-flow-mirror.on")
+FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
 # cards read like the Korean Codex cards. Unmapped tools keep their original name.
 TOOL_LABEL_KO = {
@@ -70,9 +71,16 @@ TOOL_LABEL_KO = {
     "WebSearch": "웹검색",
 }
 APPROVAL_WAIT_RE = re.compile(
-    r"\b(approval|do you want|would you like|allow(?:\s+this|\s+command)?|"
-    r"approve|permission prompt)\b",
-    re.IGNORECASE,
+    # ⚠️ 제거 금지 (DO NOT REMOVE) — control-plane only: match the actual
+    # Claude Code approval MENU (numbered Yes/No + cursor), NOT bare words in
+    # answer prose. Bare "allow"/"approve"/"permission"/"do you want" matched the
+    # assistant's own answer text and wedged the bridge in approval_wait forever
+    # → every later telegram msg stuck "enqueued", typing never cleared.
+    # (2026-06-28 라이덴 stuck-inject incident)
+    r"(?im)"
+    r"^\s*❯?\s*1\.\s*yes\b"
+    r"|^\s*\d+\.\s*no,\s*(?:and\s+)?(?:tell|keep)\b"
+    r"|do\s+you\s+want\s+to\s+(?:proceed|allow|make|create|run|delete|continue)\b",
 )
 HOOK_BLOCK_RE = re.compile(
     r"\b(hook\s+(?:blocked|denied|failed)|blocked\s+by\s+hook|"
@@ -361,6 +369,20 @@ def content_tool_summary(content: Any) -> str:
 def format_flow_mirror(text: str) -> str:
     body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
     return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+
+
+def format_ambient_flow(text: str) -> str:
+    # ⚙️ ambient flow mirror (v0.1.5) — distinct "(노드 자율)" marker so the user can
+    # tell node-autonomous work apart from active-turn flow cards.
+    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
+    return f"{FLOW_MIRROR_HEADER} (노드 자율)\n{body}" if body else ""
+
+
+def format_ambient_final(text: str) -> str:
+    # ⚙️ ambient flow mirror — node-originated work 의 최종 답변(결론) 카드. flow 카드
+    # (도구 단계, "작업 흐름")와 구분되는 "✅ 노드 결과" 헤더로 결론임을 표시한다.
+    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
+    return f"{AMBIENT_FINAL_HEADER}\n{body}" if body else ""
 
 
 def screen_status_region(screen: str, tail_lines: int = 16) -> str:
@@ -1475,6 +1497,13 @@ class Bridge:
         self.parent_map: dict[str, str | None] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
+        # ⚙️ ambient flow mirror (v0.1.5) — in-memory card for node-originated work
+        # that has no active telegram turn (autonomous worker / cron / node-to-node).
+        # Ephemeral (not persisted): on restart ambient starts fresh. Flag-gated OFF.
+        self.ambient_flow_body: str = ""
+        self.ambient_flow_message_id: int = 0
+        # ⚙️ ambient flow mirror — 노드발 작업 최종답변 미러 dedup(같은 결론 재미러 방지).
+        self.ambient_final_last_key: str = ""
         self.last_transcript_mtime = 0.0
         self.last_jsonl_read_at = 0.0
         self.last_jsonl_watch_error = ""
@@ -2195,6 +2224,8 @@ class Bridge:
                 injected_at=time.time(),
                 text=item.text,
             )
+            # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
+            self.reset_ambient_flow()
         self.persist_state()
         self.write_egress_sidecar()
         prompt = self.envelope_prompt(item)
@@ -2541,6 +2572,20 @@ class Bridge:
             return
         active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
         if not active:
+            # ⚙️ ambient flow mirror (v0.1.5) — node-originated work (autonomous worker /
+            # cron / node-to-node) has no active telegram turn, so this assistant record
+            # was dropped here and the work was invisible. When flow mirror is on,
+            # accumulate the tool_use steps into an ambient card. The card boundary is
+            # reset whenever an incoming telegram message opens a new active turn.
+            if flow_mirror_enabled():
+                if message.get("stop_reason") != "end_turn":
+                    self.mirror_ambient_flow(content)
+                else:
+                    # ⚠️ 제거 금지 (DO NOT REMOVE) — 비-텔레그램-origin(노드발/cron/노드간)
+                    # 작업의 최종 답변을 노드 챗에 미러. 작업흐름 카드(도구 단계)만 뜨고
+                    # 결론이 노드 챗에서 사라지던 사각 차단.
+                    # issue: 2026-06-27-bridge-flow-mirror-final-report-missed
+                    self.mirror_ambient_final(content)
             return
 
         if content_has_tool(content, MCP_TELEGRAM_REPLY_TOOL):
@@ -2601,6 +2646,74 @@ class Bridge:
         reasoning = active.accumulated_reasoning or content_thinking(content)
         active.pending_reasoning = sanitize_text(reasoning, limit=REASONING_MIRROR_LIMIT) or None
         self.send_active_answer(active, assistant_uuid, answer)
+
+    def reset_ambient_flow(self) -> None:
+        # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset: a new active
+        # telegram turn closes the current ambient card so the next bout of
+        # node-autonomous work starts a fresh card instead of growing the old one.
+        self.ambient_flow_body = ""
+        self.ambient_flow_message_id = 0
+
+    def mirror_ambient_flow(self, content: Any) -> None:
+        # ⚙️ ambient flow mirror (v0.1.5) — see call site in process_record. Non-fatal;
+        # never affects message delivery. Only emits when no active turn exists.
+        if self.active_turn:
+            return
+        summary = content_tool_summary(content)
+        if not summary:
+            return
+        candidate = f"{self.ambient_flow_body}\n{summary}".strip() if self.ambient_flow_body else summary
+        if not self.ambient_flow_message_id or len(candidate) > FLOW_MIRROR_LIMIT:
+            # first card of this ambient bout, or overflow -> start a fresh card
+            self.ambient_flow_body = summary
+            try:
+                ids = self.telegram.send(format_ambient_flow(self.ambient_flow_body))
+                self.ambient_flow_message_id = ids[0] if ids else 0
+                log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"ambient flow send failed (non-fatal): {exc}")
+        else:
+            # same ambient bout -> grow the existing card in place
+            self.ambient_flow_body = candidate
+            try:
+                self.telegram.edit(self.ambient_flow_message_id, format_ambient_flow(self.ambient_flow_body))
+                log("SEND", f"edited ambient flow mid={self.ambient_flow_message_id}")
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"ambient flow edit failed (non-fatal): {exc}")
+
+    def mirror_ambient_final(self, content: Any) -> None:
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 비-텔레그램-origin(노드발/cron/노드간) 작업의
+        # 최종 답변을 노드 챗에 1장 미러. flow 카드(도구 단계)만 뜨고 결론이 사라지던
+        # 사각 차단. issue: 2026-06-27-bridge-flow-mirror-final-report-missed.
+        # Non-fatal; never affects message delivery. Only emits when no active turn.
+        if self.active_turn:
+            return
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 이중송신 가드 (T-260628-10): mac-report.sh 가 같은 노드
+        # 봇챗에 노드보고를 이미 보낸 경우(suppress 플래그 90초 내) skip → mac-report self-chat
+        # 미러와 ambient_final 의 노드 봇챗 교차중복 차단.
+        # issue: 2026-06-27-bridge-flow-mirror-final-report-missed
+        suppress = os.path.expanduser(f"~/.config/claude-telegram-bridge/ambient-suppress-{self.config.node}")
+        try:
+            if os.path.exists(suppress) and (time.time() - os.path.getmtime(suppress)) < 90:
+                log("SEND", "skip ambient final (mac-report suppress active)")
+                return
+        except OSError:
+            pass
+        text = sanitize_text(content_text(content), limit=FLOW_MIRROR_LIMIT)
+        if not text:
+            return
+        key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        if key == self.ambient_final_last_key:
+            return
+        self.ambient_final_last_key = key
+        try:
+            self.telegram.send(format_ambient_final(text))
+            log("SEND", "sent ambient final")
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"ambient final send failed (non-fatal): {exc}")
+        # 최종 답변 미러 후 flow 카드 bout 종료 -> 다음 노드 작업은 새 카드로.
+        self.ambient_flow_body = ""
+        self.ambient_flow_message_id = 0
 
     def finish_active_turn(self, status: str) -> None:
         with self.lock:

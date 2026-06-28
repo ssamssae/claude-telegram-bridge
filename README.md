@@ -19,6 +19,8 @@ not share runtime code with the Codex Telegram Bridge.
 - Optional audio transcription through a local command configured with
   `CLB_AUDIO_TRANSCRIBE_CMD`.
 - Transcript-based final-answer extraction instead of screen scraping.
+- Optional flow mirror: live "work in progress" card that mirrors each tool-use
+  step of the current turn to Telegram so you can follow long runs.
 - Single Telegram chat allowlist and token ownership registry.
 - Duplicate-egress guard hooks for users who also have Telegram MCP reply tools
   or terminal mirror hooks installed.
@@ -95,12 +97,7 @@ CLB_TOKEN_FILE="$HOME/.config/claude-telegram-bridge/token.json"
 CLB_CHAT_ID="123456789"
 CLB_TOKEN_REGISTRY="$HOME/.config/claude-telegram-bridge/token-registry.json"
 CLB_STATE_DIR="$HOME/.local/state/claude-telegram-bridge"
-CLB_ACTIVE_TURN_STALE_SECONDS=900
 ```
-
-`CLB_ACTIVE_TURN_STALE_SECONDS` releases a previously observed Telegram turn
-when Claude is idle but no final reply was captured, so later queued messages
-can continue instead of being blocked behind a stale active turn.
 
 5. Store the token locally:
 
@@ -174,6 +171,18 @@ Send `/ping` to the bot, then send a normal prompt.
 - The PreToolUse egress guard is included for users who also have Telegram MCP
   reply tools installed.
 - Outgoing media auto-send is not part of this minimal export.
+
+## Optional Settings
+
+- `CLB_FLOW_MIRROR_FLAG` - path to a flag file that enables the flow mirror.
+  When the file exists, the bridge mirrors each tool-use step of the current
+  turn to Telegram as one live-updating card. Off by default (no file). Enable
+  with `touch "$HOME/.config/claude-telegram-bridge/flow-mirror.on"` and disable
+  by removing the file.
+- `CLB_ACTIVE_TURN_STALE_SECONDS` - releases a previously observed Telegram turn
+  when Claude is idle but no final reply was captured, so later queued messages
+  can continue instead of being blocked behind a stale active turn. Defaults to
+  900 seconds.
 
 ## Release Checklist
 
