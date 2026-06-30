@@ -49,6 +49,10 @@ REASONING_MIRROR_LIMIT = 3500
 # OFF (flag-file gated, runtime-toggleable, no restart). Created per-node only.
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
 AMBIENT_FINAL_HEADER = "✅ 노드 결과"
+# ⚙️ ambient flow mirror — node-originated work(다른 노드/오케가 주입한 지시)의 트리거
+# 프롬프트 카드. "✅ 노드 결과"만 떠서 무슨 지시로 나온 결과인지 맥락이 끊기던 문제 보완.
+AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
+AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
@@ -88,8 +92,10 @@ HOOK_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 ACTIVE_WORK_RE = re.compile(
-    r"(?im)^\s*(?:[✶✻✳*]\s*)?(?:working|germinating|thinking|running|processing)\b"
-    r"|esc\s+to\s+interrupt|still\s+thinking",
+    r"(?im)^\s*(?:[✶✻✳*]\s*)?"
+    r"(?:working|germinating|thinking|running|processing|cogitating|"
+    r"churning|cooking|brewing|baking)\b"
+    r"|esc\s+to\s+inter\s*rupt|inter\s*rupt\s+to\s+stop|still\s+thinking",
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
@@ -488,6 +494,66 @@ def format_ambient_final(text: str) -> str:
     return f"{AMBIENT_FINAL_HEADER}\n{body}" if body else ""
 
 
+# ⚙️ 받은-지시 카드 gist 정제 (T-260630-33) — 보일러플레이트 라우팅 헤더를 gist 에서
+# 빼고, 라우트 헤더의 from=<host>·task= 메타를 "🍎 본진 → 🖥 · T-…" 한 줄로 만든다.
+_DIRECTIVE_BOILERPLATE_RE = re.compile(
+    r"^\[(?:claude-skills HEAD|CLAUDE-REVIEW-ROUTE|NODE-ACK-)"
+)
+_DIRECTIVE_DEDUP_HEADER_RE = re.compile(r"^\[[^\]]*→[^\]]*\]\s+\[[^\]]*\]")
+_DIRECTIVE_FROM_RE = re.compile(r"\bfrom=([^\s|\]]+)")
+_DIRECTIVE_TASK_RE = re.compile(r"\btask=(T-[0-9A-Za-z\-]+)")
+_BRIDGE_NONCE_RE = re.compile(r"<claude-telegram-bridge\s+nonce=")
+
+
+def _directive_is_boilerplate(line: str) -> bool:
+    return bool(
+        _DIRECTIVE_BOILERPLATE_RE.match(line)
+        or _DIRECTIVE_DEDUP_HEADER_RE.match(line)
+    )
+
+
+def format_ambient_directive(text: str, self_emoji: str | None = None) -> str:
+    # ⚙️ ambient flow mirror — node-originated work 의 트리거(받은 지시) 카드. 라우팅
+    # 보일러플레이트 헤더([claude-skills HEAD]/[CLAUDE-REVIEW-ROUTE]/[NODE-ACK-]/발신수신
+    # dedup)를 gist 에서 빼고, 라우트 헤더의 from=<host>·task= 를 "🍎 본진 → 🖥 · T-…"
+    # 한 줄로 만든 뒤 남은 의미있는 1~2줄을 내용 gist 로 붙인다. 헤더밖에 없어 내용이
+    # 비어도 from/task 줄만이라도 보여 누가-무슨 task 인지는 드러난다. (T-260630-33)
+    raw = text or ""
+    # 텔레그램-origin(clb- nonce) 프롬프트는 노드발 지시가 아니므로 카드 X (caller 게이트
+    # not-nonce 와 동형 방어).
+    if _BRIDGE_NONCE_RE.search(raw):
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    from_host: str | None = None
+    task_id: str | None = None
+    for ln in lines:
+        if from_host is None:
+            m = _DIRECTIVE_FROM_RE.search(ln)
+            if m:
+                from_host = m.group(1)
+        if task_id is None:
+            m = _DIRECTIVE_TASK_RE.search(ln)
+            if m:
+                task_id = m.group(1)
+    content_lines = [ln for ln in lines if not _directive_is_boilerplate(ln)]
+    route_line = ""
+    if from_host:
+        label, emoji = node_label_emoji(from_host)
+        sender = f"{emoji} {label}".strip()
+        recv = self_emoji if self_emoji is not None else node_defaults()[1]
+        route_line = f"{sender} → {recv}"
+        if task_id:
+            route_line = f"{route_line} · {task_id}"
+    parts: list[str] = []
+    if route_line:
+        parts.append(route_line)
+    parts.extend(content_lines[:2])
+    if not parts and task_id:
+        parts.append(task_id)
+    gist = "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
+    return f"{AMBIENT_DIRECTIVE_HEADER}\n{gist}" if gist else ""
+
+
 def screen_status_region(screen: str, tail_lines: int = 16) -> str:
     """Return the current terminal status area, excluding stale scrollback.
 
@@ -508,7 +574,18 @@ def screen_has_hook_block(screen: str) -> bool:
 
 
 def screen_has_active_work(screen: str) -> bool:
-    return bool(ACTIVE_WORK_RE.search(screen_status_region(screen)))
+    region = screen_status_region(screen)
+    # Claude's completed footer can wrap "1 shell still running" as a physical
+    # line containing only "running" in very narrow panes. That is an idle prompt
+    # with a background shell, not a running assistant turn.
+    region = re.sub(r"\bstill\s*\n\s*running\b", "still running", region, flags=re.IGNORECASE)
+    if ACTIVE_WORK_RE.search(region):
+        return True
+    # Narrow panes can wrap "esc to interrupt" or spinner text across physical
+    # rows. tmux capture-pane callers do not always use -J, so inspect a joined
+    # logical view as a second pass.
+    joined = " ".join(region.splitlines())
+    return bool(ACTIVE_WORK_RE.search(joined))
 
 
 def strip_inline_node_emoji_header(text: str) -> str:
@@ -960,8 +1037,8 @@ class ActiveTurn:
     send_in_progress: bool = False
     pending_reasoning: str | None = None  # transient: 🧠 mirror text for this turn (not persisted)
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
-    flow_message_id: int = 0  # transient: telegram message id of this turn's ⚙️ flow card (edit-in-place)
-    flow_body: str = ""  # transient: accumulated flow lines for this turn's single card
+    flow_message_id: int = 0  # persisted across restart (anti-fragmentation): telegram message id of this turn's ⚙️ flow card (edit-in-place)
+    flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -981,6 +1058,8 @@ class ActiveTurn:
             "pending_outbox_key": self.pending_outbox_key,
             "send_attempts": self.send_attempts,
             "last_send_attempt_at": self.last_send_attempt_at,
+            "flow_message_id": self.flow_message_id,
+            "flow_body": self.flow_body,
         }
 
     @classmethod
@@ -1008,6 +1087,8 @@ class ActiveTurn:
             ),
             send_attempts=int(payload.get("send_attempts") or 0),
             last_send_attempt_at=float(payload.get("last_send_attempt_at") or 0.0),
+            flow_message_id=int(payload.get("flow_message_id") or 0),
+            flow_body=str(payload.get("flow_body") or ""),
         )
 
 
@@ -1333,8 +1414,6 @@ class SessionBinder:
             if not raw_transcript:
                 continue
             transcript = Path(raw_transcript).expanduser()
-            if not transcript.exists() and time.time() - updated_at > self.config.pending_transcript_seconds:
-                continue
             session_id = str(item.get("sessionId") or item.get("session_id") or transcript.stem)
             matches.append((updated_at, ClaudeSessionBinding(transcript, session_id, pane_pid)))
         matches.sort(key=lambda item: item[0], reverse=True)
@@ -1614,6 +1693,11 @@ class Bridge:
         self.ambient_flow_message_id: int = 0
         # ⚙️ ambient flow mirror — 노드발 작업 최종답변 미러 dedup(같은 결론 재미러 방지).
         self.ambient_final_last_key: str = ""
+        # ⚙️ ambient flow mirror — 받은지시 카드를 결과 카드의 앵커로 재사용 (T-260630-48):
+        # 결과 도착 시 새 ✅ 카드를 또 보내지 않고 받은지시 카드를 in-place edit 해 노드 챗에
+        # 받은지시→결과를 1장으로 통합한다(받은지시/노드결과 2장 중복 제거). 0 = 열린 앵커 없음.
+        self.ambient_directive_message_id: int = 0
+        self.ambient_directive_body: str = ""
         self.last_transcript_mtime = 0.0
         self.last_jsonl_read_at = 0.0
         self.last_jsonl_watch_error = ""
@@ -1703,15 +1787,39 @@ class Bridge:
             "pane_pid": binding.pane_pid,
         }
 
+    def has_fresh_pending_sidecar_binding(self, binding: ClaudeSessionBinding) -> bool:
+        if binding.transcript_path.exists():
+            return False
+        try:
+            return any(item == binding for item in self.binder._resolve_fresh_sidecar_metadata(binding.pane_pid))
+        except Exception:
+            return False
+
     def ensure_session_binding(self) -> ClaudeSessionBinding:
-        binding = self.binder.resolve()
-        if self.session_binding != binding:
-            identity = session_identity(binding.transcript_path)
+        try:
+            binding = self.binder.resolve()
+        except RuntimeError as exc:
+            if "no SessionStart sidecar entry" not in str(exc):
+                raise
+            pending = self.binder._resolve_fresh_sidecar_metadata(self.repl.pane_pid())
+            if len(pending) != 1:
+                raise
+            binding = pending[0]
+
+        identity = session_identity(binding.transcript_path) if binding.transcript_path.exists() else None
+        if self.session_binding != binding or (identity is not None and self.session_identity != identity):
             self.session_binding = binding
-            self.session_identity = identity
-            self.load_state_for_identity(identity)
-            log("SESSION", f"watching {binding.transcript_path} offset={self.session_pos}")
+            if identity is None:
+                self.session_identity = None
+                self.session_pos = 0
+                log("SESSION", f"waiting for transcript {binding.transcript_path}")
+            else:
+                self.session_identity = identity
+                self.load_state_for_identity(identity)
+                log("SESSION", f"watching {binding.transcript_path} offset={self.session_pos}")
             self.persist_state()
+            self.write_egress_sidecar()
+        elif identity is None:
             self.write_egress_sidecar()
         return binding
 
@@ -1806,6 +1914,7 @@ class Bridge:
                 self.typing_stop = None
 
     def busy_state(self) -> str:
+        self.release_completed_active_turn_if_recorded()
         self.release_stale_active_turn_if_idle()
         with self.lock:
             if self.active_turn:
@@ -1817,7 +1926,9 @@ class Bridge:
                     return "generating"
             except OSError:
                 with self.lock:
-                    if self.session_binding == binding:
+                    if self.session_binding == binding and (
+                        self.session_identity is not None or not self.has_fresh_pending_sidecar_binding(binding)
+                    ):
                         self.session_binding = None
                         self.session_identity = None
                         self.session_pos = 0
@@ -1863,6 +1974,40 @@ class Bridge:
         if screen_has_active_work(screen):
             return True
         return False
+
+    def release_completed_active_turn_if_recorded(self) -> bool:
+        with self.lock:
+            active = self.active_turn
+        if not active:
+            return False
+
+        queue_status = self.queue.status(active.queue_id)
+        completed_by_queue = queue_status in DurableQueue.terminal
+        completed_by_outbox = bool(active.pending_outbox_key and self.outbox.contains(active.pending_outbox_key))
+        if not completed_by_queue and not completed_by_outbox:
+            return False
+
+        item = self.queue_item_for_active(active)
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            self.active_turn = None
+        self.stop_typing()
+        if completed_by_outbox and not completed_by_queue:
+            self.queue.append_status(
+                item,
+                "sent",
+                assistant_uuid=active.pending_assistant_uuid or active.assistant_uuid or "",
+                recovered_from="outbox_sent",
+            )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log(
+            "TURN",
+            f"released completed active_turn queue={active.queue_id[:10]} status={queue_status or '-'} "
+            f"outbox_sent={int(completed_by_outbox)}",
+        )
+        return True
 
     def release_stale_active_turn_if_idle(self) -> bool:
         ttl = self.config.active_turn_stale_seconds
@@ -2676,6 +2821,21 @@ class Bridge:
                 self.persist_state()
                 self.write_egress_sidecar()
                 log("JSONL", f"user nonce seen {nonce}")
+                return
+            # ⚙️ ambient flow mirror — node-originated incoming directive (다른 노드/오케가
+            # 주입한 트리거 프롬프트). 텔레그램 active turn 도 nonce 도 없는 user 레코드 =
+            # 노드발 지시. 결과("✅ 노드 결과")만 떠서 맥락이 끊기던 문제 보완으로 받은
+            # 지시를 1장 미러한다. 텔레그램-origin 은 clb- nonce 를 달고 들어오므로
+            # not nonce 로 배제(노드 디렉티브는 nonce 無). tool_result(도구결과)는
+            # content_text 가 ""라 자동 제외, sub-agent sidechain 은 isSidechain 가드로
+            # 제외. flow-mirror 토글 ON 한정.
+            if (
+                flow_mirror_enabled()
+                and not nonce
+                and not self.active_turn
+                and not record.get("isSidechain")
+            ):
+                self.mirror_ambient_directive(content)
             return
 
         if record_type != "assistant" or message.get("role") != "assistant":
@@ -2791,6 +2951,30 @@ class Bridge:
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient flow edit failed (non-fatal): {exc}")
 
+    def mirror_ambient_directive(self, content: Any) -> None:
+        # ⚙️ ambient flow mirror — node-originated work 의 받은 지시(트리거) 카드를 노드
+        # 챗에 1장 미러. 결과("✅ 노드 결과")만 떠서 맥락이 끊기던 문제 보완. tool_result
+        # (도구 결과) user 레코드는 content_text 가 ""를 반환해 자동 제외된다. Non-fatal;
+        # never affects message delivery. Only emits when no active telegram turn.
+        if self.active_turn:
+            return
+        body = format_ambient_directive(content_text(content))
+        if not body:
+            return
+        # 새 bout 시작 → flow 카드 묶음 경계 리셋(받은지시→작업흐름→노드결과 한 묶음).
+        self.reset_ambient_flow()
+        try:
+            ids = self.telegram.send(body)
+            # ⚙️ T-260630-48 — 이 받은지시 카드를 결과의 앵커로 보관. mirror_ambient_final 이
+            # 새 ✅ 카드 대신 이 카드를 edit 해 받은지시→결과를 1장으로 통합한다.
+            self.ambient_directive_message_id = ids[0] if ids else 0
+            self.ambient_directive_body = body
+            log("SEND", f"sent ambient directive mid={self.ambient_directive_message_id}")
+        except Exception as exc:  # noqa: BLE001
+            self.ambient_directive_message_id = 0
+            self.ambient_directive_body = ""
+            log("SEND", f"ambient directive send failed (non-fatal): {exc}")
+
     def mirror_ambient_final(self, content: Any) -> None:
         # ⚠️ 제거 금지 (DO NOT REMOVE) — 비-텔레그램-origin(노드발/cron/노드간) 작업의
         # 최종 답변을 노드 챗에 1장 미러. flow 카드(도구 단계)만 뜨고 결론이 사라지던
@@ -2805,6 +2989,10 @@ class Bridge:
         suppress = os.path.expanduser(f"~/.config/claude-telegram-bridge/ambient-suppress-{self.config.node}")
         try:
             if os.path.exists(suppress) and (time.time() - os.path.getmtime(suppress)) < 90:
+                # ⚙️ T-260630-48 — mac-report 가 노드 챗을 소유(suppress)하면 bridge 는 받은지시
+                # 앵커를 놓아준다(다음 final 이 옛 받은지시 카드를 잘못 edit 하지 않게 정리).
+                self.ambient_directive_message_id = 0
+                self.ambient_directive_body = ""
                 log("SEND", "skip ambient final (mac-report suppress active)")
                 return
         except OSError:
@@ -2816,11 +3004,29 @@ class Bridge:
         if key == self.ambient_final_last_key:
             return
         self.ambient_final_last_key = key
-        try:
-            self.telegram.send(format_ambient_final(text))
-            log("SEND", "sent ambient final")
-        except Exception as exc:  # noqa: BLE001
-            log("SEND", f"ambient final send failed (non-fatal): {exc}")
+        anchor = self.ambient_directive_message_id
+        if anchor:
+            # ⚙️ T-260630-48 — 받은지시 앵커 카드를 결과까지 포함한 1장으로 in-place 통합
+            # (새 ✅ 카드 X). 받은지시→노드결과 2장 중복 제거. edit 실패 시 폴백으로 새 카드 send
+            # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
+            unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text)}"
+            try:
+                self.telegram.edit(anchor, unified)
+                log("SEND", f"edited ambient final into directive anchor mid={anchor}")
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"ambient final anchor edit failed → fallback send (non-fatal): {exc}")
+                try:
+                    self.telegram.send(format_ambient_final(text))
+                except Exception as exc2:  # noqa: BLE001
+                    log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
+            self.ambient_directive_message_id = 0
+            self.ambient_directive_body = ""
+        else:
+            try:
+                self.telegram.send(format_ambient_final(text))
+                log("SEND", "sent ambient final")
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"ambient final send failed (non-fatal): {exc}")
         # 최종 답변 미러 후 flow 카드 bout 종료 -> 다음 노드 작업은 새 카드로.
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
@@ -2864,6 +3070,11 @@ class Bridge:
             try:
                 binding = self.ensure_session_binding()
                 path = binding.transcript_path
+                if not path.exists():
+                    self.retry_pending_send()
+                    self.write_egress_sidecar()
+                    self.stop_event.wait(0.5)
+                    continue
                 with path.open("rb") as handle:
                     handle.seek(self.session_pos)
                     data = handle.read()
@@ -2904,9 +3115,13 @@ class Bridge:
                     self.last_jsonl_watch_error_log_at = now
                 if isinstance(exc, FileNotFoundError):
                     with self.lock:
-                        self.session_binding = None
-                        self.session_identity = None
-                        self.session_pos = 0
+                        if self.session_identity is not None or (
+                            self.session_binding is not None
+                            and not self.has_fresh_pending_sidecar_binding(self.session_binding)
+                        ):
+                            self.session_binding = None
+                            self.session_identity = None
+                            self.session_pos = 0
             self.stop_event.wait(0.5)
 
     def offer_update_if_available(self) -> None:
