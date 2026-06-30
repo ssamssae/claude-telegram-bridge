@@ -28,6 +28,20 @@ not share runtime code with the Codex Telegram Bridge.
 This is not MCP. It is a local bridge daemon for one visible Claude Code
 session.
 
+## Public Export Model
+
+This public repository is maintained from a private operator source through a
+sanitized export step. The export keeps the reusable Claude bridge behavior,
+hook templates, config examples, and documentation, while stripping private chat
+ids, token paths, hostnames, node labels, and local automation paths before
+release.
+
+Claude Telegram Bridge and Codex Telegram Bridge remain separate programs
+because they drive different interactive CLIs and transcript formats. The shared
+maintenance rule is the same: keep one internal source for each bridge, generate
+the public copy through an export script, and never publish private wrappers or
+operator-specific trigger paths.
+
 ## Billing And Terms
 
 This project does not use `claude -p` and does not create hidden one-shot
