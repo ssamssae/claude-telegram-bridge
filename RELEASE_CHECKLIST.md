@@ -1,5 +1,10 @@
 # Release Checklist
 
+Maintainer-only: this checklist and the export script below live in the
+maintainer's private automation repo, not in this public repository. If you
+forked this repo you can skip step 1 and run steps 2-4 directly against your
+working tree.
+
 Run these checks before publishing a repository or release.
 
 1. Generate a clean export:

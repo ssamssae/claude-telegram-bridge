@@ -12,6 +12,7 @@ live tmux pane and tails the SessionStart-bound transcript sidecar.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -28,16 +29,24 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
 HOME = Path.home()
+KST = timezone(timedelta(hours=9), "KST")
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
 BRIDGE_OWNER = "claude-telegram-bridge"
-ALLOWED_SLASH_COMMANDS = {"/ping", "/start", "/status"}
+BRIDGE_HEALTH_SLASH_COMMANDS = {"/ping", "/start"}
+BRIDGE_STATUS_SLASH_COMMAND = "/status"
+# /context 는 좁은 tmux 창에서 잘리므로 캡처 동안만 창을 이 폭으로 넓힌다 (codex parity, T-260702-14).
+STATUS_WIDE_CAPTURE_COLUMNS = 132
+CONTEXT_SLASH_COMMAND = "/context"
+# 세션을 종료시키는 슬래시 — 통과 후 브릿지가 watchdog 자가복구를 앞당겨 트리거한다.
+# /clear 는 세션을 죽이지 않으므로(컨텍스트 리셋만) 제외.
+SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
 MCP_TELEGRAM_REPLY_TOOL = "mcp__plugin_telegram_telegram__reply"
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
@@ -52,6 +61,7 @@ AMBIENT_FINAL_HEADER = "✅ 노드 결과"
 # ⚙️ ambient flow mirror — node-originated work(다른 노드/오케가 주입한 지시)의 트리거
 # 프롬프트 카드. "✅ 노드 결과"만 떠서 무슨 지시로 나온 결과인지 맥락이 끊기던 문제 보완.
 AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
+SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
@@ -108,25 +118,8 @@ def env(name: str, default: str | None = None) -> str | None:
 
 
 def release_hold_response(text: str) -> str | None:
-    if not re.match(r"^\s*출시\s*멈춰\s+\S+", text or ""):
-        return None
-    helper = Path(__file__).resolve().parent / "asc-release-hold.sh"
-    try:
-        proc = subprocess.run(
-            [str(helper), text],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            stdin=subprocess.DEVNULL,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"출시 보류 신호 기록 실패: {exc}"
-    if proc.returncode == 0:
-        return (proc.stdout or "출시 보류 신호 기록됨").strip()
-    if proc.returncode == 2:
-        return None
-    detail = (proc.stderr or proc.stdout or "").strip()
-    return f"출시 보류 신호 기록 실패: {detail[:200]}"
+    # Personal release-hold automation is stripped from the public export.
+    return None
 
 
 def int_env(name: str, default: int, minimum: int = 0) -> int:
@@ -255,6 +248,17 @@ def perform_self_update(latest: str) -> None:
 
 def node_defaults() -> tuple[str, str]:
     return "claude", "\U0001f916"
+
+
+# T-260701-68: the internal mesh bus/ledger layer is stripped from the public
+# export, but call sites survive newer internal commits. Documented no-op stubs
+# keep the public bridge on the direct Telegram API path (None => legacy send).
+def mesh_ledger_record(*args, **kwargs):
+    return None
+
+
+def mesh_cutover_call(method, params):
+    return None
 
 
 def read_text(path: Path) -> str:
@@ -387,17 +391,36 @@ def suffix_from_metadata(file_name: str = "", mime_type: str = "", default: str 
 
 
 def slash_token(text: str) -> str:
-    stripped = (text or "").lstrip()
-    if not stripped.startswith("/"):
+    stripped = (text or "").strip()
+    if "\n" in stripped or not stripped.startswith("/"):
         return ""
     return stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
 
+def extract_context_screen(screen: str) -> str:
+    # 넓힌 창에서 capture 한 pane 텍스트에서 후행 빈 줄만 다듬어 반환한다.
+    # (좁은 창 truncation 은 temporary_window_width 로 이미 해소된 상태.)
+    lines = (screen or "").rstrip("\n").splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
 def escape_unsafe_slash(text: str) -> str:
+    # ⚠️ 안전 가드 (제거/약화 금지 without 근거) — 옛 버전은 ALLOWED_SLASH_COMMANDS
+    #   allowlist(/ping·/start·/status)만 통과시키고 나머지 슬래시를 전각 ／ 로 이스케이프해
+    #   Claude Code TUI 의 슬래시 명령 실행을 원천 차단했다. T-260702-14(codex parity)에서
+    #   allowlist 를 폐기하고 codex 브릿지 모델로 대체: 단일 라인의 유효 슬래시 토큰
+    #   (slash_token != "")은 전부 Claude Code 로 통과시킨다(/exit·/clear 포함). 가드의
+    #   본질은 유지된다 — 멀티라인/선행텍스트 섞인 위장 슬래시는 slash_token 이 "" 를 반환하고
+    #   여기서 ／ 로 이스케이프되어 명령 오인젝션을 막는다. 세션파괴 명령(/exit·/quit)의
+    #   안전망은 SESSION_LIFECYCLE_SLASH_COMMANDS → watchdog 자가복구로 이관됨.
     token = slash_token(text)
-    if not token or token in ALLOWED_SLASH_COMMANDS:
+    if token:
         return text
     stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return text
     prefix = text[: len(text) - len(stripped)]
     return prefix + "／" + stripped[1:]
 
@@ -502,6 +525,8 @@ _DIRECTIVE_BOILERPLATE_RE = re.compile(
 _DIRECTIVE_DEDUP_HEADER_RE = re.compile(r"^\[[^\]]*→[^\]]*\]\s+\[[^\]]*\]")
 _DIRECTIVE_FROM_RE = re.compile(r"\bfrom=([^\s|\]]+)")
 _DIRECTIVE_TASK_RE = re.compile(r"\btask=(T-[0-9A-Za-z\-]+)")
+_DIRECTIVE_TITLE_RE = re.compile(r"\]\s*(?:디렉티브|directive)\s*[—:-]\s*(.+)$", re.IGNORECASE)
+_MAC_REPORT_TITLE_RE = re.compile(r"^\[Mac report title:\s*(.+?)\]\s*$", re.IGNORECASE)
 _BRIDGE_NONCE_RE = re.compile(r"<claude-telegram-bridge\s+nonce=")
 
 
@@ -512,12 +537,76 @@ def _directive_is_boilerplate(line: str) -> bool:
     )
 
 
-def format_ambient_directive(text: str, self_emoji: str | None = None) -> str:
+def _ambient_title_from_lines(lines: list[str]) -> str:
+    for line in lines:
+        m = _MAC_REPORT_TITLE_RE.match(line)
+        if m:
+            return m.group(1).strip()
+        m = _DIRECTIVE_TITLE_RE.search(line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _ambient_title_node_label(title: str, lines: list[str], route_line: str) -> str:
+    # Personal node-name detection is stripped from the public export.
+    return ""
+
+
+def _ambient_title_summary_ko(title: str, lines: list[str], route_line: str) -> str:
+    title = (title or "").strip()
+    if not title:
+        return ""
+    low = title.lower()
+    topic = ""
+    if any(key in low for key in ("worktree contention", "live checkout", "feature branch", "worktree")):
+        topic = "작업폴더 정리 필요"
+    elif any(key in low for key in ("chrome remote desktop", "remote desktop", "crd", "chromoting")):
+        topic = "원격데스크톱 점검"
+    elif "bridge" in low or "브릿지" in title:
+        topic = "브릿지 점검"
+    elif "youtube" in low:
+        topic = "유튜브 작업"
+    elif "ebook" in low:
+        topic = "전자책 작업"
+    elif any(key in low for key in ("build", "test", "verify", "verification")):
+        topic = "검증 결과"
+    elif "status" in low or "state" in low:
+        topic = "상태 확인"
+    elif "deploy" in low or "release" in low:
+        topic = "배포 확인"
+    if not topic:
+        return ""
+
+    details: list[str] = []
+    if "ack" in low or "approval" in low or "confirm" in low:
+        details.append("정리 ack 요청" if topic == "작업폴더 정리 필요" else "ack 요청")
+    if "restart" in low or "reboot" in low or "kickstart" in low:
+        details.append("재시작 확인")
+    label = _ambient_title_node_label(title, lines, route_line)
+    summary = topic
+    if details:
+        summary = f"{summary}, {', '.join(dict.fromkeys(details))}"
+    return f"{label}: {summary}" if label else summary
+
+
+def _format_directive_card(
+    text: str,
+    *,
+    header: str,
+    from_alias: str | None = None,
+    to_alias: str | None = None,
+    self_emoji: str | None = None,
+) -> str:
     # ⚙️ ambient flow mirror — node-originated work 의 트리거(받은 지시) 카드. 라우팅
     # 보일러플레이트 헤더([claude-skills HEAD]/[CLAUDE-REVIEW-ROUTE]/[NODE-ACK-]/발신수신
     # dedup)를 gist 에서 빼고, 라우트 헤더의 from=<host>·task= 를 "🍎 본진 → 🖥 · T-…"
     # 한 줄로 만든 뒤 남은 의미있는 1~2줄을 내용 gist 로 붙인다. 헤더밖에 없어 내용이
     # 비어도 from/task 줄만이라도 보여 누가-무슨 task 인지는 드러난다. (T-260630-33)
+    #
+    # T-260702-06: 같은 정제 로직을 송신카드(📤 보낸 지시)에도 재사용해 수신/송신 카드
+    # drift 를 막는다. 송신카드는 from/to alias 가 명시되므로 라우트 라벨을 양쪽 모두 노드명으로
+    # 렌더하고, 수신카드는 기존처럼 self_emoji 만 받는다.
     raw = text or ""
     # 텔레그램-origin(clb- nonce) 프롬프트는 노드발 지시가 아니므로 카드 X (caller 게이트
     # not-nonce 와 동형 방어).
@@ -537,21 +626,42 @@ def format_ambient_directive(text: str, self_emoji: str | None = None) -> str:
                 task_id = m.group(1)
     content_lines = [ln for ln in lines if not _directive_is_boilerplate(ln)]
     route_line = ""
-    if from_host:
-        label, emoji = node_label_emoji(from_host)
+    route_from = from_alias or from_host
+    if route_from:
+        label, emoji = node_label_emoji(route_from)
         sender = f"{emoji} {label}".strip()
-        recv = self_emoji if self_emoji is not None else node_defaults()[1]
+        if to_alias:
+            recv_label, recv_emoji = node_label_emoji(to_alias)
+            recv = f"{recv_emoji} {recv_label}".strip()
+        else:
+            recv = self_emoji if self_emoji is not None else node_defaults()[1]
         route_line = f"{sender} → {recv}"
         if task_id:
             route_line = f"{route_line} · {task_id}"
     parts: list[str] = []
     if route_line:
         parts.append(route_line)
+    title_summary = _ambient_title_summary_ko(_ambient_title_from_lines(lines), lines, route_line)
+    if title_summary:
+        parts.append(title_summary)
     parts.extend(content_lines[:2])
     if not parts and task_id:
         parts.append(task_id)
     gist = "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
-    return f"{AMBIENT_DIRECTIVE_HEADER}\n{gist}" if gist else ""
+    return f"{header}\n{gist}" if gist else ""
+
+
+def format_ambient_directive(text: str, self_emoji: str | None = None) -> str:
+    return _format_directive_card(text, header=AMBIENT_DIRECTIVE_HEADER, self_emoji=self_emoji)
+
+
+def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
+    return _format_directive_card(
+        text,
+        header=SENT_DIRECTIVE_HEADER,
+        from_alias=from_alias,
+        to_alias=to_alias,
+    )
 
 
 def screen_status_region(screen: str, tail_lines: int = 16) -> str:
@@ -733,12 +843,16 @@ class TelegramClient:
         self.chunk_size = chunk_size
 
     def call(self, method: str, **params: Any) -> dict[str, Any] | None:
+        cutover_payload = mesh_cutover_call(method, params)
+        if cutover_payload is not None:
+            return cutover_payload
         data = urllib.parse.urlencode(params).encode()
         request = urllib.request.Request(f"{self.api}/{method}", data=data)
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(request, timeout=60) as response:
                     payload = json.load(response)
+                mesh_ledger_record(method, params.get("chat_id"), params.get("text"), payload, message_id=params.get("message_id"))
                 return payload if isinstance(payload, dict) else None
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
@@ -746,10 +860,12 @@ class TelegramClient:
                     raise TelegramHTTPError(method, exc.code, body) from exc
                 if attempt == 2:
                     log("TGERR", f"{method} failed: HTTP {exc.code} {body[:200]}")
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
                     return None
             except Exception as exc:  # noqa: BLE001
                 if attempt == 2:
                     log("TGERR", f"{method} failed: {exc}")
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
                     return None
             time.sleep(2)
         return None
@@ -1188,6 +1304,46 @@ class ClaudeRepl:
             self.resolve_pane_target(),
         )
         return out.stdout
+
+    @contextmanager
+    def temporary_window_width(self, columns: int = STATUS_WIDE_CAPTURE_COLUMNS):
+        # /context 등 폭이 넓은 TUI 시각화를 좁은 tmux 창에서 capture-pane 하면
+        # 잘려 나온다. 캡처 동안만 창/pane 을 넓혔다가 원복한다 (codex 브릿지 포팅).
+        pane = self.resolve_pane_target()
+        try:
+            out = self.tmux(
+                "display-message", "-p", "-t", pane,
+                "#{window_id} #{window_width} #{window_height} #{pane_width} #{pane_height}",
+            )
+            window_id, window_width, window_height, pane_width, pane_height = out.stdout.strip().split()
+            original_window_width = int(window_width)
+            original_window_height = int(window_height)
+            original_pane_width = int(pane_width)
+            original_pane_height = int(pane_height)
+        except Exception as exc:  # noqa: BLE001
+            log("REPL", f"wide context capture unavailable: {exc}")
+            yield
+            return
+
+        target_width = max(columns, original_window_width)
+        resized = False
+        if target_width > original_window_width:
+            try:
+                self.tmux("resize-window", "-t", window_id, "-x", str(target_width), "-y", str(original_window_height))
+                self.tmux("resize-pane", "-t", pane, "-x", str(target_width))
+                resized = True
+                time.sleep(0.15)
+            except Exception as exc:  # noqa: BLE001
+                log("REPL", f"wide context capture resize failed: {exc}")
+        try:
+            yield
+        finally:
+            if resized:
+                try:
+                    self.tmux("resize-pane", "-t", pane, "-x", str(original_pane_width), "-y", str(original_pane_height))
+                    self.tmux("resize-window", "-t", window_id, "-x", str(original_window_width), "-y", str(original_window_height))
+                except Exception as exc:  # noqa: BLE001
+                    log("REPL", f"wide context capture restore failed: {exc}")
 
     def clear_composer(self) -> None:
         self.verify()
@@ -1975,6 +2131,25 @@ class Bridge:
             return True
         return False
 
+    def flush_reasoning_mirror(self, active: ActiveTurn) -> None:
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 🧠 reasoning 미러 유실 방지 (T-260701-63)
+        # release_completed_active_turn_if_recorded 의 조기 active_turn=None 과 send 경로가
+        # reasoning emit 을 두고 race → busy_state 폴링이 emit 전에 active 를 날려 🧠 사고
+        # 미러가 통째로 유실되던 회귀(PR#267 / 5916501 부작용) 차단. send 경로·release 경로
+        # 양쪽에서 호출, pending_reasoning None 마킹으로 idempotent(어느 경로든 정확히 1회).
+        reasoning = active.pending_reasoning
+        active.pending_reasoning = None
+        if not reasoning:
+            return
+        mirror = format_reasoning_mirror(reasoning)
+        if not mirror:
+            return
+        try:
+            self.telegram.send(mirror)
+            log("SEND", f"sent reasoning mirror nonce={active.nonce} len={len(mirror)}")
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"reasoning mirror send failed (non-fatal): {exc}")
+
     def release_completed_active_turn_if_recorded(self) -> bool:
         with self.lock:
             active = self.active_turn
@@ -1992,6 +2167,7 @@ class Bridge:
             if self.active_turn is not active:
                 return False
             self.active_turn = None
+        self.flush_reasoning_mirror(active)  # ⚠️ 제거 금지 (DO NOT REMOVE) — release 전 🧠 reasoning 보장 (T-260701-63)
         self.stop_typing()
         if completed_by_outbox and not completed_by_queue:
             self.queue.append_status(
@@ -2429,10 +2605,10 @@ class Bridge:
             self.telegram.send(hold_response)
             return
         command = slash_token(text)
-        if command in {"/start", "/ping"}:
+        if command in BRIDGE_HEALTH_SLASH_COMMANDS:
             self.telegram.send("claude-telegram-bridge running")
             return
-        if command == "/status":
+        if command == BRIDGE_STATUS_SLASH_COMMAND:
             self.telegram.send(f"claude bridge status: {self.busy_state()}")
             return
 
@@ -2456,6 +2632,56 @@ class Bridge:
             self.queue.append_status(item, "enqueued")
         log("QUEUE", f"enqueued update={update_id} queue={queue_id[:10]}")
 
+    def handle_context_command(self, item: "QueueItem") -> None:
+        # /context 시각화는 넓은 폭을 요구해 좁은 tmux 창에선 capture 가 잘린다.
+        # 캡처 동안만 창을 넓혀 /context 를 실행·캡처하고 폰으로 미러한다 (codex parity).
+        try:
+            self.telegram.send_typing()
+        except Exception:  # noqa: BLE001
+            pass
+        prompt = escape_unsafe_slash(sanitize_text(item.text))
+        settle = float(os.environ.get("CLB_CONTEXT_SETTLE_SEC", "1.2"))
+        try:
+            with self.repl.temporary_window_width(STATUS_WIDE_CAPTURE_COLUMNS):
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(prompt)
+                time.sleep(settle)
+                screen = self.repl.capture_pane(120)
+            answer = extract_context_screen(screen)
+            self.telegram.send(answer or "claude bridge /context: 캡처된 화면이 비어 있습니다.")
+            self.queue.append_status(item, "injected", slash_command=CONTEXT_SLASH_COMMAND)
+            self.queue.append_status(item, "sent", slash_command=CONTEXT_SLASH_COMMAND)
+            log("INJECT", f"/context wide-capture mirrored update={item.update_id}")
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/context capture failed: {exc}")
+            self.queue.append_status(item, "failed", error=str(exc))
+            self.telegram.send(f"claude bridge /context failed: {exc}")
+
+    def trigger_lifecycle_recovery(self, command_token: str) -> None:
+        # /exit·/quit 통과 후 Claude Code 세션이 종료되면 브릿지는 inject 대상을 잃는다.
+        # watchdog 정주기 tick 을 기다리지 않고 정착 지연 후 자가복구를 앞당겨 트리거한다
+        # (claude-bridge-watchdog 이 죽은 세션을 재생성 → graceful 재기동).
+        watchdog = Path(os.environ.get("CLB_WATCHDOG_SCRIPT", "~/.config/claude-telegram-bridge/watchdog.sh")).expanduser()
+        if not watchdog.exists():
+            log("LIFECYCLE", f"watchdog missing for {command_token}: {watchdog}")
+            return
+        delay = float(os.environ.get("CLB_LIFECYCLE_RECOVERY_DELAY_SEC", "3"))
+
+        def _heal() -> None:
+            time.sleep(delay)
+            try:
+                subprocess.run(
+                    ["bash", str(watchdog), self.config.node],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=90, check=False,
+                )
+                log("LIFECYCLE", f"watchdog self-heal spawned after {command_token}")
+            except Exception as exc:  # noqa: BLE001
+                log("LIFECYCLE", f"watchdog spawn failed after {command_token}: {exc}")
+
+        threading.Thread(target=_heal, daemon=True).start()
+
     def drain_queue(self) -> None:
         state = self.busy_state()
         if state != "idle":
@@ -2471,16 +2697,49 @@ class Bridge:
             if self.active_turn or not self.pending:
                 return
             item = self.pending.pop(0)
-            self.active_turn = ActiveTurn(
-                queue_id=item.queue_id,
-                update_id=item.update_id,
-                message_id=item.message_id,
-                nonce=item.nonce,
-                injected_at=time.time(),
-                text=item.text,
-            )
-            # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
-            self.reset_ambient_flow()
+            slash_command = bool(slash_token(item.text))
+            if slash_command:
+                self.reset_ambient_flow()
+            else:
+                self.active_turn = ActiveTurn(
+                    queue_id=item.queue_id,
+                    update_id=item.update_id,
+                    message_id=item.message_id,
+                    nonce=item.nonce,
+                    injected_at=time.time(),
+                    text=item.text,
+                )
+                # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
+                self.reset_ambient_flow()
+        if slash_command:
+            command_token = slash_token(item.text)
+            # /context 는 codex 브릿지처럼 넓힌 창에서 캡처해 폰으로 미러 (좁은 창 truncation 해결).
+            if command_token == CONTEXT_SLASH_COMMAND:
+                self.handle_context_command(item)
+                self.persist_state()
+                self.write_egress_sidecar()
+                return
+            prompt = escape_unsafe_slash(sanitize_text(item.text))
+            try:
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(prompt)
+            except Exception as exc:  # noqa: BLE001
+                log("INJECT", f"slash failed: {exc}")
+                self.queue.append_status(item, "failed", error=str(exc))
+                self.telegram.send(f"claude bridge slash command delivery failed: {exc}")
+                self.persist_state()
+                self.write_egress_sidecar()
+                return
+            self.queue.append_status(item, "injected", slash_command=command_token)
+            self.queue.append_status(item, "sent", slash_command=command_token)
+            self.persist_state()
+            self.write_egress_sidecar()
+            # /exit·/quit 는 세션을 종료시키므로 watchdog 자가복구를 앞당겨 트리거 (graceful 재기동).
+            if command_token in SESSION_LIFECYCLE_SLASH_COMMANDS:
+                self.trigger_lifecycle_recovery(command_token)
+            log("INJECT", f"slash={command_token} update={item.update_id}")
+            return
         self.persist_state()
         self.write_egress_sidecar()
         prompt = self.envelope_prompt(item)
@@ -2648,6 +2907,7 @@ class Bridge:
         claim = self.claim_send_attempt(active, assistant_uuid, answer)
         if claim == "outbox_sent":
             log("SEND", "skip duplicate outbox key")
+            mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
             self.finish_active_turn("sent")
             return
         if not claim:
@@ -2756,16 +3016,10 @@ class Bridge:
         # 🧠 reasoning mirror — sent once, right after the deduped final answer
         # (sibling of codex-repl-telegram-bridge's 🧠 코덱스 사고). Empty/no-thinking
         # turns produce no block. Failures here never affect answer delivery.
-        reasoning = None if copy_payload_messages else active.pending_reasoning
-        active.pending_reasoning = None
-        if reasoning:
-            mirror = format_reasoning_mirror(reasoning)
-            if mirror:
-                try:
-                    self.telegram.send(mirror)
-                    log("SEND", f"sent reasoning mirror nonce={active.nonce} len={len(mirror)}")
-                except Exception as exc:  # noqa: BLE001
-                    log("SEND", f"reasoning mirror send failed (non-fatal): {exc}")
+        if copy_payload_messages:
+            active.pending_reasoning = None  # 복붙 콘텐츠 turn 은 🧠 미러 skip
+        else:
+            self.flush_reasoning_mirror(active)
         with self.lock:
             if self.active_turn is active:
                 active.send_in_progress = False
@@ -2783,6 +3037,8 @@ class Bridge:
         claim = self.claim_retry_send_attempt()
         if claim == "outbox_sent":
             log("SEND", "skip duplicate outbox key")
+            active = self.active_turn
+            mesh_ledger_record("sendMessage", self.config.chat_id, active.pending_answer if active else None, result="suppressed")
             self.finish_active_turn("sent")
             return
         if not claim:
@@ -2862,6 +3118,7 @@ class Bridge:
             active.external_reply_seen = True
             self.persist_state()
             log("EGRESS", "MCP telegram reply tool_use seen; suppress bridge duplicate")
+            mesh_ledger_record("sendMessage", self.config.chat_id, content_text(content), result="suppressed")
             return
 
         # Accumulate thinking across the whole turn. This Claude Code version emits
@@ -2910,6 +3167,7 @@ class Bridge:
             return
         if active.external_reply_seen:
             log("SEND", "skip final because external reply tool was seen")
+            mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
             self.finish_active_turn("answered")
             return
         assistant_uuid = str(record.get("uuid") or "")
@@ -2994,6 +3252,7 @@ class Bridge:
                 self.ambient_directive_message_id = 0
                 self.ambient_directive_body = ""
                 log("SEND", "skip ambient final (mac-report suppress active)")
+                mesh_ledger_record("sendMessage", self.config.chat_id, content_text(content), result="suppressed")
                 return
         except OSError:
             pass
@@ -3002,6 +3261,7 @@ class Bridge:
             return
         key = hashlib.sha1(text.encode("utf-8")).hexdigest()
         if key == self.ambient_final_last_key:
+            mesh_ledger_record("sendMessage", self.config.chat_id, format_ambient_final(text), result="suppressed")
             return
         self.ambient_final_last_key = key
         anchor = self.ambient_directive_message_id
@@ -3240,11 +3500,24 @@ def health_check_main() -> int:
         return 20
 
 
+def validate_startup_config(config: "Config") -> None:
+    # T-260702-42: 공개 export 의 chat_id 기본값은 "" — 검증 없이 기동하면 어떤
+    # 채팅도 매칭 못 하는 데몬이 조용히 떠서 영원히 폴링한다 (silent fail).
+    chat = str(config.chat_id or "").strip()
+    if not re.fullmatch(r"-?\d+", chat):
+        raise ValueError(
+            "CLB_CHAT_ID is required and must be a numeric Telegram chat id "
+            f"(got {chat!r}). Message your bot once, read the chat id from "
+            "getUpdates, then set CLB_CHAT_ID before starting the bridge."
+        )
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--health-check":
         return health_check_main()
     try:
         config = Config.from_env()
+        validate_startup_config(config)
         token = load_token(config.token_file)
         bridge = Bridge(
             config,

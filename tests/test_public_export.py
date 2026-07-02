@@ -1,3 +1,4 @@
+import dataclasses
 import importlib.util
 import sys
 import unittest
@@ -15,6 +16,16 @@ class PublicExportTest(unittest.TestCase):
         spec.loader.exec_module(mod)
         self.assertEqual(mod.node_defaults()[0], "claude")
         self.assertEqual(mod.BRIDGE_OWNER, "claude-telegram-bridge")
+        source = path.read_text(encoding="utf-8")
+        self.assertNotIn("asc-release-hold", source)
+        self.assertNotIn("claude-" "automations", source)  # adjacent-literal split keeps the leak sweep itself clean
+        self.assertIsNone(mod.release_hold_response("출시 멈춰 memoyo"))
+        # T-260701-68: stripped mesh layer must leave working no-op stubs
+        self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}))
+        self.assertIsNone(mod.mesh_ledger_record())
+        cfg = dataclasses.replace(mod.Config.from_env(), chat_id="")
+        with self.assertRaises(ValueError):
+            mod.validate_startup_config(cfg)
 
 
 if __name__ == "__main__":

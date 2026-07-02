@@ -198,6 +198,14 @@ Send `/ping` to the bot, then send a normal prompt.
   can continue instead of being blocked behind a stale active turn. Defaults to
   900 seconds.
 
+### Advanced settings
+
+The bridge reads ~20 more tuning knobs (self-update via `CLB_AUTO_UPDATE` /
+`CLB_NO_UPDATE_CHECK`, send-retry policy, durable queue/outbox paths, session
+binding TTLs, an optional `CLB_WATCHDOG_SCRIPT` lifecycle hook, and more). All
+of them ship with safe defaults; the full annotated list lives at the bottom
+of `config.example.env`.
+
 ## Release Checklist
 
 See `RELEASE_CHECKLIST.md` before publishing a fork or release.
