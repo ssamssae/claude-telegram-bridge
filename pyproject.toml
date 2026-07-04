@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-telegram-bridge"
-version = "0.4.1"
+version = "0.4.2"
 description = "Control an existing interactive Claude Code session from Telegram."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,12 @@ classifiers = [
   "Topic :: Software Development"
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ssamssae/claude-telegram-bridge"
+Repository = "https://github.com/ssamssae/claude-telegram-bridge"
+Releases = "https://github.com/ssamssae/claude-telegram-bridge/releases"
+Issues = "https://github.com/ssamssae/claude-telegram-bridge/issues"
 
 [project.scripts]
 claude-telegram-bridge = "claude_telegram_bridge:main"

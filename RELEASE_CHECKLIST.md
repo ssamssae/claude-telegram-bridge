@@ -57,5 +57,25 @@ PY
 5. Re-read README billing language. It must say billing classification is
 unverified and must not claim subscription safety.
 
-6. Public release only after the above checks pass and the intended maintainer
-explicitly accepts the operational risk.
+6. Build the PyPI distribution and validate it before any upload:
+
+```bash
+python3 -m build dist/claude-telegram-bridge --outdir dist/claude-telegram-bridge/pypi-dist
+python3 -m twine check dist/claude-telegram-bridge/pypi-dist/*
+```
+
+Expected result: `twine check` reports `PASSED` for both the sdist and the wheel.
+
+7. Public release (PyPI upload). Only after every check above passes AND the
+intended maintainer explicitly accepts the operational risk. Requires the
+maintainer's PyPI API token. Confirm the name is free/owned, upload, then verify
+the self-update path resolves the new version:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://pypi.org/pypi/claude-telegram-bridge/json  # 404 = unclaimed
+python3 -m twine upload dist/claude-telegram-bridge/pypi-dist/*
+curl -s https://pypi.org/pypi/claude-telegram-bridge/json | python3 -c 'import sys, json; print(json.load(sys.stdin)["info"]["version"])'
+```
+
+The published name MUST equal `SELF_UPDATE_PACKAGE` in the bridge script, or the
+in-app "update available" check (which queries `pypi.org/pypi/<name>/json`) never fires.

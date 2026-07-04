@@ -83,6 +83,13 @@ AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
+# F9 (T-260705-04) — typing 루프 pulse/self-liveness 튜닝. 소등 호출을 놓친 경로가
+# 있어도(예: ambient 턴 종료) 루프가 세션 유휴를 스스로 감지해 소등한다. probe 실패는
+# 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
+TYPING_PULSE_FIRST_WAIT = 1.0
+TYPING_PULSE_WAIT = 4.0
+TYPING_LIVENESS_GRACE_PULSES = 5
+TYPING_LIVENESS_CHECK_EVERY = 5
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
 # cards read like the Korean Codex cards. Unmapped tools keep their original name.
@@ -2197,11 +2204,27 @@ class Bridge:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
                     pulse_count += 1
+                    # F9 (T-260705-04) self-liveness: N pulse 마다 세션이 실제로 일하는지
+                    # 확인하고 유휴면 자가소등 — stop_typing 호출을 놓친 어떤 경로가 남아도
+                    # 유령이 TYPING_MAX(기본 2h)까지 살지 못한다. active_turn 무락 읽기는
+                    # 휴리스틱(최악 1 pulse 지연). probe 예외 = 소등하지 않음(fail-open).
+                    if (
+                        pulse_count >= TYPING_LIVENESS_GRACE_PULSES
+                        and pulse_count % TYPING_LIVENESS_CHECK_EVERY == 0
+                    ):
+                        try:
+                            if self.active_turn is None and not self.session_occupied_excluding_active(
+                                missing_transcript_busy=False
+                            ):
+                                log("TYPE", f"self-exit: session idle at pulse={pulse_count}")
+                                break
+                        except Exception:  # noqa: BLE001
+                            pass
                     try:
                         self.telegram.send_typing()
                     except Exception as exc:  # noqa: BLE001
                         log("TYPE", f"sendChatAction failed: {exc}")
-                    wait_seconds = 1.0 if pulse_count == 1 else 4.0
+                    wait_seconds = TYPING_PULSE_FIRST_WAIT if pulse_count == 1 else TYPING_PULSE_WAIT
                     if deadline is not None:
                         wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
                     if wait_seconds <= 0:
@@ -3547,6 +3570,12 @@ class Bridge:
         # Non-fatal; never affects message delivery. Only emits when no active turn.
         if self.active_turn:
             return
+        # F9 (T-260705-04): ambient(디렉티브/mac-report) 턴 종료 지점 — typing 명시 소등.
+        # 기존엔 finish_active_turn(브릿지가 주입한 턴)만 stop_typing 을 불러, drain_queue
+        # busy 분기의 ensure_typing 이 켠 '입력중'이 보고 턴 뒤 TYPING_MAX(2h)까지 남는
+        # 유령이 됐다(2026-07-05 새벽 5노드 실측). suppress/dedupe/전송실패 분기 포함
+        # 모든 종료 경로보다 앞에서 소등한다.
+        self.stop_typing()
         # ⚠️ 제거 금지 (DO NOT REMOVE) — 이중송신 가드 (T-260628-10): mac-report.sh 가 같은 노드
         # 봇챗에 노드보고를 이미 보낸 경우(suppress 플래그 90초 내) skip → mac-report self-chat
         # 미러와 ambient_final 의 노드 봇챗 교차중복 차단.
