@@ -20,7 +20,10 @@ not share runtime code with the Codex Telegram Bridge.
   `CLB_AUDIO_TRANSCRIBE_CMD`.
 - Transcript-based final-answer extraction instead of screen scraping.
 - Optional flow mirror: live "work in progress" card that mirrors each tool-use
-  step of the current turn to Telegram so you can follow long runs.
+  step of the current turn to Telegram so you can follow long runs. For work that
+  starts without an active Telegram turn (autonomous or externally triggered runs),
+  the received prompt and the final result are folded into a single card that
+  updates in place, instead of posting separate "received" and "result" cards.
 - Single Telegram chat allowlist and token ownership registry.
 - Duplicate-egress guard hooks for users who also have Telegram MCP reply tools
   or terminal mirror hooks installed.
@@ -75,6 +78,33 @@ Telegram user message/media
 The bridge uses one Bot API egress path. The included hooks prevent Claude's
 Telegram MCP reply tool and terminal mirror hooks from sending duplicate
 answers while the bridge owns a turn.
+
+## Slash Commands
+
+Slash commands sent from Telegram are classified before anything is injected
+into the Claude pane. Commands that would open an interactive picker or dialog
+are never pasted raw, because a blocking dialog can freeze the one visible
+session. Each command falls into one of these groups.
+
+| Command | Behavior |
+| --- | --- |
+| `/context`, `/usage`, `/cost` | Read-only info commands. The bridge widens the tmux capture window, runs the command, waits for the render to finish before capturing (no more blank "in progress" frame), trims the terminal chrome to a clean text view, and mirrors that screen back to Telegram. |
+| `/model` | Intercepted. Pasting `/model` raw opens an interactive picker that can freeze the session, so the bridge shows an inline keyboard of model choices instead and applies the pick non-interactively as `/model <alias>`. |
+| `/clear`, `/exit`, `/quit` | Passed through unchanged; these do not open a dialog. `/exit` and `/quit` end the session, so the bridge triggers watchdog recovery for a graceful restart afterward. `/clear` only resets context. |
+| `/ping`, `/start`, `/status` | Bridge health and status, answered by the bridge itself. |
+| Anything else | Blocked from injection as a freeze-guard fail-safe. The bridge replies with the supported list instead of risking a stuck session. |
+
+To bypass the freeze guard and inject a slash command raw, prefix the Telegram
+message with `!` (for example `!/theme`).
+
+Capture tuning for `/context`, `/usage`, and `/cost`:
+
+- `CLB_CONTEXT_SETTLE_SEC` - floor delay before the first capture attempt.
+  Defaults to `1.2` seconds.
+- `CLB_CONTEXT_CAPTURE_TIMEOUT_SEC` - how long to keep polling for a finished
+  render before sending the last captured frame. Defaults to `8.0` seconds.
+- `CLB_MODEL_CHOICES` - optional comma-separated list of model aliases shown in
+  the `/model` inline keyboard.
 
 ## Files
 
@@ -181,7 +211,10 @@ Send `/ping` to the bot, then send a normal prompt.
 - Polling only; no public webhook is required.
 - One allowed Telegram chat id.
 - Token ownership registry must match the local token before polling starts.
-- Unsafe slash commands from Telegram are escaped before entering Claude.
+- Interactive slash commands that could open a blocking dialog are held back by
+  a freeze guard rather than pasted raw; a set of read-only and safe commands is
+  supported and mirrored. See [Slash Commands](#slash-commands) for the full set
+  and the `!` escape hatch.
 - The PreToolUse egress guard is included for users who also have Telegram MCP
   reply tools installed.
 - Outgoing media auto-send is not part of this minimal export.

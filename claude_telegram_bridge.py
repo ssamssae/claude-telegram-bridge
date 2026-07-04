@@ -44,9 +44,28 @@ BRIDGE_STATUS_SLASH_COMMAND = "/status"
 # /context 는 좁은 tmux 창에서 잘리므로 캡처 동안만 창을 이 폭으로 넓힌다 (codex parity, T-260702-14).
 STATUS_WIDE_CAPTURE_COLUMNS = 132
 CONTEXT_SLASH_COMMAND = "/context"
+# read-only 정보 명령 — 넓힌 창에서 실행·캡처해 터미널 화면 그대로 폰에 미러 (T-260702-14/T-260703-01).
+CAPTURE_MIRROR_SLASH_COMMANDS = {CONTEXT_SLASH_COMMAND, "/usage", "/cost"}
+# /model 은 원문 주입 시 인터랙티브 선택창이 세션을 점유(8분 프리즈 실사고 T-260703-17) —
+# 주입 전 인터셉트해 inline keyboard 로 처리하고, 적용은 비대화형 인자형(/model <alias>)으로만 주입한다.
+MODEL_SLASH_COMMAND = "/model"
+MODEL_CALLBACK = "clb-model"
+# 선택지 목록: env CLB_MODEL_CHOICES(콤마) 우선. 아래 fallback 은 모델 id 가 아니라 CLI alias 토큰
+# (하드코딩 최소화 — 새 모델은 env 로 주입, 현재 모델 표시는 settings SoT 에서 동적).
+DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
+# 프리즈 가드 밖 원문 강제 주입 escape hatch: 메시지 맨 앞 '!' 1자 (예: !/theme).
+SLASH_ESCAPE_PREFIX = "!"
+# 인터셉트 없이 그대로 통과시키는 슬래시 — 대화상자를 열지 않는(프리즈 위험 0) 명령만.
+SAFE_PASSTHROUGH_SLASH_COMMANDS = {"/clear", "/exit", "/quit"}
 # 세션을 종료시키는 슬래시 — 통과 후 브릿지가 watchdog 자가복구를 앞당겨 트리거한다.
 # /clear 는 세션을 죽이지 않으므로(컨텍스트 리셋만) 제외.
 SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
+# /model 콜백/인자형이 진행 중 턴을 만났을 때 안내문 (T-260703-23): busy 면 주입을 미룬다 —
+# clear_composer() 의 Escape 가 그 턴을 끊지 않도록. 사용자는 턴 종료 후 다시 누르면 된다.
+MODEL_BUSY_DEFER_TEXT = (
+    "⏳ 지금 진행 중인 턴이 있어 모델 전환을 미뤘어요 (진행 중 턴을 끊지 않아요).\n"
+    "턴이 끝난 뒤 다시 선택해 주세요."
+)
 MCP_TELEGRAM_REPLY_TOOL = "mcp__plugin_telegram_telegram__reply"
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
@@ -406,6 +425,65 @@ def extract_context_screen(screen: str) -> str:
     return "\n".join(lines).strip()
 
 
+# /context 시각화가 쓰는 도형(draughts/board) 글리프 — 진행바 블록(█▓▒░)은 codex 식
+# 텍스트 막대라 일부러 제외한다(보존).
+CONTEXT_CHART_GLYPHS = "⛀⛁⛂⛃⛄⛅⛆⛇⛶⛷"
+_LEADING_CHART_RE = re.compile(r"^[\s" + re.escape(CONTEXT_CHART_GLYPHS) + r"]+")
+
+
+def clean_context_screen(screen: str) -> str:
+    # T-260703-36 (codex /status 톤): /context 캡처는 좌측 도형 차트(⛁⛶ 그리드) + 우측 텍스트가
+    #   같은 행에 놓인 2단 레이아웃이다. 각 줄 선두의 (글리프|공백) 런을 걷어내 우측 텍스트만
+    #   남기면 폭-무관·글리프-무관의 깔끔한 텍스트가 된다. 텍스트가 없는 순수 차트 줄은 버린다.
+    #   진행바 블록은 CONTEXT_CHART_GLYPHS 에서 빠져 있어 그대로 보존된다.
+    out: list[str] = []
+    for raw in (screen or "").splitlines():
+        text = _LEADING_CHART_RE.sub("", raw).rstrip()
+        if not text.strip():
+            continue
+        out.append(text)
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out).strip()
+
+
+def claude_settings_model() -> str:
+    # 현재 모델은 settings SoT(~/.claude/settings.json "model")에서 동적으로 읽는다 —
+    # 모델명 하드코딩 금지 (T-260702-14). 테스트/특수 배치는 CLB_CLAUDE_SETTINGS 로 경로 오버라이드.
+    path = Path(os.environ.get("CLB_CLAUDE_SETTINGS") or (Path.home() / ".claude" / "settings.json"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        model = str(data.get("model") or "").strip()
+        return model or "(설정에 model 없음 — 세션 디폴트)"
+    except Exception:  # noqa: BLE001
+        return "(settings 확인 불가)"
+
+
+def model_menu_aliases() -> list[str]:
+    raw = os.environ.get("CLB_MODEL_CHOICES", "")
+    aliases = [alias.strip() for alias in raw.split(",") if alias.strip()]
+    return aliases or list(DEFAULT_MODEL_MENU_ALIASES)
+
+
+def model_alias_allowed(alias: str) -> bool:
+    # ⚠️ 하드닝 (T-260703-23, PR#362 리뷰): /model 적용 경로(콜백·인자형)는 이 allowlist
+    #   안의 alias 만 composer 로 주입한다. 위조 callback_data / 임의 인자가 `/model <임의문자열>`
+    #   로 흘러 들어가는 것을 차단. 전체 모델 ID 등 목록 밖 값은 '!' escape 원문 주입으로만.
+    return alias in model_menu_aliases()
+
+
+def model_alias_rejection_text(alias: str) -> str:
+    choices = " ".join(model_menu_aliases())
+    return (
+        f"⛔ 알 수 없는 모델 별칭: {alias}\n"
+        f"가능한 값: {choices}\n"
+        f"전체 모델 ID 를 그대로 적용하려면 앞에 {SLASH_ESCAPE_PREFIX} 를 붙여 원문 주입하세요 "
+        f"(예: {SLASH_ESCAPE_PREFIX}/model <id>)."
+    )
+
+
 def escape_unsafe_slash(text: str) -> str:
     # ⚠️ 안전 가드 (제거/약화 금지 without 근거) — 옛 버전은 ALLOWED_SLASH_COMMANDS
     #   allowlist(/ping·/start·/status)만 통과시키고 나머지 슬래시를 전각 ／ 로 이스케이프해
@@ -523,17 +601,30 @@ _DIRECTIVE_BOILERPLATE_RE = re.compile(
     r"^\[(?:claude-skills HEAD|CLAUDE-REVIEW-ROUTE|NODE-ACK-)"
 )
 _DIRECTIVE_DEDUP_HEADER_RE = re.compile(r"^\[[^\]]*→[^\]]*\]\s+\[[^\]]*\]")
+# T-260703-16 ①: 운반체가 주입 본문 앞에 붙이는 라우트 메타 1줄 'from=<host> | task=<T-id>'.
+# 파서(_DIRECTIVE_FROM_RE/_DIRECTIVE_TASK_RE)가 라우트를 뽑은 뒤 이 원문줄은 gist 에서
+# 뺀다 — 파이프('|')·공백 두 구분자 모두. [claude-skills HEAD] 류 라우팅 보일러플레이트.
+_DIRECTIVE_ROUTE_META_RE = re.compile(r"^from=\S+\s*\|?\s*task=")
 _DIRECTIVE_FROM_RE = re.compile(r"\bfrom=([^\s|\]]+)")
 _DIRECTIVE_TASK_RE = re.compile(r"\btask=(T-[0-9A-Za-z\-]+)")
 _DIRECTIVE_TITLE_RE = re.compile(r"\]\s*(?:디렉티브|directive)\s*[—:-]\s*(.+)$", re.IGNORECASE)
 _MAC_REPORT_TITLE_RE = re.compile(r"^\[Mac report title:\s*(.+?)\]\s*$", re.IGNORECASE)
 _BRIDGE_NONCE_RE = re.compile(r"<claude-telegram-bridge\s+nonce=")
+# T-260703-16 ②: 로컬 슬래시-명령(예: /model, /clear) 출력 레코드는 노드발 지시가 아니므로
+# 받은지시 카드 X. Claude Code 가 주입하는 <command-name>/<command-message>/<command-args>/
+# <local-command-stdout>/<local-command-caveat> 마커로 식별한다 (nonce 가드와 동형 방어).
+# 실사고 2026-07-03 09:21 로컬 /model 이 받은지시 카드 2장으로 오카드화.
+_LOCAL_COMMAND_RE = re.compile(
+    r"<(?:command-name|command-message|command-args"
+    r"|local-command-stdout|local-command-caveat)\b"
+)
 
 
 def _directive_is_boilerplate(line: str) -> bool:
     return bool(
         _DIRECTIVE_BOILERPLATE_RE.match(line)
         or _DIRECTIVE_DEDUP_HEADER_RE.match(line)
+        or _DIRECTIVE_ROUTE_META_RE.match(line)
     )
 
 
@@ -597,6 +688,8 @@ def _format_directive_card(
     from_alias: str | None = None,
     to_alias: str | None = None,
     self_emoji: str | None = None,
+    self_alias: str | None = None,
+    narrative: bool = False,
 ) -> str:
     # ⚙️ ambient flow mirror — node-originated work 의 트리거(받은 지시) 카드. 라우팅
     # 보일러플레이트 헤더([claude-skills HEAD]/[CLAUDE-REVIEW-ROUTE]/[NODE-ACK-]/발신수신
@@ -611,6 +704,9 @@ def _format_directive_card(
     # 텔레그램-origin(clb- nonce) 프롬프트는 노드발 지시가 아니므로 카드 X (caller 게이트
     # not-nonce 와 동형 방어).
     if _BRIDGE_NONCE_RE.search(raw):
+        return ""
+    # T-260703-16 ②: 로컬 슬래시-명령 출력(/model·/clear 등)은 노드발 지시가 아님 → 카드 X.
+    if _LOCAL_COMMAND_RE.search(raw):
         return ""
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     from_host: str | None = None
@@ -638,10 +734,29 @@ def _format_directive_card(
         route_line = f"{sender} → {recv}"
         if task_id:
             route_line = f"{route_line} · {task_id}"
+    title_summary = _ambient_title_summary_ko(_ambient_title_from_lines(lines), lines, route_line)
+    # alt3 이야기체 (spec v0.2 매트릭스 directive_sent aniki_dm 동형, T-260702-37 PR-B 판단 (b)
+    # 카드 유지+이야기체): 라우트 줄 "X → Y · T-…" 를 사람 문장으로 바꾼다. 발신·수신 라벨이
+    # 둘 다 해석될 때만 — 못 읽으면 기존 카드 그대로 (fallback, 행동 보존).
+    if narrative and route_from:
+        s_label, s_emoji = node_label_emoji(route_from)
+        recv_token = to_alias or self_alias or node_defaults()[0]
+        r_label, r_emoji = node_label_emoji(recv_token)
+        if s_label and r_label:
+            sentence = (
+                f"{s_emoji} {s_label}{subject_particle(s_label)} "
+                f"{r_emoji} {r_label}에게 맡겼어요"
+            )
+            if title_summary:
+                sentence = f"{sentence} — {title_summary}"
+            if task_id:
+                sentence = f"{sentence} ({task_id})"
+            parts = [sentence, *content_lines[:2]]
+            gist = "\n".join(parts)[:AMBIENT_DIRECTIVE_LIMIT].strip()
+            return gist
     parts: list[str] = []
     if route_line:
         parts.append(route_line)
-    title_summary = _ambient_title_summary_ko(_ambient_title_from_lines(lines), lines, route_line)
     if title_summary:
         parts.append(title_summary)
     parts.extend(content_lines[:2])
@@ -651,8 +766,20 @@ def _format_directive_card(
     return f"{header}\n{gist}" if gist else ""
 
 
-def format_ambient_directive(text: str, self_emoji: str | None = None) -> str:
-    return _format_directive_card(text, header=AMBIENT_DIRECTIVE_HEADER, self_emoji=self_emoji)
+def format_ambient_directive(
+    text: str,
+    self_emoji: str | None = None,
+    self_alias: str | None = None,
+) -> str:
+    # alt3 ON = 이야기체 (수신 노드 = 자기 자신, self_alias 미지정 시 hostname 해석).
+    # 송신카드(format_sent_directive)는 node_dm 운영 카드라 v0.1 불변 — narrative 미적용.
+    return _format_directive_card(
+        text,
+        header=AMBIENT_DIRECTIVE_HEADER,
+        self_emoji=self_emoji,
+        self_alias=self_alias,
+        narrative=alt3_narrative_enabled(),
+    )
 
 
 def format_sent_directive(text: str, from_alias: str, to_alias: str) -> str:
@@ -932,10 +1059,16 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return chunks
 
-    def send(self, text: str) -> list[int] | None:
+    def send(self, text: str, reply_to_message_id: int | None = None) -> list[int] | None:
         message_ids: list[int] = []
-        for chunk in self.chunks(text):
-            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+        for idx, chunk in enumerate(self.chunks(text)):
+            params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+            if reply_to_message_id and idx == 0:
+                # alt3 타래 (spec v0.2 §5, T-260702-37 PR-B): 분할 시 첫 chunk 만 루트에 단다.
+                # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
+                params["reply_to_message_id"] = reply_to_message_id
+                params["allow_sending_without_reply"] = "true"
+            payload = self.call("sendMessage", **params)
             if not payload or not payload.get("ok"):
                 return None
             result = payload.get("result")
@@ -1963,7 +2096,7 @@ class Bridge:
             binding = pending[0]
 
         identity = session_identity(binding.transcript_path) if binding.transcript_path.exists() else None
-        if self.session_binding != binding or (identity is not None and self.session_identity != identity):
+        if self.session_binding != binding or (identity is not None and self.transcript_identity_changed(identity)):
             self.session_binding = binding
             if identity is None:
                 self.session_identity = None
@@ -1977,7 +2110,22 @@ class Bridge:
             self.write_egress_sidecar()
         elif identity is None:
             self.write_egress_sidecar()
+        else:
+            self.session_identity = identity  # 동일 파일 성장 — size 캐시만 갱신, 재로드 없음
         return binding
+
+    def transcript_identity_changed(self, identity: SessionIdentity) -> bool:
+        # T-260704-25 F2: size 는 transcript 가 자랄 때마다 변한다 — size 성장만으로
+        # "세션 변경" 판정하면 poll 마다 load_state_for_identity 재로드가 폭주(실측
+        # 134회/2h40m)해 뒤처진 디스크 state 가 인메모리 active_turn/parent_map/
+        # session_pos 를 덮어쓴다 (🧠 reasoning 미러 유실·상태훼손, T-260701-74 연계).
+        # 변경으로 보는 것: 파일 교체(dev/ino/path) 또는 축소(truncation 이상신호)뿐.
+        prev = self.session_identity
+        if prev is None:
+            return True
+        if (prev.dev, prev.ino, prev.path) != (identity.dev, identity.ino, identity.path):
+            return True
+        return identity.size < prev.size
 
     def write_egress_sidecar(self) -> None:
         binding = self.session_binding
@@ -2043,16 +2191,26 @@ class Bridge:
 
         def loop() -> None:
             deadline = time.monotonic() + max_seconds if max_seconds else None
-            while not stop_event.is_set():
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-                self.telegram.send_typing()
-                wait_seconds = 4.0
-                if deadline is not None:
-                    wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
-                if wait_seconds <= 0:
-                    break
-                stop_event.wait(wait_seconds)
+            pulse_count = 0
+            try:
+                while not stop_event.is_set():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+                    pulse_count += 1
+                    try:
+                        self.telegram.send_typing()
+                    except Exception as exc:  # noqa: BLE001
+                        log("TYPE", f"sendChatAction failed: {exc}")
+                    wait_seconds = 1.0 if pulse_count == 1 else 4.0
+                    if deadline is not None:
+                        wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
+                    if wait_seconds <= 0:
+                        break
+                    stop_event.wait(wait_seconds)
+            finally:
+                with self.typing_lock:
+                    if self.typing_stop is stop_event:
+                        self.typing_stop = None
 
         threading.Thread(target=loop, daemon=True, name="clb-typing").start()
         return stop_event
@@ -2061,6 +2219,12 @@ class Bridge:
         with self.typing_lock:
             if self.typing_stop:
                 self.typing_stop.set()
+            self.typing_stop = self.start_typing_loop(self.config.typing_max_seconds)
+
+    def ensure_typing(self) -> None:
+        with self.typing_lock:
+            if self.typing_stop:
+                return
             self.typing_stop = self.start_typing_loop(self.config.typing_max_seconds)
 
     def stop_typing(self) -> None:
@@ -2632,15 +2796,22 @@ class Bridge:
             self.queue.append_status(item, "enqueued")
         log("QUEUE", f"enqueued update={update_id} queue={queue_id[:10]}")
 
-    def handle_context_command(self, item: "QueueItem") -> None:
-        # /context 시각화는 넓은 폭을 요구해 좁은 tmux 창에선 capture 가 잘린다.
-        # 캡처 동안만 창을 넓혀 /context 를 실행·캡처하고 폰으로 미러한다 (codex parity).
+    def handle_capture_command(self, item: "QueueItem", command_token: str) -> None:
+        # /context /usage /cost — read-only 정보 명령. 시각화가 넓은 폭을 요구해 좁은
+        # tmux 창에선 capture 가 잘리므로, 캡처 동안만 창을 넓혀 실행·캡처하고
+        # 터미널 화면 그대로 폰에 미러한다 (codex /status 동형, T-260702-14/T-260703-01).
         try:
             self.telegram.send_typing()
         except Exception:  # noqa: BLE001
             pass
         prompt = escape_unsafe_slash(sanitize_text(item.text))
         settle = float(os.environ.get("CLB_CONTEXT_SETTLE_SEC", "1.2"))
+        # T-260703-36: 고정 settle 후 1회 캡처는 렌더가 settle 안에 안 끝나면(예: /context
+        #   "✦ Forging..." 지연) 스피너 프레임을 찍어 빈 화면만 미러했다. settle 을 바닥값으로
+        #   두되, 활성 작업 스피너(screen_has_active_work — esc-to-interrupt/spinner)가 사라질
+        #   때까지 재캡처 폴링해 렌더 완료 프레임을 잡는다. /usage·/cost 도 동일 경로라 함께 수혜.
+        capture_timeout = float(os.environ.get("CLB_CONTEXT_CAPTURE_TIMEOUT_SEC", "8.0"))
+        poll = float(os.environ.get("CLB_CONTEXT_POLL_SEC", "0.4"))
         try:
             with self.repl.temporary_window_width(STATUS_WIDE_CAPTURE_COLUMNS):
                 for _ in range(self.config.composer_clear_retries):
@@ -2648,15 +2819,129 @@ class Bridge:
                 self.repl.paste_prompt(prompt)
                 time.sleep(settle)
                 screen = self.repl.capture_pane(120)
-            answer = extract_context_screen(screen)
-            self.telegram.send(answer or "claude bridge /context: 캡처된 화면이 비어 있습니다.")
-            self.queue.append_status(item, "injected", slash_command=CONTEXT_SLASH_COMMAND)
-            self.queue.append_status(item, "sent", slash_command=CONTEXT_SLASH_COMMAND)
-            log("INJECT", f"/context wide-capture mirrored update={item.update_id}")
+                deadline = time.monotonic() + max(capture_timeout, 0.0)
+                while screen_has_active_work(screen) and time.monotonic() < deadline:
+                    try:
+                        self.telegram.send_typing()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    time.sleep(poll)
+                    screen = self.repl.capture_pane(120)
+            # codex /status 톤: 도형 차트 그리드를 걷어낸 깔끔 텍스트 우선, 정리 결과가 비면
+            # 원본 캡처(글리프 포함)로 폴백 (T-260703-36).
+            answer = clean_context_screen(screen) or extract_context_screen(screen)
+            self.telegram.send(answer or f"claude bridge {command_token}: 캡처된 화면이 비어 있습니다.")
+            self.queue.append_status(item, "injected", slash_command=command_token)
+            self.queue.append_status(item, "sent", slash_command=command_token)
+            log("INJECT", f"{command_token} wide-capture mirrored update={item.update_id}")
         except Exception as exc:  # noqa: BLE001
-            log("INJECT", f"/context capture failed: {exc}")
+            log("INJECT", f"{command_token} capture failed: {exc}")
             self.queue.append_status(item, "failed", error=str(exc))
-            self.telegram.send(f"claude bridge /context failed: {exc}")
+            self.telegram.send(f"claude bridge {command_token} failed: {exc}")
+
+    def handle_model_command(self, item: "QueueItem") -> None:
+        # /model 인터셉트 (T-260703-17 프리즈 실사고 재발방지): bare 는 선택지 키보드,
+        # 인자형은 TUI 를 열지 않으므로 그대로 주입(비대화형 적용) + 적용 확인 회신.
+        text = sanitize_text(item.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) > 1:
+            alias = parts[1].strip()
+            # ⚠️ 하드닝 (T-260703-23): 인자형도 allowlist 밖 alias 는 주입 거부 — 콜백 경로와 동형.
+            if not model_alias_allowed(alias):
+                self.telegram.send(model_alias_rejection_text(alias))
+                self.queue.append_status(item, "blocked", slash_command=MODEL_SLASH_COMMAND)
+                log("INJECT", f"/model arg rejected (not allowlisted): {alias!r} update={item.update_id}")
+                return
+            try:
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(f"/model {alias}")
+            except Exception as exc:  # noqa: BLE001
+                log("INJECT", f"/model arg apply failed: {exc}")
+                self.queue.append_status(item, "failed", error=str(exc))
+                self.telegram.send(f"claude bridge /model 적용 실패: {exc}")
+                return
+            time.sleep(float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
+            applied = claude_settings_model()
+            self.telegram.send(f"모델 적용을 보냈어요: {alias}\n현재 설정: {applied}")
+            self.queue.append_status(item, "injected", slash_command=MODEL_SLASH_COMMAND)
+            self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
+            log("INJECT", f"/model arg={alias} applied update={item.update_id}")
+            return
+        current = claude_settings_model()
+        buttons = [
+            [
+                {
+                    "text": ("✅ " if alias and alias in current else "") + alias,
+                    "callback_data": f"{MODEL_CALLBACK}::{alias}",
+                }
+            ]
+            for alias in model_menu_aliases()
+        ]
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        self.telegram.call(
+            "sendMessage",
+            chat_id=self.config.chat_id,
+            text=prefix(f"현재 모델: {current}\n바꿀 모델을 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"),
+            reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+        )
+        self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
+        log("INJECT", f"/model menu sent update={item.update_id}")
+
+    def handle_blocked_slash(self, item: "QueueItem", command_token: str) -> None:
+        # 프리즈 가드 fail-safe (T-260702-14): 지원 목록 밖 슬래시는 인터랙티브
+        # 대화상자로 세션이 얼 수 있어 주입하지 않는다. escape hatch 1개만 안내.
+        supported = "/model /context /usage /cost /status /clear /exit /quit /ping /start"
+        self.telegram.send(
+            f"⛔ {command_token} 은(는) 인터랙티브 대화상자를 열어 세션이 얼 수 있어 주입을 차단했어요.\n"
+            f"지원 명령: {supported}\n"
+            f"그래도 원문 그대로 보내려면 맨 앞에 {SLASH_ESCAPE_PREFIX} 를 붙여주세요 (예: {SLASH_ESCAPE_PREFIX}{command_token})."
+        )
+        self.queue.append_status(item, "blocked", slash_command=command_token)
+        log("INJECT", f"slash blocked token={command_token} update={item.update_id}")
+
+    def _emit_model_notice(self, text: str, menu_message_id: int | None) -> None:
+        # 메뉴 메시지가 있으면 그 자리를 edit(적용/거부/대기 확인), 없으면 새 메시지로 회신.
+        if menu_message_id is not None:
+            self.telegram.call(
+                "editMessageText",
+                chat_id=self.config.chat_id,
+                message_id=menu_message_id,
+                text=text,
+            )
+        else:
+            self.telegram.send(text)
+
+    def apply_model_choice(self, alias: str, menu_message_id: int | None = None) -> None:
+        # inline keyboard 선택 콜백 → 비대화형 인자형 주입 + 메뉴 메시지를 적용 확인으로 edit.
+        # ⚠️ 하드닝 (T-260703-23, PR#362 리뷰 YELLOW):
+        #   ① allowlist — model_menu_aliases() 밖 alias(위조 callback_data 포함)는 주입 거부.
+        #   ② idle 게이트 — 진행 중 턴이 있으면 주입하지 않는다. clear_composer()의 첫 키가
+        #      Escape 라, busy 일 때 주입하면 진행 중 턴을 끊어버린다. 대기 안내만 하고 반환.
+        #   두 실패 모두 composer 를 건드리지 않는다(턴 무영향).
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        if not model_alias_allowed(alias):
+            self._emit_model_notice(prefix(model_alias_rejection_text(alias)), menu_message_id)
+            log("INJECT", f"/model choice rejected (not allowlisted): {alias!r}")
+            return
+        state = self.busy_state()
+        if state != "idle":
+            self._emit_model_notice(prefix(MODEL_BUSY_DEFER_TEXT), menu_message_id)
+            log("INJECT", f"/model choice deferred (busy state={state}): {alias}")
+            return
+        try:
+            for _ in range(self.config.composer_clear_retries):
+                self.repl.clear_composer()
+            self.repl.paste_prompt(f"/model {alias}")
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/model choice apply failed: {exc}")
+            self.telegram.send(f"claude bridge /model 적용 실패: {exc}")
+            return
+        time.sleep(float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
+        applied = claude_settings_model()
+        text = prefix(f"✅ 모델 선택 적용: {alias}\n현재 설정: {applied}")
+        self._emit_model_notice(text, menu_message_id)
+        log("INJECT", f"/model choice={alias} applied")
 
     def trigger_lifecycle_recovery(self, command_token: str) -> None:
         # /exit·/quit 통과 후 Claude Code 세션이 종료되면 브릿지는 inject 대상을 잃는다.
@@ -2689,15 +2974,18 @@ class Bridge:
             # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
             # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 아니키 "백그라운드 작업일 때도
             # 타이핑"). active typing 루프(begin_typing)가 이미 돌면 중복 안 쏨.
-            if self.typing_stop is None:
-                self.telegram.send_typing()
+            self.ensure_typing()
             log("BUSY", f"skip inject state={state}")
             return
         with self.lock:
             if self.active_turn or not self.pending:
                 return
             item = self.pending.pop(0)
-            slash_command = bool(slash_token(item.text))
+            stripped_text = (item.text or "").strip()
+            escape_slash = stripped_text.startswith(SLASH_ESCAPE_PREFIX) and bool(
+                slash_token(stripped_text[len(SLASH_ESCAPE_PREFIX):].lstrip())
+            )
+            slash_command = bool(slash_token(item.text)) or escape_slash
             if slash_command:
                 self.reset_ambient_flow()
             else:
@@ -2712,14 +3000,33 @@ class Bridge:
                 # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
                 self.reset_ambient_flow()
         if slash_command:
-            command_token = slash_token(item.text)
-            # /context 는 codex 브릿지처럼 넓힌 창에서 캡처해 폰으로 미러 (좁은 창 truncation 해결).
-            if command_token == CONTEXT_SLASH_COMMAND:
-                self.handle_context_command(item)
-                self.persist_state()
-                self.write_egress_sidecar()
-                return
-            prompt = escape_unsafe_slash(sanitize_text(item.text))
+            # ── T-260702-14 슬래시 인터셉트 레이어 (codex 브릿지 동형) ──
+            # escape hatch: '!' prefix 는 프리즈 가드를 명시적으로 우회해 원문 그대로 주입.
+            inject_text = item.text
+            if escape_slash:
+                inject_text = stripped_text[len(SLASH_ESCAPE_PREFIX):].lstrip()
+                command_token = slash_token(inject_text)
+            else:
+                command_token = slash_token(item.text)
+                # read-only 정보 명령(/context /usage /cost) = 넓힌 창 캡처 미러.
+                if command_token in CAPTURE_MIRROR_SLASH_COMMANDS:
+                    self.handle_capture_command(item, command_token)
+                    self.persist_state()
+                    self.write_egress_sidecar()
+                    return
+                # /model = 인터셉트 (원문 주입 시 선택창 프리즈 — T-260703-17 실사고).
+                if command_token == MODEL_SLASH_COMMAND:
+                    self.handle_model_command(item)
+                    self.persist_state()
+                    self.write_egress_sidecar()
+                    return
+                # 프리즈 가드 fail-safe: 지원 목록 밖 슬래시 = 주입 차단 + 안내.
+                if command_token not in SAFE_PASSTHROUGH_SLASH_COMMANDS:
+                    self.handle_blocked_slash(item, command_token)
+                    self.persist_state()
+                    self.write_egress_sidecar()
+                    return
+            prompt = escape_unsafe_slash(sanitize_text(inject_text))
             try:
                 for _ in range(self.config.composer_clear_retries):
                     self.repl.clear_composer()
@@ -2908,7 +3215,7 @@ class Bridge:
         if claim == "outbox_sent":
             log("SEND", "skip duplicate outbox key")
             mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
-            self.finish_active_turn("sent")
+            self.finish_active_turn("sent", active)
             return
         if not claim:
             return
@@ -2932,7 +3239,7 @@ class Bridge:
             active.send_in_progress = True
             return key
 
-    def claim_retry_send_attempt(self) -> tuple[ActiveTurn, str, str, str] | str | None:
+    def claim_retry_send_attempt(self) -> tuple[ActiveTurn, str, str, str] | tuple[str, ActiveTurn, str] | None:
         with self.lock:
             active = self.active_turn
             if not active or not active.pending_answer or not active.pending_assistant_uuid:
@@ -2946,7 +3253,7 @@ class Bridge:
             assistant_uuid = active.pending_assistant_uuid
             key = answer_outbox_key(active.nonce, assistant_uuid, answer)
             if self.outbox.contains(key):
-                return "outbox_sent"
+                return "outbox_sent", active, answer
             active.assistant_uuid = assistant_uuid
             active.pending_outbox_key = key
             active.send_attempts += 1
@@ -3031,15 +3338,15 @@ class Bridge:
             attempts=active.send_attempts,
         )
         log("SEND", f"sent final nonce={active.nonce} assistant={assistant_uuid}")
-        self.finish_active_turn("sent")
+        self.finish_active_turn("sent", active)
 
     def retry_pending_send(self) -> None:
         claim = self.claim_retry_send_attempt()
-        if claim == "outbox_sent":
+        if isinstance(claim, tuple) and claim and claim[0] == "outbox_sent":
             log("SEND", "skip duplicate outbox key")
-            active = self.active_turn
-            mesh_ledger_record("sendMessage", self.config.chat_id, active.pending_answer if active else None, result="suppressed")
-            self.finish_active_turn("sent")
+            _, active, answer = claim
+            mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
+            self.finish_active_turn("sent", active)
             return
         if not claim:
             return
@@ -3168,7 +3475,7 @@ class Bridge:
         if active.external_reply_seen:
             log("SEND", "skip final because external reply tool was seen")
             mesh_ledger_record("sendMessage", self.config.chat_id, answer, result="suppressed")
-            self.finish_active_turn("answered")
+            self.finish_active_turn("answered", active)
             return
         assistant_uuid = str(record.get("uuid") or "")
         reasoning = active.accumulated_reasoning or content_thinking(content)
@@ -3265,7 +3572,27 @@ class Bridge:
             return
         self.ambient_final_last_key = key
         anchor = self.ambient_directive_message_id
-        if anchor:
+        if anchor and alt3_narrative_enabled():
+            # alt3 (spec v0.2 §6, T-260702-37 PR-B): 받은지시 카드 edit-통합 모델 폐기 →
+            # 결과는 받은지시 루트에 native reply (같은 chat·같은 봇이라 §5-3 충족).
+            # 본문은 R-C1 자연어 그대로(✅ chrome 없음) — 연결은 reply 인용이 표현한다.
+            # reply send 실패 시 폴백 = 기존 ✅ 카드 send (결과 1장 보장).
+            try:
+                ids = self.telegram.send(text, reply_to_message_id=anchor)
+                if ids:
+                    log("SEND", f"sent ambient final as reply to directive root mid={anchor}")
+                else:
+                    self.telegram.send(format_ambient_final(text))
+                    log("SEND", "ambient final reply failed → fallback card send")
+            except Exception as exc:  # noqa: BLE001
+                log("SEND", f"ambient final reply failed → fallback send (non-fatal): {exc}")
+                try:
+                    self.telegram.send(format_ambient_final(text))
+                except Exception as exc2:  # noqa: BLE001
+                    log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
+            self.ambient_directive_message_id = 0
+            self.ambient_directive_body = ""
+        elif anchor:
             # ⚙️ T-260630-48 — 받은지시 앵커 카드를 결과까지 포함한 1장으로 in-place 통합
             # (새 ✅ 카드 X). 받은지시→노드결과 2장 중복 제거. edit 실패 시 폴백으로 새 카드 send
             # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
@@ -3291,26 +3618,33 @@ class Bridge:
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
 
-    def finish_active_turn(self, status: str) -> None:
+    def finish_active_turn(self, status: str, active: ActiveTurn) -> bool:
         with self.lock:
-            active = self.active_turn
+            if self.active_turn is not active:
+                current = self.active_turn
+                current_queue = current.queue_id[:10] if current else "-"
+                log(
+                    "TURN",
+                    f"skip stale finish expected={active.queue_id[:10]} current={current_queue} status={status}",
+                )
+                return False
             self.active_turn = None
         self.stop_typing()
-        if active:
-            self.queue.append_status(
-                QueueItem(
-                    active.queue_id,
-                    active.update_id,
-                    active.message_id,
-                    active.text,
-                    active.nonce,
-                    active.injected_at,
-                ),
-                status,
-            )
+        self.queue.append_status(
+            QueueItem(
+                active.queue_id,
+                active.update_id,
+                active.message_id,
+                active.text,
+                active.nonce,
+                active.injected_at,
+            ),
+            status,
+        )
         self.persist_state()
         self.write_egress_sidecar()
         self.drain_queue()
+        return True
 
     def quarantine_line(self, line: bytes, error: str, start: int, end: int) -> None:
         append_jsonl(
@@ -3430,6 +3764,15 @@ class Bridge:
                         if str(cb_chat.get("id")) == str(self.config.chat_id):
                             self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text="업데이트를 시작합니다…")
                             perform_self_update(data.split("::", 1)[1])
+                    elif data.startswith(f"{MODEL_CALLBACK}::"):
+                        # /model inline keyboard 선택 → 비대화형 인자형 적용 (T-260702-14)
+                        cb_chat = (cb.get("message") or {}).get("chat") or {}
+                        if str(cb_chat.get("id")) == str(self.config.chat_id):
+                            # 토스트는 결과(적용/거부/대기) 확정 전에 뜨므로 중립 문구 — 실제 결과는
+                            # apply_model_choice 가 메뉴 메시지를 edit 해서 durable 하게 알린다 (T-260703-23).
+                            self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text="확인 중…")
+                            menu_message_id = (cb.get("message") or {}).get("message_id")
+                            self.apply_model_choice(data.split("::", 1)[1], menu_message_id=menu_message_id)
                     continue
                 self.enqueue_update(update)
                 offset = update_id + 1
