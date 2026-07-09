@@ -20,10 +20,7 @@ not share runtime code with the Codex Telegram Bridge.
   `CLB_AUDIO_TRANSCRIBE_CMD`.
 - Transcript-based final-answer extraction instead of screen scraping.
 - Optional flow mirror: live "work in progress" card that mirrors each tool-use
-  step of the current turn to Telegram so you can follow long runs. For work that
-  starts without an active Telegram turn (autonomous or externally triggered runs),
-  the received prompt and the final result are folded into a single card that
-  updates in place, instead of posting separate "received" and "result" cards.
+  step of the current turn to Telegram so you can follow long runs.
 - Single Telegram chat allowlist and token ownership registry.
 - Duplicate-egress guard hooks for users who also have Telegram MCP reply tools
   or terminal mirror hooks installed.
@@ -88,7 +85,8 @@ session. Each command falls into one of these groups.
 
 | Command | Behavior |
 | --- | --- |
-| `/context`, `/usage`, `/cost` | Read-only info commands. The bridge widens the tmux capture window, runs the command, waits for the render to finish before capturing (no more blank "in progress" frame), trims the terminal chrome to a clean text view, and mirrors that screen back to Telegram. |
+| `/context` | Read-only context screen. The bridge widens the tmux capture window, runs `/context`, captures the pane with ANSI color, renders it locally to PNG, and replies with `sendPhoto` to the same Telegram chat. |
+| `/usage`, `/cost` | Read-only info commands. The bridge widens the tmux capture window, waits for the render to finish, trims terminal chrome to a clean text view, and mirrors that text back to Telegram. |
 | `/model` | Intercepted. Pasting `/model` raw opens an interactive picker that can freeze the session, so the bridge shows an inline keyboard of model choices instead and applies the pick non-interactively as `/model <alias>`. |
 | `/clear`, `/exit`, `/quit` | Passed through unchanged; these do not open a dialog. `/exit` and `/quit` end the session, so the bridge triggers watchdog recovery for a graceful restart afterward. `/clear` only resets context. |
 | `/ping`, `/start`, `/status` | Bridge health and status, answered by the bridge itself. |
@@ -103,6 +101,9 @@ Capture tuning for `/context`, `/usage`, and `/cost`:
   Defaults to `1.2` seconds.
 - `CLB_CONTEXT_CAPTURE_TIMEOUT_SEC` - how long to keep polling for a finished
   render before sending the last captured frame. Defaults to `8.0` seconds.
+- `CLB_CONTEXT_IMAGE_FONT` - optional local monospace font path used when
+  rendering `/context` PNG output. Defaults to common system monospace fonts.
+- `CLB_CONTEXT_IMAGE_FONT_SIZE` - `/context` PNG font size. Defaults to `17`.
 - `CLB_MODEL_CHOICES` - optional comma-separated list of model aliases shown in
   the `/model` inline keyboard.
 
@@ -114,6 +115,23 @@ Capture tuning for `/context`, `/usage`, and `/cost`:
 - `hooks/claude-telegram-bridge-pretool-block.sh` - blocks Telegram MCP replies
   during bridge-owned turns.
 - `config.example.env` - local environment template.
+
+## Install
+
+Install from PyPI with `pipx` (recommended) or `pip`:
+
+```bash
+pipx install claude-telegram-bridge
+```
+
+```bash
+pip install --user claude-telegram-bridge
+```
+
+This provides the `claude-telegram-bridge` command. Installed copies also get
+the startup version check with a one-tap Telegram update button. Running from
+a clone works too: use `python3 claude_telegram_bridge.py` in place of the
+installed command.
 
 ## Minimal Manual Setup
 
@@ -217,7 +235,9 @@ Send `/ping` to the bot, then send a normal prompt.
   and the `!` escape hatch.
 - The PreToolUse egress guard is included for users who also have Telegram MCP
   reply tools installed.
-- Outgoing media auto-send is not part of this minimal export.
+- Outgoing media is limited to bridge-owned local outputs such as `/context`
+  PNG replies; assistant answer attachment auto-discovery is not part of this
+  minimal export.
 
 ## Optional Settings
 

@@ -12,10 +12,13 @@ live tmux pane and tails the SessionStart-bound transcript sidecar.
 
 from __future__ import annotations
 
+import argparse
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import http.client
 import json
+import math
 import mimetypes
 import os
 import re
@@ -24,8 +27,10 @@ import signal
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -68,8 +73,12 @@ MODEL_BUSY_DEFER_TEXT = (
 )
 MCP_TELEGRAM_REPLY_TOOL = "mcp__plugin_telegram_telegram__reply"
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
 BRACKETED_PASTE_RE = re.compile(r"\x1b\[(?:200|201)~")
-NONCE_RE = re.compile(r"clb-[0-9a-f]{24,64}")
+NONCE_RE = re.compile(r"clb-[0-9a-f]{8,64}")
+OUTBOUND_CLB_ENVELOPE_RE = re.compile(r"</?claude-telegram-bridge\b[^>]*>|<clb-[0-9a-f]{8,64}/>")
+OUTBOUND_CLB_NONCE_RE = re.compile(r"\bclb-[0-9a-f]{8,64}\b")
+OUTBOUND_CLB_GAP_RE = re.compile(r"[ \t]{2,}")
 REASONING_HEADER = "\U0001f9e0 클로드 사고"
 REASONING_MIRROR_LIMIT = 3500
 # ⚙️ flow mirror — relays intermediate tool_use steps to Telegram in real time so
@@ -83,6 +92,11 @@ AMBIENT_DIRECTIVE_HEADER = "📥 받은 지시"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
+VOICE_PROMPT_HEADER = "[voice]"
+VOICE_PROMPT_INSTRUCTION = (
+    "음성 질문입니다. 2~3문장으로 짧게 한국어로 답하세요. "
+    "무무 클론목소리로 바로 읽을 수 있게 본문만 답하세요."
+)
 # F9 (T-260705-04) — typing 루프 pulse/self-liveness 튜닝. 소등 호출을 놓친 경로가
 # 있어도(예: ambient 턴 종료) 루프가 세션 유휴를 스스로 감지해 소등한다. probe 실패는
 # 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
@@ -91,6 +105,10 @@ TYPING_PULSE_WAIT = 4.0
 TYPING_LIVENESS_GRACE_PULSES = 5
 TYPING_LIVENESS_CHECK_EVERY = 5
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
+ENVELOPE_SIDECAR_FLAG = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_FLAG", "~/.choso/clb-envelope-sidecar.on")).expanduser()
+ENVELOPE_SIDECAR_PATH = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_PATH", "~/.choso/clb-envelope-sidecar.jsonl")).expanduser()
+ENVELOPE_SIDECAR_SCHEMA = "claude-telegram-bridge-envelope-sidecar/v1"
+DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS = 120.0
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
 # cards read like the Korean Codex cards. Unmapped tools keep their original name.
 TOOL_LABEL_KO = {
@@ -136,6 +154,12 @@ ACTIVE_WORK_RE = re.compile(
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+TELEGRAM_MEDIA_PROMPT_PREFIXES = (
+    "[Telegram image received]",
+    "[Telegram audio received]",
+    "[Telegram video received]",
+    "[Telegram file received]",
+)
 
 
 def env(name: str, default: str | None = None) -> str | None:
@@ -156,9 +180,63 @@ def int_env(name: str, default: int, minimum: int = 0) -> int:
     return value if value >= minimum else default
 
 
+def float_env(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        value = float(env(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= minimum else default
+
+
 def bool_env(name: str, default: bool = False) -> bool:
     fallback = "1" if default else "0"
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
+
+
+def busy_inject_enabled() -> bool:
+    # T-260707-36 env 게이트 (기본 off). generating(진행 중) 턴 위에 Escape 없이 메시지를
+    # 얹어 Claude Code TUI 의 native 큐잉에 실어 다음 턴으로 반영시키는 경로를 켠다. 안전
+    # 롤아웃용 — off 면 기존 동작(idle 까지 큐 대기) 그대로. 매 drain 시점에 읽어 토글 반영.
+    return bool_env("CLB_BUSY_INJECT", False)
+
+
+def busy_submit_key() -> str:
+    # busy(generating) 중 native 큐잉 제출키. 기본 Enter. codex 브릿지는 이 키가 Tab 이다
+    # (Codex TUI 는 진행 중 Enter 가 composer 에 텍스트를 남길 수 있어 Tab 로 큐잉). Claude
+    # Code TUI 의 generating 중 큐잉 제출키가 Enter 가 맞는지는 미검증 — 아니면 이 env 로 교체.
+    return env("CLB_BUSY_SUBMIT_KEY", "Enter") or "Enter"
+
+
+def is_telegram_media_prompt(text: str) -> bool:
+    return text.lstrip().startswith(TELEGRAM_MEDIA_PROMPT_PREFIXES)
+
+
+def composer_lock_path() -> Path:
+    # codex composer_lock_path() 미러 — busy-inject/idle 주입/슬래시 핸들러의 composer
+    # 동시쓰기 경합을 파일 flock 으로 직렬화. codex 락과는 별도 파일(다른 TUI/pane).
+    return Path(os.environ.get("CLB_COMPOSER_LOCK", "~/.choso/claude-composer.lock")).expanduser()
+
+
+def composer_residual_text(screen: str) -> str:
+    """busy-inject 안전 가드: Claude composer 프롬프트 라인(``> …``)에 남아 있는 잔여 입력 추출.
+
+    generating 중 composer 에 사용자가 이미 타이핑해 둔 텍스트가 있으면, 우리가 paste 한
+    프롬프트가 그 뒤에 이어붙어 오염된 채 Enter 될 수 있다. 주입 전 이 잔여를 감지해 Escape
+    없는 clear 로 확실히 비운다. 빈 문자열 = 깨끗한 composer.
+    (2026-06-28 라이덴 stuck-inject 회귀 클래스 방지.)
+    """
+    if not screen:
+        return ""
+    for line in reversed(screen.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        core = stripped.strip("│").strip()  # box-drawing 테두리 제거
+        if core.startswith(">"):
+            return core[1:].strip()
+        # 프롬프트가 아닌 콘텐츠가 최하단이면 composer 는 비어있다고 본다
+        return ""
+    return ""
 
 
 def now_ts() -> str:
@@ -167,6 +245,10 @@ def now_ts() -> str:
 
 def log(label: str, message: str) -> None:
     print(f"[{now_ts()}] {label:<6} {message}", flush=True)
+
+
+def is_tmux_session_lost_error(error: object) -> bool:
+    return "tmux session not found" in str(error).lower()
 
 
 # ─ codex-CLI-style startup version check + button/auto self-update ─────────────
@@ -302,22 +384,45 @@ def read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _atomic_tmp(path: Path) -> tuple[int, Path]:
+    # T-260704-37 F5: tmp 는 호출마다 유니크(mkstemp) — 고정 '<name>.tmp' 는 동시
+    # 쓰기가 같은 경로를 공유하다 첫 replace 후 두번째 replace 가 FileNotFoundError
+    # 로 죽는 race (라이덴 2026-07-04 23:36 크래시 실측, exit 2 → 브릿지 전체 다운).
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    return fd, Path(name)
+
+
 def write_text_atomic(path: Path, value: str | int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(str(value), encoding="utf-8")
-    tmp.replace(path)
+    fd, tmp = _atomic_tmp(path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(value))
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    tmp.replace(path)
+    fd, tmp = _atomic_tmp(path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     try:
         dir_fd = os.open(str(path.parent), os.O_RDONLY)
     except OSError:
@@ -403,6 +508,17 @@ def sanitize_text(text: str, limit: int = 12000) -> str:
     return text
 
 
+def strip_ansi_control(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def strip_bridge_nonce_markers(text: str) -> str:
+    text = OUTBOUND_CLB_ENVELOPE_RE.sub("", text or "")
+    text = OUTBOUND_CLB_NONCE_RE.sub("", text)
+    lines = [OUTBOUND_CLB_GAP_RE.sub(" ", line).rstrip() for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
+
 def safe_filename_part(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in value)
     return cleaned.strip("-")[:80] or "file"
@@ -423,13 +539,73 @@ def slash_token(text: str) -> str:
     return stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
 
+# /context TUI 그리드 문자 — 텔레그램 클라이언트 폰트가 못 그려 밑줄로 뭉개진다 (T-260703-01 스크린샷 실측)
+CONTEXT_GRID_GLYPHS = "⛁⛀⛶⛝"
+CONTEXT_BAR_SLOTS = 20
+CONTEXT_TOKENS_RE = re.compile(
+    r"(?P<used>[\d.,]+[kKmM]?)\s*/\s*(?P<total>[\d.,]+[kKmM]?)\s*tokens\s*\((?P<pct>\d{1,3}(?:\.\d+)?)%\)"
+)
+CONTEXT_CATEGORY_RE = re.compile(
+    r"(?P<name>System prompt|System tools|MCP tools|Memory files|Skills|Messages|Free space)\s*:?\s*"
+    r"(?P<size>[\d.,]+[kKmM]?)?\s*(?:tokens\s*)?\((?P<pct>\d{1,3}(?:\.\d+)?)%\)"
+)
+
+
+def render_context_bar(pct: float, slots: int = CONTEXT_BAR_SLOTS) -> str:
+    filled = max(0, min(slots, round(slots * pct / 100.0)))
+    return "[" + "█" * filled + "░" * (slots - filled) + "]"
+
+
 def extract_context_screen(screen: str) -> str:
-    # 넓힌 창에서 capture 한 pane 텍스트에서 후행 빈 줄만 다듬어 반환한다.
-    # (좁은 창 truncation 은 temporary_window_width 로 이미 해소된 상태.)
-    lines = (screen or "").rstrip("\n").splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    return "\n".join(lines).strip()
+    # 코덱스 /status 패리티 (T-260703-01): raw TUI 캡처(⛁⛶ 그리드)를 그대로 보내면
+    # 텔레그램 폰트가 밑줄로 뭉개므로, 숫자만 파싱해 텔레그램-안전 바(█░)로 재조립한다.
+    # extract_codex_status_text(codex-repl-telegram-bridge.py) 와 동형 접근.
+    # 파싱 실패(레이아웃 변경 등) 시 glyph 만 벗겨낸 평문 폴백 — raw 그리드 전송은 금지.
+    raw = strip_ansi_control(screen or "").rstrip("\n")
+    header_idx = raw.rfind("Context Usage")
+    scan = raw[header_idx:] if header_idx != -1 else raw
+
+    model = ""
+    tokens = None
+    cats: list[tuple[str, str, str]] = []
+    for line in scan.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if tokens is None:
+            m = CONTEXT_TOKENS_RE.search(text)
+            if m:
+                tokens = m
+                continue
+        m = CONTEXT_CATEGORY_RE.search(text)
+        if m:
+            cats.append((m.group("name"), m.group("size") or "", m.group("pct")))
+            continue
+        stripped = text.strip(CONTEXT_GRID_GLYPHS + " ")
+        if not model and stripped.startswith("claude-"):
+            model = stripped.split()[0]
+
+    if tokens is not None:
+        pct = float(tokens.group("pct"))
+        out = ["Claude context"]
+        if model:
+            out.append(f"Model: {model}")
+        out.append(f"Context: {tokens.group('used')}/{tokens.group('total')} tokens ({tokens.group('pct')}%)")
+        out.append(f"{render_context_bar(pct)} {tokens.group('pct')}%")
+        for name, size, cpct in cats:
+            if name in ("Messages", "Free space"):
+                size_part = f"{size} " if size else ""
+                out.append(f"{name}: {size_part}({cpct}%)")
+        return "\n".join(out)
+
+    # 폴백: glyph 제거 + 다중 공백 축약한 평문 (파싱 불가 레이아웃 대비)
+    cleaned: list[str] = []
+    for line in raw.splitlines():
+        text = re.sub("[" + CONTEXT_GRID_GLYPHS + "]", "", line).strip()
+        text = re.sub(r"\s{2,}", "  ", text)
+        if text:
+            cleaned.append(text)
+    return "\n".join(cleaned).strip()
 
 
 # /context 시각화가 쓰는 도형(draughts/board) 글리프 — 진행바 블록(█▓▒░)은 codex 식
@@ -437,16 +613,27 @@ def extract_context_screen(screen: str) -> str:
 CONTEXT_CHART_GLYPHS = "⛀⛁⛂⛃⛄⛅⛆⛇⛶⛷"
 _LEADING_CHART_RE = re.compile(r"^[\s" + re.escape(CONTEXT_CHART_GLYPHS) + r"]+")
 
+# T-260704-38 F6: 캡처에 섞이는 터미널 크롬 — 셸 프롬프트 줄(user@host:...)과 입력창
+# 단축키 힌트. 스테이터스라인은 노드별 커스텀 포맷이라 패턴화하지 않고 블록 추출
+# (extract_slash_command_block — 다음 프롬프트 마커에서 절단)로 걷어낸다.
+CONTEXT_CHROME_RE = re.compile(
+    r"^\S+@\S+:|bypass permissions|\? for shortcuts|esc to interrupt", re.IGNORECASE
+)
+_SEPARATOR_LINE_RE = re.compile(r"^[─━\s]+$")
+
 
 def clean_context_screen(screen: str) -> str:
     # T-260703-36 (codex /status 톤): /context 캡처는 좌측 도형 차트(⛁⛶ 그리드) + 우측 텍스트가
     #   같은 행에 놓인 2단 레이아웃이다. 각 줄 선두의 (글리프|공백) 런을 걷어내 우측 텍스트만
     #   남기면 폭-무관·글리프-무관의 깔끔한 텍스트가 된다. 텍스트가 없는 순수 차트 줄은 버린다.
     #   진행바 블록은 CONTEXT_CHART_GLYPHS 에서 빠져 있어 그대로 보존된다.
+    # T-260704-38 F6: ─/━ 구분선-only 줄과 터미널 크롬 줄도 미러에서 걷어낸다.
     out: list[str] = []
-    for raw in (screen or "").splitlines():
+    for raw in strip_ansi_control(screen or "").splitlines():
         text = _LEADING_CHART_RE.sub("", raw).rstrip()
         if not text.strip():
+            continue
+        if _SEPARATOR_LINE_RE.match(text) or CONTEXT_CHROME_RE.search(text):
             continue
         out.append(text)
     while out and not out[0].strip():
@@ -454,6 +641,205 @@ def clean_context_screen(screen: str) -> str:
     while out and not out[-1].strip():
         out.pop()
     return "\n".join(out).strip()
+
+
+def extract_slash_command_block(screen: str, command_token: str) -> str:
+    # T-260704-38 F6: 통째 pane 캡처에서 '❯ <명령>' 에코 ~ 다음 프롬프트 마커(❯) 사이
+    # 블록만 남긴다 — 직전 대화와 입력창 아래 크롬(셸 프롬프트/스테이터스라인/힌트)이
+    # 미러에 섞이는 것을 차단 (아니키 라이덴·맥미니 스샷 실측, 2026-07-04). 에코가
+    # 화면에 없으면 빈 문자열 반환 → 호출측이 전체 화면 정리로 폴백한다.
+    token = (command_token or "").strip().lower()
+    if not token:
+        return ""
+    lines = (screen or "").splitlines()
+    echo_idx = None
+    for idx in range(len(lines) - 1, -1, -1):  # 마지막 에코 — 직전 대화의 같은 명령 무시
+        stripped = strip_ansi_control(lines[idx]).lstrip()
+        if stripped.startswith("❯") and token in stripped.lower():
+            echo_idx = idx
+            break
+    if echo_idx is None:
+        return ""
+    block: list[str] = []
+    for line in lines[echo_idx + 1 :]:
+        if strip_ansi_control(line).lstrip().startswith("❯"):
+            break
+        block.append(line)
+    return "\n".join(block)
+
+
+ANSI_DEFAULT_FG = (229, 231, 235)
+ANSI_DEFAULT_BG = (15, 23, 42)
+ANSI_BOLD_FG = (248, 250, 252)
+ANSI_16_COLORS = {
+    30: (30, 41, 59),
+    31: (239, 68, 68),
+    32: (34, 197, 94),
+    33: (234, 179, 8),
+    34: (59, 130, 246),
+    35: (168, 85, 247),
+    36: (6, 182, 212),
+    37: (226, 232, 240),
+    90: (100, 116, 139),
+    91: (248, 113, 113),
+    92: (74, 222, 128),
+    93: (250, 204, 21),
+    94: (96, 165, 250),
+    95: (196, 181, 253),
+    96: (34, 211, 238),
+    97: (248, 250, 252),
+}
+ANSI_256_COLORS = [
+    (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128), (192, 192, 192),
+    (128, 128, 128), (255, 0, 0), (0, 255, 0), (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+]
+for _r in (0, 95, 135, 175, 215, 255):
+    for _g in (0, 95, 135, 175, 215, 255):
+        for _b in (0, 95, 135, 175, 215, 255):
+            ANSI_256_COLORS.append((_r, _g, _b))
+for _i in range(24):
+    _v = 8 + _i * 10
+    ANSI_256_COLORS.append((_v, _v, _v))
+
+
+def ansi_color_from_256(index: int) -> tuple[int, int, int]:
+    if 0 <= index < len(ANSI_256_COLORS):
+        return ANSI_256_COLORS[index]
+    return ANSI_DEFAULT_FG
+
+
+def parse_ansi_cells(text: str) -> list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]]:
+    fg = ANSI_DEFAULT_FG
+    bg = ANSI_DEFAULT_BG
+    bold = False
+    lines: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]] = [[]]
+    i = 0
+    while i < len(text):
+        if text[i] == "\x1b":
+            match = ANSI_ESCAPE_RE.match(text, i)
+            if match:
+                code = match.group(0)
+                if code.endswith("m") and code.startswith("\x1b["):
+                    raw_parts = code[2:-1]
+                    parts = [0] if raw_parts == "" else [int(p) if p.isdigit() else 0 for p in raw_parts.split(";")]
+                    j = 0
+                    while j < len(parts):
+                        part = parts[j]
+                        if part == 0:
+                            fg = ANSI_DEFAULT_FG
+                            bg = ANSI_DEFAULT_BG
+                            bold = False
+                        elif part == 1:
+                            bold = True
+                        elif part == 22:
+                            bold = False
+                        elif part == 39:
+                            fg = ANSI_DEFAULT_FG
+                        elif part == 49:
+                            bg = ANSI_DEFAULT_BG
+                        elif part in ANSI_16_COLORS:
+                            fg = ANSI_16_COLORS[part]
+                        elif 40 <= part <= 47:
+                            fg_code = part - 10
+                            bg = ANSI_16_COLORS.get(fg_code, ANSI_DEFAULT_BG)
+                        elif 100 <= part <= 107:
+                            fg_code = part - 10
+                            bg = ANSI_16_COLORS.get(fg_code, ANSI_DEFAULT_BG)
+                        elif part in (38, 48) and j + 2 < len(parts):
+                            target_fg = part == 38
+                            mode = parts[j + 1]
+                            if mode == 5 and j + 2 < len(parts):
+                                color = ansi_color_from_256(parts[j + 2])
+                                if target_fg:
+                                    fg = color
+                                else:
+                                    bg = color
+                                j += 2
+                            elif mode == 2 and j + 4 < len(parts):
+                                color = tuple(max(0, min(255, parts[j + k])) for k in range(2, 5))
+                                if target_fg:
+                                    fg = color  # type: ignore[assignment]
+                                else:
+                                    bg = color  # type: ignore[assignment]
+                                j += 4
+                        j += 1
+                i = match.end()
+                continue
+        ch = text[i]
+        i += 1
+        if ch == "\r":
+            continue
+        if ch == "\n":
+            lines.append([])
+            continue
+        if unicodedata.category(ch).startswith("C"):
+            continue
+        lines[-1].append((ch, fg, bg, bold))
+    while len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    return lines or [[]]
+
+
+def ansi_char_cells(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+
+
+def context_image_font(size: int = 17):
+    try:
+        from PIL import ImageFont
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Pillow is required for /context image rendering") from exc
+    candidates = [
+        os.environ.get("CLB_CONTEXT_IMAGE_FONT", ""),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "/Library/Fonts/Menlo.ttc",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            try:
+                return ImageFont.truetype(candidate, size=size)
+            except Exception:  # noqa: BLE001
+                continue
+    return ImageFont.load_default()
+
+
+def render_ansi_png(text: str, output_path: Path) -> Path:
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("Pillow is required for /context image rendering") from exc
+
+    font_size = int_env("CLB_CONTEXT_IMAGE_FONT_SIZE", 17, minimum=8)
+    font = context_image_font(font_size)
+    lines = parse_ansi_cells(text or "")
+    probe = Image.new("RGB", (1, 1), ANSI_DEFAULT_BG)
+    draw = ImageDraw.Draw(probe)
+    bbox = draw.textbbox((0, 0), "M", font=font)
+    char_width = max(1, int(math.ceil(draw.textlength("M", font=font))))
+    line_height = max(1, (bbox[3] - bbox[1]) + 6)
+    padding_x = 16
+    padding_y = 14
+    max_cells = max((sum(ansi_char_cells(ch) for ch, _fg, _bg, _bold in line) for line in lines), default=1)
+    width = max(320, padding_x * 2 + char_width * max(1, max_cells))
+    height = max(96, padding_y * 2 + line_height * max(1, len(lines)))
+    image = Image.new("RGB", (width, height), ANSI_DEFAULT_BG)
+    draw = ImageDraw.Draw(image)
+    for row, line in enumerate(lines):
+        x = padding_x
+        y = padding_y + row * line_height
+        for ch, fg, bg, bold in line:
+            cells = ansi_char_cells(ch)
+            cell_width = char_width * cells
+            if bg != ANSI_DEFAULT_BG:
+                draw.rectangle((x, y, x + cell_width, y + line_height), fill=bg)
+            color = ANSI_BOLD_FG if bold and fg == ANSI_DEFAULT_FG else fg
+            draw.text((x, y), ch, font=font, fill=color)
+            x += cell_width
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output_path, format="PNG")
+    return output_path
 
 
 def claude_settings_model() -> str:
@@ -521,6 +907,22 @@ def content_text(content: Any) -> str:
             continue
         if item.get("type") == "text" and isinstance(item.get("text"), str):
             chunks.append(item["text"])
+    return "\n".join(chunks).strip()
+
+
+def attachment_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        chunks = [attachment_text(item) for item in value]
+        return "\n".join(chunk for chunk in chunks if chunk).strip()
+    if not isinstance(value, dict):
+        return ""
+    chunks: list[str] = []
+    for key in ("text", "content", "body", "value"):
+        chunk = attachment_text(value.get(key))
+        if chunk:
+            chunks.append(chunk)
     return "\n".join(chunks).strip()
 
 
@@ -616,7 +1018,7 @@ _DIRECTIVE_FROM_RE = re.compile(r"\bfrom=([^\s|\]]+)")
 _DIRECTIVE_TASK_RE = re.compile(r"\btask=(T-[0-9A-Za-z\-]+)")
 _DIRECTIVE_TITLE_RE = re.compile(r"\]\s*(?:디렉티브|directive)\s*[—:-]\s*(.+)$", re.IGNORECASE)
 _MAC_REPORT_TITLE_RE = re.compile(r"^\[Mac report title:\s*(.+?)\]\s*$", re.IGNORECASE)
-_BRIDGE_NONCE_RE = re.compile(r"<claude-telegram-bridge\s+nonce=")
+_BRIDGE_NONCE_RE = re.compile(r"<(?:claude-telegram-bridge|clb)\s+nonce=|<clb-[0-9a-f]{8,64}/>")
 # T-260703-16 ②: 로컬 슬래시-명령(예: /model, /clear) 출력 레코드는 노드발 지시가 아니므로
 # 받은지시 카드 X. Claude Code 가 주입하는 <command-name>/<command-message>/<command-args>/
 # <local-command-stdout>/<local-command-caveat> 마커로 식별한다 (nonce 가드와 동형 방어).
@@ -818,7 +1220,7 @@ def screen_has_hook_block(screen: str) -> bool:
 
 
 def screen_has_active_work(screen: str) -> bool:
-    region = screen_status_region(screen)
+    region = strip_ansi_control(screen_status_region(screen))
     # Claude's completed footer can wrap "1 shell still running" as a physical
     # line containing only "running" in very narrow panes. That is an idle prompt
     # with a background shell, not a running assistant turn.
@@ -932,6 +1334,21 @@ def record_contains_nonce(record: dict[str, Any]) -> str | None:
     return match.group(0) if match else None
 
 
+def record_attachment_nonce(record: dict[str, Any]) -> str | None:
+    text = attachment_text(record.get("attachment"))
+    match = NONCE_RE.search(text)
+    return match.group(0) if match else None
+
+
+def terminal_retry_original_text(text: str) -> str:
+    cleaned = sanitize_text(text)
+    lines = cleaned.splitlines()
+    marker_indexes = [index for index, line in enumerate(lines) if line.strip() == "원문:"]
+    if marker_indexes and any("브릿지 재주입 재시도" in line for line in lines[: marker_indexes[-1]]):
+        return sanitize_text("\n".join(lines[marker_indexes[-1] + 1 :]))
+    return cleaned
+
+
 def outbox_key(nonce: str, assistant_uuid: str, answer: str) -> str:
     digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()
     return f"{nonce}:{assistant_uuid}:{digest}"
@@ -968,6 +1385,30 @@ class TelegramHTTPError(RuntimeError):
         return self.code == 409 or "Conflict:" in self.body
 
 
+# F3 (T-260705-72): 429 flood control 대응 상수 — codex-repl-telegram-bridge.py 동형.
+# 고정 2s×3(+외곽 5s×3) 예산이 통상 30s+ flood 대기를 못 넘겨 최종답이 영구 유실되던 갭.
+TELEGRAM_FLOOD_MAX_WAITS = 3
+TELEGRAM_FLOOD_WAIT_CAP_SECONDS = 61.0
+
+
+def telegram_retry_after_seconds(body: str, headers: Any = None, default: float = 3.0) -> float:
+    """429 응답에서 대기 초를 해석: body JSON parameters.retry_after → Retry-After 헤더 → default."""
+    try:
+        payload = json.loads(body)
+        value = (payload.get("parameters") or {}).get("retry_after")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return float(value)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        raw = headers.get("Retry-After") if headers is not None else None
+        if raw is not None:
+            return max(0.0, float(raw))
+    except Exception:  # noqa: BLE001
+        pass
+    return default
+
+
 class TelegramClient:
     def __init__(self, token: str, chat_id: str, emoji: str, chunk_size: int) -> None:
         self.token = token
@@ -982,7 +1423,16 @@ class TelegramClient:
             return cutover_payload
         data = urllib.parse.urlencode(params).encode()
         request = urllib.request.Request(f"{self.api}/{method}", data=data)
-        for attempt in range(3):
+
+        def give_up(detail: str) -> None:
+            log("TGERR", f"{method} failed: {detail}")
+            mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
+
+        # F3 (T-260705-72): 429 는 retry_after 를 지켜 기다렸다 재시도 — flood 대기는
+        # 일반 재시도 예산(3회)과 별도로 센다. 그 외 4xx 는 영구 오류라 즉시 단락.
+        attempt = 0
+        flood_waits = 0
+        while True:
             try:
                 with urllib.request.urlopen(request, timeout=60) as response:
                     payload = json.load(response)
@@ -992,17 +1442,89 @@ class TelegramClient:
                 body = exc.read().decode("utf-8", errors="replace")
                 if exc.code == 409:
                     raise TelegramHTTPError(method, exc.code, body) from exc
-                if attempt == 2:
-                    log("TGERR", f"{method} failed: HTTP {exc.code} {body[:200]}")
-                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
+                if exc.code == 429 and flood_waits < TELEGRAM_FLOOD_MAX_WAITS:
+                    flood_waits += 1
+                    wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+                    log("TGERR", f"{method} 429 flood; waiting {wait:.0f}s ({flood_waits}/{TELEGRAM_FLOOD_MAX_WAITS})")
+                    time.sleep(wait)
+                    continue
+                if 400 <= exc.code < 500:
+                    # 4xx(flood 예산 소진 포함)는 재시도 무의미 — 즉시 단락.
+                    give_up(f"HTTP {exc.code} {body[:200]}")
+                    return None
+                attempt += 1
+                if attempt >= 3:
+                    give_up(f"HTTP {exc.code} {body[:200]}")
                     return None
             except Exception as exc:  # noqa: BLE001
-                if attempt == 2:
-                    log("TGERR", f"{method} failed: {exc}")
-                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"), None, message_id=params.get("message_id"))
+                attempt += 1
+                if attempt >= 3:
+                    give_up(str(exc))
                     return None
             time.sleep(2)
-        return None
+
+    def call_multipart(
+        self,
+        method: str,
+        fields: dict[str, str],
+        file_field: str,
+        file_path: Path,
+    ) -> dict[str, Any] | None:
+        boundary = "----clb" + secrets.token_hex(16)
+        parts: list[bytes] = []
+        for name, value in fields.items():
+            parts.append(f"--{boundary}\r\n".encode())
+            parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+            parts.append(str(value).encode("utf-8"))
+            parts.append(b"\r\n")
+
+        filename = file_path.name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{filename}"\r\n'
+            ).encode()
+        )
+        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        parts.append(file_path.read_bytes())
+        parts.append(b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+
+        request = urllib.request.Request(
+            f"{self.api}/{method}",
+            data=b"".join(parts),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        attempt = 0
+        flood_waits = 0
+        while True:
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    payload = json.load(response)
+                return payload if isinstance(payload, dict) else None
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and flood_waits < TELEGRAM_FLOOD_MAX_WAITS:
+                    flood_waits += 1
+                    wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
+                    log("TGERR", f"{method} upload 429 flood; waiting {wait:.0f}s ({flood_waits}/{TELEGRAM_FLOOD_MAX_WAITS})")
+                    time.sleep(wait)
+                    continue
+                if 400 <= exc.code < 500:
+                    log("TGERR", f"{method} upload failed: HTTP {exc.code} {body[:200]}")
+                    return None
+                attempt += 1
+                if attempt >= 3:
+                    log("TGERR", f"{method} upload failed: HTTP {exc.code} {body[:200]}")
+                    return None
+            except Exception as exc:  # noqa: BLE001
+                attempt += 1
+                if attempt >= 3:
+                    log("TGERR", f"{method} upload failed: {exc}")
+                    return None
+            time.sleep(2)
 
     def get_updates(self, offset: int, timeout: int) -> list[dict[str, Any]]:
         payload = self.call("getUpdates", offset=offset, timeout=timeout)
@@ -1046,11 +1568,36 @@ class TelegramClient:
 
         quoted_path = urllib.parse.quote(file_path, safe="/")
         request = urllib.request.Request(f"https://api.telegram.org/file/bot{self.token}/{quoted_path}")
-        with urllib.request.urlopen(request, timeout=60) as response:
-            output_path.write_bytes(response.read())
-        return output_path
+        # T-260705-43: 단발 통짜 read()는 텔레그램 파일서버 지연 국면에
+        # 'The read operation timed out' 으로 그대로 실패(2026-07-05 본진+라이덴 크로스노드 재현).
+        # chunk read 는 소켓 타임아웃이 청크마다 갱신되고, transient 실패는 백오프 재시도.
+        last_err: Exception | None = None
+        # T-260705-56 (2): per-attempt 60s→30s — 최악 단일스레드 블록 ~3min → ~1.6min.
+        try:
+            attempt_timeout = float(os.environ.get("CLB_DOWNLOAD_ATTEMPT_TIMEOUT_SEC", "30"))
+        except ValueError:
+            attempt_timeout = 30.0
+        for attempt in range(3):
+            try:
+                buf = bytearray()
+                with urllib.request.urlopen(request, timeout=attempt_timeout) as response:
+                    while True:
+                        chunk = response.read(1 << 16)
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                output_path.write_bytes(bytes(buf))
+                return output_path
+            except (OSError, http.client.HTTPException) as err:
+                # T-260705-56 (1): 중간 끊김의 http.client.IncompleteRead 는 OSError 가 아니라
+                # HTTPException 계열 — 기존 except OSError 는 이를 놓쳐 재시도 없이 즉사했다.
+                last_err = err
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"file download failed after 3 attempts: {last_err}")
 
     def with_emoji_prefix(self, text: str) -> str:
+        text = strip_bridge_nonce_markers(text)
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
         if first_line == self.emoji:
             return text
@@ -1058,6 +1605,7 @@ class TelegramClient:
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:
+        text = strip_bridge_nonce_markers(text or "")
         text = self.with_emoji_prefix(text or "(empty response)")
         chunks = [text[: self.chunk_size]]
         rest = text[self.chunk_size :]
@@ -1083,6 +1631,23 @@ class TelegramClient:
                 message_ids.append(int(result["message_id"]))
         return message_ids
 
+    def send_photo(self, path: Path, caption: str = "", reply_to_message_id: int | None = None) -> list[int] | None:
+        fields: dict[str, str] = {"chat_id": str(self.chat_id)}
+        if caption:
+            fields["caption"] = self.with_emoji_prefix(caption)[:1024]
+        if reply_to_message_id:
+            fields["reply_to_message_id"] = str(reply_to_message_id)
+            fields["allow_sending_without_reply"] = "true"
+        payload = self.call_multipart("sendPhoto", fields, "photo", path)
+        if not payload or not payload.get("ok"):
+            payload = self.call_multipart("sendDocument", fields, "document", path)
+        if not payload or not payload.get("ok"):
+            return None
+        result = payload.get("result")
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return [int(result["message_id"])]
+        return []
+
     def send_update_button(self, text: str, callback_data: str) -> None:
         reply_markup = json.dumps(
             {"inline_keyboard": [[{"text": "\U0001f504 지금 업데이트", "callback_data": callback_data}]]},
@@ -1092,7 +1657,12 @@ class TelegramClient:
 
     def edit(self, message_id: int, text: str) -> None:
         # ⚙️ flow mirror edit-in-place — update one card instead of sending many.
-        self.call("editMessageText", chat_id=self.chat_id, message_id=message_id, text=text)
+        self.call(
+            "editMessageText",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=strip_bridge_nonce_markers(text) or "(empty response)",
+        )
 
 
 @dataclass(frozen=True)
@@ -1166,6 +1736,9 @@ class Config:
     send_max_attempts: int
     queue_compact_max_events: int
     outbox_max_entries: int
+    envelope_sidecar_flag_path: Path = ENVELOPE_SIDECAR_FLAG
+    envelope_sidecar_path: Path = ENVELOPE_SIDECAR_PATH
+    envelope_sidecar_ttl_seconds: float = DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -1224,6 +1797,15 @@ class Config:
             send_max_attempts=int_env("CLB_SEND_MAX_ATTEMPTS", 3, minimum=1),
             queue_compact_max_events=int_env("CLB_QUEUE_COMPACT_MAX_EVENTS", 5000, minimum=100),
             outbox_max_entries=int_env("CLB_OUTBOX_MAX_ENTRIES", 2000, minimum=100),
+            envelope_sidecar_flag_path=Path(
+                env("CLB_ENVELOPE_SIDECAR_FLAG", str(ENVELOPE_SIDECAR_FLAG)) or ""
+            ).expanduser(),
+            envelope_sidecar_path=Path(env("CLB_ENVELOPE_SIDECAR_PATH", str(ENVELOPE_SIDECAR_PATH)) or "").expanduser(),
+            envelope_sidecar_ttl_seconds=float_env(
+                "CLB_ENVELOPE_SIDECAR_TTL_SECONDS",
+                DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS,
+                minimum=1.0,
+            ),
         )
 
     @property
@@ -1249,16 +1831,45 @@ class QueueItem:
     text: str
     nonce: str
     received_at: float = field(default_factory=time.time)
+    # T-260705-67: 아니키 발신 시각(Telegram message.date, epoch sec). 0.0 = unknown(레거시/미상).
+    # finish_active_turn 등이 QueueItem 을 위치인자 6개로 재구성하므로 기존 위치 필드 순서는 유지.
+    sent_at: float = 0.0
+    source: str = ""
+    voice_reply_path: str = ""
+    # T-260707-36: generating 중 이 항목을 Escape 없는 native 큐잉으로 이미 TUI 에 주입했는지
+    # 표시. per-item 멱등성 플래그 — 옛 "active_turn 존재 여부로 재주입 차단"을 대체한다.
+    # 다음 drain 이 재-paste 하지 않도록(그리고 브릿지 재기동 후에도 재주입 안 하도록) durable
+    # queue 레코드에 함께 실려 복원된다.
+    busy_injected: bool = False
+    # T-260708-46: 다중 busy-inject 에서는 후속 pending 의 user JSONL nonce 가 active_turn
+    # 승계 전에 먼저 보일 수 있다. 관측 정보를 pending item 에 보존해 promote 뒤 verify
+    # timeout 으로 빠지지 않게 한다.
+    user_uuid: str = ""
+    user_seen_at: float = 0.0
+    native_queue_seen_at: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "queue_id": self.queue_id,
             "update_id": self.update_id,
             "message_id": self.message_id,
             "text": self.text,
             "nonce": self.nonce,
             "received_at": self.received_at,
+            "sent_at": self.sent_at,
         }
+        if self.source:
+            payload["source"] = self.source
+        if self.voice_reply_path:
+            payload["voice_reply_path"] = self.voice_reply_path
+        if self.busy_injected:
+            payload["busy_injected"] = True
+        if self.user_uuid:
+            payload["user_uuid"] = self.user_uuid
+            payload["user_seen_at"] = self.user_seen_at
+        if self.native_queue_seen_at > 0:
+            payload["native_queue_seen_at"] = self.native_queue_seen_at
+        return payload
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "QueueItem":
@@ -1269,6 +1880,13 @@ class QueueItem:
             text=str(payload["text"]),
             nonce=str(payload["nonce"]),
             received_at=float(payload.get("received_at") or time.time()),
+            sent_at=float(payload.get("sent_at") or 0.0),
+            source=str(payload.get("source") or ""),
+            voice_reply_path=str(payload.get("voice_reply_path") or ""),
+            busy_injected=bool(payload.get("busy_injected")),
+            user_uuid=str(payload.get("user_uuid") or ""),
+            user_seen_at=float(payload.get("user_seen_at") or 0.0),
+            native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
         )
 
 
@@ -1295,14 +1913,21 @@ class ActiveTurn:
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
     flow_message_id: int = 0  # persisted across restart (anti-fragmentation): telegram message id of this turn's ⚙️ flow card (edit-in-place)
     flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
+    sent_at: float = 0.0  # T-260705-67: 아니키 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
+    source: str = ""
+    voice_reply_path: str = ""
+    busy_injected: bool = False
+    native_queue_seen_at: float = 0.0
+    sidecar_consumed_at: float = 0.0
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "queue_id": self.queue_id,
             "update_id": self.update_id,
             "message_id": self.message_id,
             "nonce": self.nonce,
             "injected_at": self.injected_at,
+            "sent_at": self.sent_at,
             "text": self.text,
             "user_uuid": self.user_uuid,
             "user_seen_at": self.user_seen_at,
@@ -1316,7 +1941,16 @@ class ActiveTurn:
             "last_send_attempt_at": self.last_send_attempt_at,
             "flow_message_id": self.flow_message_id,
             "flow_body": self.flow_body,
+            "source": self.source,
+            "voice_reply_path": self.voice_reply_path,
         }
+        if self.busy_injected:
+            payload["busy_injected"] = True
+        if self.native_queue_seen_at > 0:
+            payload["native_queue_seen_at"] = self.native_queue_seen_at
+        if self.sidecar_consumed_at > 0:
+            payload["sidecar_consumed_at"] = self.sidecar_consumed_at
+        return payload
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> "ActiveTurn":
@@ -1345,6 +1979,12 @@ class ActiveTurn:
             last_send_attempt_at=float(payload.get("last_send_attempt_at") or 0.0),
             flow_message_id=int(payload.get("flow_message_id") or 0),
             flow_body=str(payload.get("flow_body") or ""),
+            sent_at=float(payload.get("sent_at") or 0.0),
+            source=str(payload.get("source") or ""),
+            voice_reply_path=str(payload.get("voice_reply_path") or ""),
+            busy_injected=bool(payload.get("busy_injected")),
+            native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
+            sidecar_consumed_at=float(payload.get("sidecar_consumed_at") or 0.0),
         )
 
 
@@ -1418,12 +2058,33 @@ class ClaudeRepl:
     def verify(self) -> None:
         self.tmux("has-session", "-t", self.resolve_session_target())
 
+    def invalidate_target_cache(self) -> None:
+        self._session_target = None
+        self._pane_target = None
+
     def pane_pid(self) -> int:
-        out = self.tmux("display-message", "-p", "-t", self.resolve_pane_target(), "#{pane_pid}")
-        raw = out.stdout.strip()
-        if not raw.isdigit():
-            raise RuntimeError(f"could not resolve pane pid: {raw!r}")
-        return int(raw)
+        # tmux 세션 재생성 시 캐시 타깃이 영구 stale 로 남아 'could not resolve
+        # pane pid' 가 브릿지 재시작 전까지 지속되던 갭(T-260705-09 ②, 2026-07-05
+        # 01:58 2노드 동시 실측) — 실패 시 캐시를 비우고 1회 재해석 후 재시도.
+        last_error: Exception | None = None
+        for _attempt in range(2):
+            target = self.resolve_pane_target()
+            try:
+                out = self.tmux("display-message", "-p", "-t", target, "#{pane_pid}")
+            except RuntimeError as exc:
+                last_error = exc
+            else:
+                raw = out.stdout.strip()
+                if raw.isdigit():
+                    return int(raw)
+                last_error = RuntimeError(
+                    f"could not resolve pane pid: {raw!r} "
+                    f"(target={target}, socket={self.config.tmux_socket})"
+                )
+            # 최종 실패여도 캐시는 비워 둔다 — 다음 사이클이 신선 해석을 타게
+            self.invalidate_target_cache()
+        assert last_error is not None
+        raise last_error
 
     def pane_tty(self) -> str:
         out = self.tmux("display-message", "-p", "-t", self.resolve_pane_target(), "#{pane_tty}")
@@ -1433,16 +2094,12 @@ class ClaudeRepl:
         out = self.tmux("display-message", "-p", "-t", self.resolve_pane_target(), "#{pane_current_path}")
         return out.stdout.strip()
 
-    def capture_pane(self, lines: int = 80) -> str:
-        out = self.tmux(
-            "capture-pane",
-            "-p",
-            "-J",
-            "-S",
-            f"-{max(1, lines)}",
-            "-t",
-            self.resolve_pane_target(),
-        )
+    def capture_pane(self, lines: int = 80, ansi: bool = False) -> str:
+        args = ["capture-pane", "-p", "-J"]
+        if ansi:
+            args.append("-e")
+        args.extend(["-S", f"-{max(1, lines)}", "-t", self.resolve_pane_target()])
+        out = self.tmux(*args)
         return out.stdout
 
     @contextmanager
@@ -1485,22 +2142,70 @@ class ClaudeRepl:
                 except Exception as exc:  # noqa: BLE001
                     log("REPL", f"wide context capture restore failed: {exc}")
 
-    def clear_composer(self) -> None:
+    @contextmanager
+    def composer_lock(self):
+        path = composer_lock_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as lock_file:
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — composer single-writer guard. codex 브릿지
+            # composer_lock (T-260628-35) 미러링 — busy-inject(진행 중 주입, T-260707-36)와
+            # idle 주입/슬래시 핸들러가 같은 composer 에 동시 send-keys 해 입력이 섞이는
+            # 경합(TOCTOU: apply_model_choice 가 busy 게이트 통과 직후 busy-inject 가 claim)을 차단.
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _clear_composer_unlocked(self, interrupt: bool = True) -> None:
         self.verify()
-        for key in ("Escape", "C-e", "C-u", "C-a", "C-k"):
+        # interrupt=True (기본, idle 주입): Escape 로 진행 중 턴을 끊고 composer 를 비운다.
+        # interrupt=False (busy-inject, T-260707-36): Escape 를 빼고 줄편집 키만 보낸다 —
+        #   generating 중 composer 잔여만 비우고 진행 중 턴은 절대 끊지 않는다. C-e/C-u/C-a/C-k
+        #   는 composer 줄 편집일 뿐이라 generating 을 인터럽트하지 않는다(codex 동형).
+        keys = ("Escape", "C-e", "C-u", "C-a", "C-k") if interrupt else ("C-e", "C-u", "C-a", "C-k")
+        for key in keys:
             self.tmux("send-keys", "-t", self.resolve_pane_target(), key)
             time.sleep(0.05)
 
-    def paste_prompt(self, prompt: str) -> None:
+    def clear_composer(self, interrupt: bool = True) -> None:
+        with self.composer_lock():
+            self._clear_composer_unlocked(interrupt)
+
+    def _paste_prompt_unlocked(self, prompt: str, submit_key: str = "Enter") -> None:
         if not prompt.strip():
             return
         if BRACKETED_PASTE_RE.search(prompt):
             raise RuntimeError("prompt contains bracketed paste control sequences")
         self.verify()
-        self.tmux("load-buffer", "-", input_text=prompt.rstrip("\n"))
+        buffer = prompt.rstrip("\n")
+        # 붙여넣기 버퍼가 bare 백슬래시로 끝나면, 이어지는 send-keys 제출키를 Claude Code TUI 가
+        # `\`+Enter = 줄바꿈(line-continuation)으로 먹어 봉투가 composer 에 고착되고 nonce 가 user
+        # JSONL 에 안 떠 주입이 "nonce user JSONL not observed" 로 실패한다 (실측: "ㅎㅇ\\").
+        # 개행 1개를 덧붙여 백슬래시 뒤가 리터럴 개행이 되게 한다 — bracketed paste 는 Enter '키'가
+        # 아닌 '문자' 삽입이라 continuation 이 안 걸리고 커서가 빈 줄에 놓여, 뒤따르는 send-keys
+        # 제출키는 escape 없이 제출된다. 사용자 백슬래시 원문은 보존.
+        if buffer.endswith("\\"):
+            buffer += "\n"
+        self.tmux("load-buffer", "-", input_text=buffer)
         self.tmux("paste-buffer", "-p", "-t", self.resolve_pane_target())
         time.sleep(0.1)
-        self.tmux("send-keys", "-t", self.resolve_pane_target(), "Enter")
+        # submit_key 기본 Enter. codex TUI 는 진행 중 큐잉 제출키가 Tab 이라 별도 submit_key 를
+        # 쓴다("Repeated Enter can leave text sitting in the composer"). Claude Code TUI 의
+        # generating 중 큐잉 제출키가 Enter 가 맞는지는 미검증 — 아니면 CLB_BUSY_SUBMIT_KEY 로 교체.
+        self.tmux("send-keys", "-t", self.resolve_pane_target(), submit_key)
+
+    def _submit_prompt_unlocked(self, submit_key: str = "Enter") -> None:
+        self.verify()
+        self.tmux("send-keys", "-t", self.resolve_pane_target(), submit_key)
+
+    def submit_prompt(self, submit_key: str = "Enter") -> None:
+        with self.composer_lock():
+            self._submit_prompt_unlocked(submit_key)
+
+    def paste_prompt(self, prompt: str, submit_key: str = "Enter") -> None:
+        with self.composer_lock():
+            self._paste_prompt_unlocked(prompt, submit_key)
 
 
 def proc_ppid(pid: int) -> int | None:
@@ -1613,6 +2318,27 @@ class SessionBinder:
     def __init__(self, config: Config, repl: ClaudeRepl) -> None:
         self.config = config
         self.repl = repl
+        # T-260705-05: busy 고착 유령 transcript 격리 (path str → quarantined_at).
+        # 사이드카 스코어링이 mtime 최신 우선이라, 격리 없이 재해석하면 유령이
+        # 매번 다시 이긴다. TTL 만료로 자연 복권 (in-memory, 재시작 시 초기화).
+        self.quarantined: dict[str, float] = {}
+
+    def _quarantine_ttl_seconds(self) -> float:
+        try:
+            return float(os.environ.get("CLB_BUSY_STUCK_QUARANTINE_TTL_SEC", "1800"))
+        except ValueError:
+            return 1800.0
+
+    def quarantine_transcript(self, path: Path) -> None:
+        self.quarantined[str(Path(path).resolve())] = time.time()
+
+    def _is_quarantined(self, path: Path) -> bool:
+        now = time.time()
+        ttl = self._quarantine_ttl_seconds()
+        expired = [key for key, at in self.quarantined.items() if now - at > ttl]
+        for key in expired:
+            del self.quarantined[key]
+        return str(Path(path).resolve()) in self.quarantined
 
     def resolve(self) -> ClaudeSessionBinding:
         pane_pid = self.repl.pane_pid()
@@ -1661,6 +2387,8 @@ class SessionBinder:
             if not transcript_raw:
                 continue
             transcript = Path(transcript_raw).expanduser()
+            if self._is_quarantined(transcript):
+                continue
             try:
                 item_pid = int(item.get("pane_pid") or 0)
             except (TypeError, ValueError):
@@ -1745,6 +2473,8 @@ class SessionBinder:
         cutoff = time.time() - max(1.0, self.config.latest_transcript_fallback_seconds)
         recent: list[Path] = []
         for path in candidates:
+            if self._is_quarantined(path):
+                continue
             try:
                 if path.stat().st_mtime >= cutoff:
                     recent.append(path.resolve())
@@ -1937,6 +2667,110 @@ class DurableQueue:
         return sorted(items, key=lambda item: (item.received_at, item.update_id))
 
 
+def build_voice_prompt(question: str) -> str:
+    cleaned = sanitize_text(question, limit=2000)
+    return f"{VOICE_PROMPT_HEADER} {VOICE_PROMPT_INSTRUCTION}\n\n질문: {cleaned}"
+
+
+def bridge_nonce() -> str:
+    return f"clb-{secrets.token_hex(4)}"
+
+
+def prompt_sha256(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
+
+
+def append_jsonl_locked(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_envelope_sidecar_records(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                for line in handle:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict) and record.get("schema") == ENVELOPE_SIDECAR_SCHEMA:
+                        records.append(record)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return []
+    return records
+
+
+def enqueue_voice_prompt(
+    config: Config,
+    *,
+    question: str,
+    reply_path: Path,
+    request_id: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    now = time.time() if now is None else now
+    queue_id = request_id.strip() if request_id.strip() else f"voice-{int(now * 1000)}-{secrets.token_hex(4)}"
+    item = QueueItem(
+        queue_id=queue_id,
+        update_id=int(now * 1000) % 2147483647,
+        message_id=0,
+        text=build_voice_prompt(question),
+        nonce=bridge_nonce(),
+        received_at=now,
+        source="voice",
+        voice_reply_path=str(reply_path),
+    )
+    queue = DurableQueue(config.queue_path, config.queue_compact_max_events)
+    existing = queue.status(queue_id)
+    if existing:
+        return {
+            "schema": "claude-telegram-bridge-voice-enqueue/v1",
+            "status": "duplicate",
+            "queue_id": queue_id,
+            "existing_status": existing,
+            "queue_path": str(config.queue_path),
+            "voice_reply_path": str(reply_path),
+        }
+    queue.append_status(item, "received")
+    queue.append_status(item, "enqueued")
+    return {
+        "schema": "claude-telegram-bridge-voice-enqueue/v1",
+        "status": "enqueued",
+        "queue_id": queue_id,
+        "queue_path": str(config.queue_path),
+        "voice_reply_path": str(reply_path),
+    }
+
+
+def write_voice_answer(active: ActiveTurn, *, assistant_uuid: str, answer: str, status: str = "answered") -> None:
+    if active.source != "voice" or not active.voice_reply_path:
+        return
+    payload = {
+        "schema": "claude-telegram-bridge-voice-answer/v1",
+        "status": status,
+        "queue_id": active.queue_id,
+        "assistant_uuid": assistant_uuid,
+        "answer": answer,
+        "answered_at": time.time(),
+    }
+    write_json_atomic(Path(active.voice_reply_path).expanduser(), payload)
+
+
 class Outbox:
     def __init__(self, path: Path, max_entries: int = 2000) -> None:
         self.path = path
@@ -1980,6 +2814,7 @@ class Bridge:
         self.session_identity: SessionIdentity | None = None
         self.session_pos = 0
         self.parent_map: dict[str, str | None] = {}
+        self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
         # ⚙️ ambient flow mirror (v0.1.5) — in-memory card for node-originated work
@@ -1998,6 +2833,14 @@ class Bridge:
         self.last_jsonl_read_at = 0.0
         self.last_jsonl_watch_error = ""
         self.last_jsonl_watch_error_log_at = 0.0
+        # T-260705-56 (3): 미디어 다운로드 실패 auto-requeue 대기열 — queue_key → (update, 시도수, 재시도시각).
+        # ephemeral: 재시작 시 소실(offset 이미 전진) — 기존 즉시-실패 동작 대비 악화 아님.
+        self.media_retry: dict[str, tuple[dict[str, Any], int, float]] = {}
+        # T-260705-67 ③-b: pending 정체 1회성 알림 발송분 (queue_id). ephemeral —
+        # 재시작 시 초기화돼 여전히 정체면 1회 재알림되는 쪽이 안전.
+        self.stuck_alert_sent: set[str] = set()
+        # T-260705-05: '기록파일 신선 + 화면 idle + pending 대기' 모순 시작 시각.
+        self.busy_stuck_since = 0.0
 
     def acquire_lock(self) -> None:
         self.config.pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -2069,9 +2912,25 @@ class Bridge:
         active = (state or {}).get("active_turn")
         if isinstance(active, dict):
             try:
-                self.active_turn = ActiveTurn.from_json(active)
+                loaded_active = ActiveTurn.from_json(active)
             except (KeyError, TypeError, ValueError):
                 self.active_turn = None
+            else:
+                if self.active_turn_is_stale_unanswered(loaded_active):
+                    item = self.queue_item_for_active(loaded_active)
+                    self.queue.append_status(
+                        item,
+                        "stale_released",
+                        release_reason="state_load_stale_unseen",
+                        age_seconds=int(max(self.active_turn_age_seconds(loaded_active), 0)),
+                    )
+                    self.active_turn = None
+                    log(
+                        "STALE",
+                        f"dropped stale active_turn on state load queue={loaded_active.queue_id[:10]}",
+                    )
+                else:
+                    self.active_turn = loaded_active
 
     def binding_payload(self) -> dict[str, Any]:
         binding = self.session_binding
@@ -2287,6 +3146,23 @@ class Bridge:
             return "generating"
         return "idle"
 
+    def session_clear_pending(self) -> bool:
+        clearing = self.config.state_dir / "clearing"
+        if not clearing.exists():
+            return False
+        try:
+            ttl = float(os.environ.get("CLB_CLEARING_HOLD_TTL_SEC", "300"))
+        except ValueError:
+            ttl = 300.0
+        if ttl > 0:
+            try:
+                if time.time() - clearing.stat().st_mtime >= ttl:
+                    log("BUSY", "stale clearing flag ignored")
+                    return False
+            except OSError:
+                return False
+        return True
+
     def session_occupied_excluding_active(self, *, missing_transcript_busy: bool = True) -> bool:
         """Busy signal that ignores our own active_turn.
 
@@ -2308,7 +3184,10 @@ class Bridge:
                     return True
         try:
             screen = self.repl.capture_pane(80)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if is_tmux_session_lost_error(exc):
+                self.release_active_turn_due_to_tmux_session_lost(str(exc))
+                return False
             return True
         if screen_has_approval_wait(screen):
             return True
@@ -2372,21 +3251,70 @@ class Bridge:
         )
         return True
 
+    def release_active_turn_due_to_tmux_session_lost(self, detail: str) -> bool:
+        with self.lock:
+            active = self.active_turn
+        if not active:
+            return False
+
+        item = self.queue_item_for_active(active)
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            self.active_turn = None
+            self.session_binding = None
+            self.session_identity = None
+            self.session_pos = 0
+        self.flush_reasoning_mirror(active)  # ⚠️ 제거 금지 (DO NOT REMOVE) — release 전 🧠 reasoning 보장 (T-260701-63)
+        self.stop_typing()
+        self.queue.append_status(item, "stale_released", release_reason="tmux_session_lost")
+        self.persist_state()
+        self.write_egress_sidecar()
+        if hasattr(self.repl, "invalidate_target_cache"):
+            self.repl.invalidate_target_cache()
+        log("TURN", f"released active_turn queue={active.queue_id[:10]}: tmux session lost ({detail})")
+        return True
+
+    def active_turn_age_seconds(self, active: ActiveTurn) -> float:
+        reference_at = max(active.user_seen_at or 0.0, active.sidecar_consumed_at or 0.0, active.injected_at or 0.0)
+        return time.time() - reference_at
+
+    def active_turn_can_stale_release(self, active: ActiveTurn) -> bool:
+        return not (
+            active.assistant_uuid
+            or active.pending_answer
+            or active.pending_assistant_uuid
+            or active.pending_outbox_key
+            or active.send_in_progress
+        )
+
+    def active_turn_is_stale_unanswered(self, active: ActiveTurn) -> bool:
+        ttl = self.config.active_turn_stale_seconds
+        if ttl <= 0 or not self.active_turn_can_stale_release(active):
+            return False
+        return self.active_turn_age_seconds(active) >= ttl
+
+    def active_turn_unconfirmed_submission(self, active: ActiveTurn) -> bool:
+        return not (
+            active.user_uuid
+            or active.user_seen_at > 0
+            or active.sidecar_consumed_at > 0
+            or active.native_queue_seen_at > 0
+        )
+
     def release_stale_active_turn_if_idle(self) -> bool:
         ttl = self.config.active_turn_stale_seconds
         if ttl <= 0:
             return False
         with self.lock:
             active = self.active_turn
-        if not active or not active.user_uuid:
+        if not active or not self.active_turn_can_stale_release(active):
             return False
-        if active.pending_answer or active.pending_assistant_uuid or active.pending_outbox_key or active.send_in_progress:
-            return False
-        reference_at = max(active.user_seen_at or 0.0, active.injected_at or 0.0)
-        age = time.time() - reference_at
+        age = self.active_turn_age_seconds(active)
         if age < ttl:
             return False
-        if self.session_occupied_excluding_active(missing_transcript_busy=False):
+        unconfirmed_submission = self.active_turn_unconfirmed_submission(active)
+        if not unconfirmed_submission and self.session_occupied_excluding_active(missing_transcript_busy=False):
             return False
 
         item = self.queue_item_for_active(active)
@@ -2395,10 +3323,19 @@ class Bridge:
                 return False
             self.active_turn = None
         self.stop_typing()
-        self.queue.append_status(item, "stale_released", age_seconds=int(max(age, 0)))
+        release_reason = "active_turn_submit_unconfirmed_timeout" if unconfirmed_submission else "active_turn_idle_timeout"
+        self.queue.append_status(
+            item,
+            "stale_released",
+            age_seconds=int(max(age, 0)),
+            release_reason=release_reason,
+        )
         self.persist_state()
         self.write_egress_sidecar()
-        log("STALE", f"released active_turn queue={active.queue_id[:10]} age={int(max(age, 0))}s")
+        log(
+            "STALE",
+            f"released active_turn queue={active.queue_id[:10]} age={int(max(age, 0))}s reason={release_reason}",
+        )
         return True
 
     def format_metadata(self, metadata: dict[str, Any]) -> str:
@@ -2752,13 +3689,464 @@ class Bridge:
 
     def envelope_prompt(self, item: QueueItem) -> str:
         safe_text = escape_unsafe_slash(sanitize_text(item.text))
-        return (
-            f"<claude-telegram-bridge nonce=\"{item.nonce}\" "
-            f"update_id=\"{item.update_id}\" message_id=\"{item.message_id}\">\n"
-            "Telegram-origin prompt. Do not mention this bridge envelope or nonce in the answer.\n"
-            "</claude-telegram-bridge>\n\n"
-            f"{safe_text}"
+        marker = f"<{item.nonce}/>"
+        notice = self.stale_prompt_notice(item)
+        if notice:
+            return f"{marker}\n{notice}\n{safe_text}"
+        return f"{marker}\n\n{safe_text}"
+
+    def envelope_sidecar_enabled(self) -> bool:
+        return self.config.envelope_sidecar_flag_path.exists()
+
+    def sidecar_visible_prompt(self, item: QueueItem) -> str:
+        return escape_unsafe_slash(sanitize_text(item.text))
+
+    def envelope_sidecar_context(self, item: QueueItem, *, visible_prompt: str, now: float | None = None) -> str:
+        now = time.time() if now is None else now
+        stale_notice = self.stale_prompt_notice(item, now=now).strip()
+        lines = [
+            "[claude-telegram-bridge sidecar]",
+            "Telegram-origin prompt. The visible prompt was pasted without a bridge envelope.",
+            f"nonce: {item.nonce}",
+            f"queue_id: {item.queue_id}",
+            f"update_id: {item.update_id}",
+            f"message_id: {item.message_id}",
+            f"prompt_sha256: {prompt_sha256(visible_prompt)}",
+            f"<{item.nonce}/>",
+            "Do not mention this bridge sidecar, envelope, or nonce in the answer.",
+        ]
+        if stale_notice:
+            lines.append(stale_notice)
+        return "\n".join(lines)
+
+    def write_envelope_sidecar(self, item: QueueItem, *, visible_prompt: str) -> None:
+        now = time.time()
+        record = {
+            "schema": ENVELOPE_SIDECAR_SCHEMA,
+            "status": "pending",
+            "created_at": now,
+            "expires_at": now + max(1.0, float(self.config.envelope_sidecar_ttl_seconds)),
+            "nonce": item.nonce,
+            "queue_id": item.queue_id,
+            "update_id": item.update_id,
+            "message_id": item.message_id,
+            "prompt_sha256": prompt_sha256(visible_prompt),
+            "additional_context": self.envelope_sidecar_context(item, visible_prompt=visible_prompt, now=now),
+        }
+        append_jsonl_locked(self.config.envelope_sidecar_path, record)
+
+    def prompt_for_item(self, item: QueueItem) -> str:
+        if not self.envelope_sidecar_enabled():
+            return self.envelope_prompt(item)
+        visible_prompt = self.sidecar_visible_prompt(item)
+        try:
+            self.write_envelope_sidecar(item, visible_prompt=visible_prompt)
+            return visible_prompt
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"sidecar write failed; falling back to visible envelope: {exc}")
+            return self.envelope_prompt(item)
+
+    def active_envelope_sidecar_consumed_record(self, active: ActiveTurn) -> dict[str, Any] | None:
+        expected_hash = prompt_sha256(self.sidecar_visible_prompt(self.queue_item_for_active(active)))
+        latest: dict[str, Any] | None = None
+        for record in read_envelope_sidecar_records(self.config.envelope_sidecar_path):
+            if str(record.get("queue_id") or "") != active.queue_id:
+                continue
+            if str(record.get("nonce") or "") != active.nonce:
+                continue
+            latest = record
+        if not latest or latest.get("status") != "consumed":
+            return None
+        seen_hash = str(latest.get("prompt_sha256_seen") or "")
+        if seen_hash and seen_hash != expected_hash:
+            return None
+        return latest
+
+    @staticmethod
+    def sidecar_consumed_at(record: dict[str, Any]) -> float:
+        try:
+            consumed_at = float(record.get("consumed_at") or 0.0)
+        except (TypeError, ValueError):
+            consumed_at = 0.0
+        return consumed_at if consumed_at > 0 else time.time()
+
+    def mark_active_sidecar_consumed_seen(self, active: ActiveTurn) -> bool:
+        if active.sidecar_consumed_at > 0:
+            return True
+        record = self.active_envelope_sidecar_consumed_record(active)
+        if not record:
+            return False
+        consumed_at = self.sidecar_consumed_at(record)
+        item: QueueItem | None = None
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            if self.active_turn.sidecar_consumed_at <= 0:
+                self.active_turn.sidecar_consumed_at = consumed_at
+                item = self.queue_item_for_active(self.active_turn)
+        if item:
+            self.queue.append_status(item, "sidecar_consumed_seen", consumed_at=consumed_at)
+            self.persist_state()
+            self.write_egress_sidecar()
+            log("JSONL", f"sidecar consumed seen {active.nonce}")
+        return True
+
+    def mark_active_sidecar_body_user_seen(self, record: dict[str, Any]) -> bool:
+        user_uuid = str(record.get("uuid") or "")
+        if not user_uuid:
+            return False
+        with self.lock:
+            active = self.active_turn
+        if not active:
+            return False
+        body = content_text((record.get("message") or {}).get("content"))
+        if not body:
+            return False
+        expected_hash = prompt_sha256(self.sidecar_visible_prompt(self.queue_item_for_active(active)))
+        if prompt_sha256(body) != expected_hash:
+            return False
+        if not self.mark_active_sidecar_consumed_seen(active):
+            return False
+        user_seen_at = record_timestamp_seconds(record) or time.time()
+        item: QueueItem | None = None
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            self.active_turn.user_uuid = user_uuid
+            self.active_turn.user_seen_at = user_seen_at
+            item = self.queue_item_for_active(self.active_turn)
+        self.queue.append_status(
+            item,
+            "user_jsonl_seen",
+            user_uuid=user_uuid,
+            user_seen_at=user_seen_at,
+            sidecar_consumed=True,
         )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("JSONL", f"body-only sidecar user seen {active.nonce}")
+        return True
+
+    def stale_prompt_notice(self, item: QueueItem, now: float | None = None) -> str:
+        # T-260705-67 ②: 주입 시점에 늙은 메시지(배달 지연/큐 대기)면 봉투 안에 경고를 박아
+        # 지연수신 stale 메시지가 진행중 R3 작업의 중지/반전 지시로 오해석되는 사고 클래스 차단.
+        # 차단이 아니라 advisory — fresh 재확인 지시문만 얹는다. 0 이하로 끄기 가능.
+        try:
+            threshold = float(os.environ.get("CLB_STALE_PROMPT_SEC", "300"))
+        except ValueError:
+            threshold = 300.0
+        if threshold <= 0:
+            return ""
+        now = time.time() if now is None else now
+        origin = item.sent_at if item.sent_at > 0 else item.received_at
+        age = now - origin
+        if age < threshold:
+            return ""
+        basis = "발신된" if item.sent_at > 0 else "수신된"
+        clock = time.strftime("%H:%M", time.localtime(origin))
+        minutes = max(1, int(age // 60))
+        return (
+            f"⚠️ 지연 배달 경고: 이 메시지는 약 {minutes}분 전({clock} KST) {basis} 것이 지금에야 주입됐다. "
+            "그 사이 상황이 바뀌었을 수 있다. 이 메시지를 진행중인 R3 작업(공개 발행·대외 발신·스토어 제출 등)의 "
+            "중지/반전/승인 지시로 해석해야 한다면, 실행 전 반드시 아니키에게 fresh 재확인을 받은 뒤에만 움직여라. "
+            "일반 작업 지시라도 최신 상태(tasks.md·직전 대화)를 먼저 점검하고 착수하라.\n"
+        )
+
+    def maybe_alert_late_delivery(self, item: QueueItem) -> None:
+        # T-260705-67 ③-a: 발신→수신 갭(브릿지 다운/폴링 정체 구간)이 큰 메시지는 enqueue 즉시
+        # 아니키 폰에 표면화. enqueue_update 가 queue_id 로 dedup 하므로 메시지당 최대 1회.
+        try:
+            threshold = float(os.environ.get("CLB_STALE_PROMPT_SEC", "300"))
+        except ValueError:
+            threshold = 300.0
+        if threshold <= 0 or item.sent_at <= 0:
+            return
+        gap = item.received_at - item.sent_at
+        if gap < threshold:
+            return
+        minutes = max(1, int(gap // 60))
+        clock = time.strftime("%H:%M", time.localtime(item.sent_at))
+        log("QUEUE", f"late delivery gap={int(gap)}s update={item.update_id}")
+        try:
+            self.telegram.send(
+                f"⚠️ 지연 수신: 약 {minutes}분 전({clock} KST)에 보내신 메시지를 지금 받았어요. "
+                "그 사이 브릿지가 밀려 있었을 수 있어요. 오래된 지시라면 최신 상황 기준으로 다시 한 번 보내주세요."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"late delivery alert failed: {exc}")
+
+    def check_busy_stuck_rebind(self) -> None:
+        # T-260705-05: 이중(유령) 세션 busy 고착 self-heal. 유령 세션이 bound
+        # transcript 를 계속 갱신하면 busy_state 가 영구 "generating" 이라 인바운드
+        # 주입이 죽는다 (2026-07-05 01:0x 본진 실사고 — 아니키 수동 재기동으로 복구).
+        # '기록파일 신선 + 화면 idle + pending 대기 + active_turn 없음' 모순이
+        # threshold(기본 300s) 연속 지속되면 해당 transcript 를 격리하고 바인딩을
+        # 리셋한다 — 다음 ensure_session_binding 이 화면 세션으로 재바인딩.
+        try:
+            threshold = float(os.environ.get("CLB_BUSY_STUCK_REBIND_SEC", "300"))
+        except ValueError:
+            threshold = 300.0
+        if threshold <= 0:
+            return
+        with self.lock:
+            has_pending = bool(self.pending)
+            active = self.active_turn
+        binding = self.session_binding
+        if not has_pending or binding is None:
+            self.busy_stuck_since = 0.0
+            return
+        if active is not None:
+            if not self.active_turn_is_stale_unanswered(active):
+                self.busy_stuck_since = 0.0
+                return
+            try:
+                transcript_age = time.time() - binding.transcript_path.stat().st_mtime
+            except OSError:
+                transcript_age = 0.0
+            if transcript_age < threshold:
+                self.busy_stuck_since = 0.0
+                return
+            try:
+                screen = self.repl.capture_pane(80)
+            except Exception:  # noqa: BLE001
+                self.busy_stuck_since = 0.0
+                return
+            if (
+                screen_has_approval_wait(screen)
+                or screen_has_hook_block(screen)
+                or screen_has_active_work(screen)
+            ):
+                self.busy_stuck_since = 0.0
+                return
+            now = time.time()
+            if not self.busy_stuck_since:
+                self.busy_stuck_since = now
+                return
+            if now - self.busy_stuck_since < threshold:
+                return
+            item = self.queue_item_for_active(active)
+            with self.lock:
+                if self.active_turn is not active:
+                    return
+                self.active_turn = None
+            self.busy_stuck_since = now
+            self.stop_typing()
+            self.queue.append_status(
+                item,
+                "stale_released",
+                release_reason="stuck_busy_idle",
+                age_seconds=int(max(self.active_turn_age_seconds(active), 0)),
+            )
+            self.persist_state()
+            self.write_egress_sidecar()
+            log(
+                "BUSY",
+                f"stuck self-heal: released active_turn {active.queue_id[:10]} "
+                f"(idle screen + stale transcript for {int(transcript_age)}s)",
+            )
+            return
+        try:
+            transcript_fresh = (
+                time.time() - binding.transcript_path.stat().st_mtime
+                < self.config.transcript_stable_seconds
+            )
+        except OSError:
+            transcript_fresh = False
+        if not transcript_fresh:
+            self.busy_stuck_since = 0.0
+            return
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            self.busy_stuck_since = 0.0
+            return
+        if (
+            screen_has_approval_wait(screen)
+            or screen_has_hook_block(screen)
+            or screen_has_active_work(screen)
+        ):
+            # 진짜 작업 중 — 정상 큐 대기
+            self.busy_stuck_since = 0.0
+            return
+        now = time.time()
+        if not self.busy_stuck_since:
+            self.busy_stuck_since = now
+            return
+        if now - self.busy_stuck_since < threshold:
+            return
+        self.busy_stuck_since = now  # 재발동도 threshold 간격 — 스팸 방지
+        self.binder.quarantine_transcript(binding.transcript_path)
+        with self.lock:
+            self.session_binding = None
+            self.session_identity = None
+            self.session_pos = 0
+        self.persist_state()
+        log(
+            "BUSY",
+            f"stuck self-heal: quarantined {binding.transcript_path} "
+            f"(fresh transcript + idle screen for {int(now - (self.busy_stuck_since - threshold))}s)",
+        )
+        try:
+            self.telegram.send(
+                "⚠️ 유령 세션 감지: 화면은 쉬는데 뒤에서 다른 세션이 기록을 계속 써서 "
+                "메시지 주입이 막혀 있었어요. 화면 세션으로 다시 연결합니다 — "
+                "밀린 메시지는 곧 전달됩니다."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("BUSY", f"stuck self-heal notice failed: {exc}")
+
+    def check_queue_stuck_alert(self) -> None:
+        # T-260705-67 ③-b: 수신→주입 정체(세션 busy/브릿지 내부 문제로 pending 이 안 빠지는 상태)
+        # 표면화. telegram_loop 틱(기본 2s)마다 불리므로 queue_id 별 1회성 set 로 스팸 차단.
+        try:
+            threshold = float(os.environ.get("CLB_QUEUE_STUCK_ALERT_SEC", "180"))
+        except ValueError:
+            threshold = 180.0
+        if threshold <= 0:
+            return
+        now = time.time()
+        with self.lock:
+            pending_ids = {item.queue_id for item in self.pending}
+            # 큐를 떠난 항목 키는 정리해 set 무한 증가 방지 (재enqueue 는 dedup 이 막는다).
+            self.stuck_alert_sent &= pending_ids
+            stuck = [
+                item
+                for item in self.pending
+                if now - item.received_at >= threshold and item.queue_id not in self.stuck_alert_sent
+            ]
+            for item in stuck:
+                self.stuck_alert_sent.add(item.queue_id)
+        for item in stuck:
+            age = int(now - item.received_at)
+            preview = sanitize_text(item.text)[:40]
+            log("QUEUE", f"stuck pending age={age}s update={item.update_id}")
+            try:
+                self.telegram.send(
+                    f"⚠️ 큐 정체: 받은 메시지가 {age}초째 노드에 주입되지 못하고 대기중이에요 "
+                    f"(“{preview}…”). 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요."
+                )
+            except Exception as exc:  # noqa: BLE001
+                log("QUEUE", f"stuck alert send failed: {exc}")
+
+    def directive_retry_max(self) -> int:
+        try:
+            value = int(os.environ.get("CLB_DIRECTIVE_RETRY_MAX", "2"))
+        except ValueError:
+            value = 2
+        return max(0, min(value, 5))
+
+    def terminal_retry_count(self, item: QueueItem) -> int:
+        record = self.queue.records_by_queue_id().get(item.queue_id) or {}
+        try:
+            return max(0, int(record.get("terminal_retry_count") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def terminal_original_text(self, item: QueueItem) -> str:
+        record = self.queue.records_by_queue_id().get(item.queue_id) or {}
+        original = record.get("terminal_original_text")
+        if isinstance(original, str) and original.strip():
+            return terminal_retry_original_text(original)
+        return terminal_retry_original_text(item.text)
+
+    def terminal_retry_prompt_text(
+        self,
+        original_text: str,
+        *,
+        status: str,
+        error: str = "",
+        retry_count: int,
+        retry_max: int,
+    ) -> str:
+        label = "전달 실패" if status == "failed" else "차단"
+        lines = [
+            f"⚠️ 브릿지 재주입 재시도 {retry_count}/{retry_max}: 이전 전달이 {label} 상태로 중단됐다.",
+            "이 원문은 지연/재시도된 지시다. R3 작업(머지·배포·외부발신 등)은 실행 전 최신 상태와 fresh 확인을 먼저 보라.",
+        ]
+        detail = sanitize_text(error, limit=500)
+        if detail:
+            lines.append(f"중단 사유: {detail}")
+        lines.extend(["", "원문:", sanitize_text(original_text)])
+        return "\n".join(lines)
+
+    def mark_directive_terminal(
+        self,
+        item: QueueItem,
+        status: str,
+        *,
+        error: str = "",
+        slash_command: str = "",
+    ) -> QueueItem | None:
+        # T-260707-16: failed/blocked directive가 큐에서 무소음 유실되지 않도록 sender 에
+        # 즉시 표면화하고, 같은 queue_id 를 유한 횟수만 재-enqueue 한다.
+        retry_count = self.terminal_retry_count(item)
+        retry_max = self.directive_retry_max()
+        if retry_max <= 0:
+            terminal_retry_count = 0
+        else:
+            terminal_retry_count = min(retry_count + 1, retry_max)
+        original_text = self.terminal_original_text(item)
+        extra: dict[str, Any] = {"terminal_retry_count": terminal_retry_count}
+        if original_text:
+            extra["terminal_original_text"] = original_text
+        if error:
+            extra["error"] = error
+        if slash_command:
+            extra["slash_command"] = slash_command
+        self.queue.append_status(item, status, **extra)
+
+        label = "전달 실패" if status == "failed" else "차단"
+        if retry_count >= retry_max:
+            try:
+                self.telegram.send(
+                    f"⚠️ 브릿지 {label}: 지시를 노드에 전달하지 못했고 자동 재시도 소진 "
+                    f"({retry_count}/{retry_max}) 상태예요. 최신 상황 기준으로 다시 보내주세요."
+                )
+            except Exception as exc:  # noqa: BLE001
+                log("QUEUE", f"terminal exhaustion notice failed: {exc}")
+            log("QUEUE", f"directive {status} exhausted queue={item.queue_id} retry={retry_count}/{retry_max}")
+            return None
+
+        next_retry = retry_count + 1
+        retry_item = QueueItem(
+            queue_id=item.queue_id,
+            update_id=item.update_id,
+            message_id=item.message_id,
+            text=self.terminal_retry_prompt_text(
+                original_text,
+                status=status,
+                error=error,
+                retry_count=next_retry,
+                retry_max=retry_max,
+            ),
+            nonce=bridge_nonce(),
+            received_at=item.received_at,
+            sent_at=item.sent_at,
+            source=item.source,
+            voice_reply_path=item.voice_reply_path,
+            busy_injected=False,
+        )
+        self.queue.append_status(
+            retry_item,
+            "enqueued",
+            terminal_retry_count=next_retry,
+            terminal_original_text=original_text,
+            retry_from_status=status,
+            retry_reason=sanitize_text(error, limit=500),
+            retry_slash_command=slash_command,
+        )
+        with self.lock:
+            if not (self.active_turn and self.active_turn.queue_id == retry_item.queue_id):
+                self.pending = [pending for pending in self.pending if pending.queue_id != retry_item.queue_id]
+                self.pending.append(retry_item)
+        try:
+            self.telegram.send(
+                f"⚠️ 브릿지 {label}: 지시 전달이 중단돼 유실 방지로 자동 재시도 {next_retry}/{retry_max} 회차를 큐에 넣었어요."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"terminal retry notice failed: {exc}")
+        log("QUEUE", f"directive {status} requeued queue={item.queue_id} retry={next_retry}/{retry_max}")
+        return retry_item
 
     def enqueue_update(self, update: dict[str, Any]) -> None:
         if "edited_message" in update:
@@ -2771,17 +4159,33 @@ class Bridge:
         if str(chat.get("id")) != self.config.chat_id:
             return
         update_id = int(update["update_id"])
+        retry_key = message_update_key(update, self.token_hash)
         try:
             text = self.prompt_from_telegram_message(message, update_id)
+            self.media_retry.pop(retry_key, None)
         except Exception as exc:  # noqa: BLE001
             caption = message.get("caption")
             caption_text = caption.strip() if isinstance(caption, str) else ""
             detail = str(exc).replace(self.token, "<redacted-token>")
             if caption_text:
+                self.media_retry.pop(retry_key, None)
                 self.telegram.send(f"media 처리 실패: {detail}. caption만 전달합니다.")
                 text = caption_text
             else:
-                self.telegram.send(f"media 처리 실패: {detail}")
+                # T-260705-56 (3): 재전송 요구 전에 1회 자동 재시도 — transient 다운로드
+                # 실패(타임아웃/중간끊김)에서 아니키 손(재전송) 빌리는 UX 제거 (원칙 1 손0).
+                attempts = self.media_retry.get(retry_key, (None, 0, 0.0))[1]
+                if attempts < 1:
+                    try:
+                        delay = float(os.environ.get("CLB_MEDIA_REQUEUE_DELAY_SEC", "30"))
+                    except ValueError:
+                        delay = 30.0
+                    self.media_retry[retry_key] = (update, attempts + 1, time.time() + delay)
+                    log("QUEUE", f"media download failed; auto-requeue in {int(delay)}s update={update_id}")
+                    self.telegram.send(f"media 내려받기 실패: {detail}. {int(delay)}초 뒤 자동 재시도할게요.")
+                    return
+                self.media_retry.pop(retry_key, None)
+                self.telegram.send(f"media 처리 실패: {detail}. 다시 보내주시면 재시도합니다.")
                 return
         text = sanitize_text(text)
         if not text:
@@ -2796,13 +4200,21 @@ class Bridge:
             self.telegram.send("claude-telegram-bridge running")
             return
         if command == BRIDGE_STATUS_SLASH_COMMAND:
-            self.telegram.send(f"claude bridge status: {self.busy_state()}")
+            self.handle_status_command()
             return
 
         message_id = int(message.get("message_id") or 0)
         queue_id = message_update_key(update, self.token_hash)
-        nonce = f"clb-{secrets.token_hex(16)}"
-        item = QueueItem(queue_id=queue_id, update_id=update_id, message_id=message_id, text=text, nonce=nonce)
+        nonce = bridge_nonce()
+        # T-260705-67: Telegram message.date = 아니키 발신 시각(epoch sec). 사고(1895s 발신→수신 갭)의
+        # 원인 이분(발신→수신 vs 수신→주입)을 durable queue 에 남기는 계측 기반.
+        try:
+            sent_at = float(message.get("date") or 0.0)
+        except (TypeError, ValueError):
+            sent_at = 0.0
+        item = QueueItem(
+            queue_id=queue_id, update_id=update_id, message_id=message_id, text=text, nonce=nonce, sent_at=sent_at
+        )
         with self.lock:
             active_queue_id = self.active_turn.queue_id if self.active_turn else ""
             pending_queue_ids = {existing.queue_id for existing in self.pending}
@@ -2818,6 +4230,37 @@ class Bridge:
             self.pending.append(item)
             self.queue.append_status(item, "enqueued")
         log("QUEUE", f"enqueued update={update_id} queue={queue_id[:10]}")
+        self.maybe_alert_late_delivery(item)
+
+    def handle_status_command(self) -> None:
+        # codex /status 패리티 (T-260703-01 확장): bridge 상태 한 줄 → 상태 + 컨텍스트 요약 바.
+        # busy(generating) 중엔 composer 오염 방지를 위해 캡처 생략 — 기존 한 줄 응답 유지.
+        state = self.busy_state()
+        if state != "idle":
+            self.telegram.send(f"claude bridge status: {state} (턴 진행 중 — 컨텍스트 캡처 생략)")
+            return
+        try:
+            self.telegram.send_typing()
+        except Exception:  # noqa: BLE001
+            pass
+        settle = float(os.environ.get("CLB_CONTEXT_SETTLE_SEC", "1.2"))
+        try:
+            with self.repl.temporary_window_width(STATUS_WIDE_CAPTURE_COLUMNS):
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(CONTEXT_SLASH_COMMAND)
+                time.sleep(settle)
+                screen = self.repl.capture_pane(120)
+            source = extract_slash_command_block(screen, CONTEXT_SLASH_COMMAND) or screen
+            body = extract_context_screen(source)
+            if body.startswith("Claude context"):
+                body = body[len("Claude context"):].lstrip("\n")
+            header = "Claude status\nBridge: idle"
+            self.telegram.send(f"{header}\n{body}" if body else header)
+            log("INJECT", "/status rich mirrored")
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/status capture failed: {exc}")
+            self.telegram.send(f"claude bridge status: idle (컨텍스트 캡처 실패: {exc})")
 
     def handle_capture_command(self, item: "QueueItem", command_token: str) -> None:
         # /context /usage /cost — read-only 정보 명령. 시각화가 넓은 폭을 요구해 좁은
@@ -2835,13 +4278,14 @@ class Bridge:
         #   때까지 재캡처 폴링해 렌더 완료 프레임을 잡는다. /usage·/cost 도 동일 경로라 함께 수혜.
         capture_timeout = float(os.environ.get("CLB_CONTEXT_CAPTURE_TIMEOUT_SEC", "8.0"))
         poll = float(os.environ.get("CLB_CONTEXT_POLL_SEC", "0.4"))
+        capture_ansi = command_token == CONTEXT_SLASH_COMMAND
         try:
             with self.repl.temporary_window_width(STATUS_WIDE_CAPTURE_COLUMNS):
                 for _ in range(self.config.composer_clear_retries):
                     self.repl.clear_composer()
                 self.repl.paste_prompt(prompt)
                 time.sleep(settle)
-                screen = self.repl.capture_pane(120)
+                screen = self.repl.capture_pane(120, ansi=capture_ansi)
                 deadline = time.monotonic() + max(capture_timeout, 0.0)
                 while screen_has_active_work(screen) and time.monotonic() < deadline:
                     try:
@@ -2849,11 +4293,36 @@ class Bridge:
                     except Exception:  # noqa: BLE001
                         pass
                     time.sleep(poll)
-                    screen = self.repl.capture_pane(120)
+                    screen = self.repl.capture_pane(120, ansi=capture_ansi)
+            if screen_has_active_work(screen):
+                # T-260704-38 F6-c: 세션이 긴 턴 작업 중이라 타임아웃 — 작업중 프레임
+                # 덤프(라이덴 'Frolicking...' 케이스) 대신 1줄 안내만 보낸다.
+                self.telegram.send(
+                    f"⏳ claude 세션이 다른 작업을 실행 중이라 {command_token} 화면을 못 잡았어요 — 유휴 때 다시 시도해주세요."
+                )
+                self.queue.append_status(item, "injected", slash_command=command_token)
+                self.queue.append_status(item, "sent", slash_command=command_token)
+                log("INJECT", f"{command_token} busy-timeout notice update={item.update_id}")
+                return
             # codex /status 톤: 도형 차트 그리드를 걷어낸 깔끔 텍스트 우선, 정리 결과가 비면
             # 원본 캡처(글리프 포함)로 폴백 (T-260703-36).
-            answer = clean_context_screen(screen) or extract_context_screen(screen)
-            self.telegram.send(answer or f"claude bridge {command_token}: 캡처된 화면이 비어 있습니다.")
+            # F6-a: '❯ <명령>' 에코~다음 프롬프트 마커 블록만 추출 (없으면 전체 화면 폴백).
+            source = extract_slash_command_block(screen, command_token) or screen
+            if command_token == CONTEXT_SLASH_COMMAND:
+                image_dir = self.config.state_dir / "claude-telegram-bridge-context-images" / self.config.node
+                image_path = image_dir / f"context-{item.update_id}-{safe_filename_part(item.queue_id[:12])}.png"
+                render_ansi_png(source or screen, image_path)
+                caption = f"claude {command_token}"
+                reply_to = item.message_id if item.message_id > 0 else None
+                sent_ids = self.telegram.send_photo(image_path, caption=caption, reply_to_message_id=reply_to)
+                if sent_ids is None:
+                    answer = clean_context_screen(source) or extract_context_screen(source)
+                    self.telegram.send(answer or f"claude bridge {command_token}: 이미지 전송에 실패했고 캡처된 화면도 비어 있습니다.")
+                else:
+                    log("INJECT", f"{command_token} image mirrored update={item.update_id} path={image_path}")
+            else:
+                answer = clean_context_screen(source) or extract_context_screen(source)
+                self.telegram.send(answer or f"claude bridge {command_token}: 캡처된 화면이 비어 있습니다.")
             self.queue.append_status(item, "injected", slash_command=command_token)
             self.queue.append_status(item, "sent", slash_command=command_token)
             log("INJECT", f"{command_token} wide-capture mirrored update={item.update_id}")
@@ -2913,14 +4382,13 @@ class Bridge:
 
     def handle_blocked_slash(self, item: "QueueItem", command_token: str) -> None:
         # 프리즈 가드 fail-safe (T-260702-14): 지원 목록 밖 슬래시는 인터랙티브
-        # 대화상자로 세션이 얼 수 있어 주입하지 않는다. escape hatch 1개만 안내.
-        supported = "/model /context /usage /cost /status /clear /exit /quit /ping /start"
-        self.telegram.send(
-            f"⛔ {command_token} 은(는) 인터랙티브 대화상자를 열어 세션이 얼 수 있어 주입을 차단했어요.\n"
-            f"지원 명령: {supported}\n"
-            f"그래도 원문 그대로 보내려면 맨 앞에 {SLASH_ESCAPE_PREFIX} 를 붙여주세요 (예: {SLASH_ESCAPE_PREFIX}{command_token})."
+        # 대화상자로 세션이 얼 수 있어 명령으로는 주입하지 않고, 원문 프롬프트로 재시도한다.
+        self.mark_directive_terminal(
+            item,
+            "blocked",
+            slash_command=command_token,
+            error=f"unsupported slash command {command_token}",
         )
-        self.queue.append_status(item, "blocked", slash_command=command_token)
         log("INJECT", f"slash blocked token={command_token} update={item.update_id}")
 
     def _emit_model_notice(self, text: str, menu_message_id: int | None) -> None:
@@ -2990,9 +4458,151 @@ class Bridge:
 
         threading.Thread(target=_heal, daemon=True).start()
 
+    def busy_inject_guarded_clear(self) -> None:
+        # T-260707-36 안전 가드: 주입 전 capture-pane 으로 composer 잔여 텍스트 확인 →
+        # Escape 없는 clear 키로 정리해, 사용자가 이미 타이핑해 둔 입력에 우리 prompt 가
+        # 이어붙어 오염되는 걸 막는다. 잔여가 있으면 방어적으로 한 번 더 비운다.
+        # 호출부(try_busy_inject)가 composer_lock 을 잡고 있으므로 unlocked primitive 사용.
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            screen = ""
+        residual = composer_residual_text(screen)
+        passes = self.config.composer_clear_retries
+        if residual:
+            log("INJECT", f"busy-inject composer residual detected (len={len(residual)}) — Escape-less clear")
+            passes += 1
+        for _ in range(passes):
+            self.repl._clear_composer_unlocked(interrupt=False)
+
+    def try_busy_inject(self) -> bool:
+        # T-260707-36: generating 중 Escape 없는 native 큐잉 주입. 주입하면 True,
+        # 대기로 넘기면 False(호출부가 기존 대기 경로로). 슬래시 명령은 프리즈 가드(idle
+        # 게이트)를 지켜 busy 중 주입하지 않는다.
+        #
+        # 라이브 버그 픽스: busy-inject 가 필요한 순간이 바로 "진행 중 텔레그램 턴 A 위에
+        # 새 메시지 B 가 온" 그 순간이므로, 옛 `if self.active_turn` 가드는 주 시나리오를
+        # 스스로 막았다. 이제 active_turn(A) 이 set 이어도 주입한다. 단 A 의 추적을
+        # clobber 하지 않도록, A 가 진행 중일 땐 active_turn 을 B 로 덮지 않고 B 를 pending
+        # 에 남겨 busy_injected 로 표시한다(A 완료 후 idle drain 이 재-paste 없이 승계).
+        # 재진입 중복주입/enqueued 고착(2026-06-28 회귀)은 이 per-item busy_injected 표시로
+        # 막는다 — active_turn 존재 여부 가드를 대체.
+        #
+        # T-260708-46: pending[0] 이 이미 busy_injected 인 상태에서 뒤 텍스트가 쌓이면,
+        # 앞 항목은 이미 TUI native 큐에 올라간 것이므로 그 뒤 텍스트도 순서대로 추가
+        # 제출한다. 단 head 가 slash/media 처럼 아직 올라가지 않은 보류 항목이면 뒤를
+        # 먼저 태우지 않는다(순서 보존).
+        with self.lock:
+            if not self.pending:
+                return False
+            selected_index = -1
+            for idx, candidate in enumerate(self.pending):
+                if candidate.busy_injected:
+                    # 이미 native 큐잉됨 — 재-paste 금지(멱등성). 뒤 텍스트는 같은 native
+                    # 큐 뒤에 추가 제출할 수 있다.
+                    continue
+                stripped_text = (candidate.text or "").strip()
+                escape_slash = stripped_text.startswith(SLASH_ESCAPE_PREFIX) and bool(
+                    slash_token(stripped_text[len(SLASH_ESCAPE_PREFIX):].lstrip())
+                )
+                if bool(slash_token(candidate.text)) or escape_slash:
+                    # 슬래시는 busy 중 주입 금지 — 기존 대기 경로가 idle 까지 보류(프리즈 가드).
+                    # head 보류 항목을 건너뛰고 뒤 텍스트를 먼저 태우면 순서가 뒤집힌다.
+                    return False
+                if is_telegram_media_prompt(candidate.text):
+                    # T-260708-22: media prompts are multi-line local-path envelopes.
+                    # During generation Claude can leave them in the composer while the
+                    # bridge marks busy_injected and stops retrying. Keep them pending
+                    # for the proven idle delivery path instead.
+                    return False
+                selected_index = idx
+                break
+            if selected_index < 0:
+                # pending 전부 이미 native 큐잉됨 — 재-paste 금지. idle drain 이 승계 처리.
+                return False
+            item = self.pending[selected_index]
+            # paste 전에 표시(재진입/롤백 안전). 실패 시 아래에서 False 로 되돌린다.
+            item.busy_injected = True
+            adopt = self.active_turn is None and selected_index == 0
+            if adopt:
+                # 진행 중 텔레그램 턴이 없다 — B 를 즉시 active_turn 으로 claim 해
+                # nonce/최종답변이 정상 턴 추적으로 미러되게 한다(기존 동작 보존).
+                self.pending.pop(selected_index)
+                self.active_turn = ActiveTurn(
+                    queue_id=item.queue_id,
+                    update_id=item.update_id,
+                    message_id=item.message_id,
+                    nonce=item.nonce,
+                    injected_at=time.time(),
+                    text=item.text,
+                    sent_at=item.sent_at,
+                    source=item.source,
+                    voice_reply_path=item.voice_reply_path,
+                    busy_injected=True,
+                    user_uuid=item.user_uuid or None,
+                    user_seen_at=item.user_seen_at,
+                    native_queue_seen_at=item.native_queue_seen_at,
+                )
+                self.reset_ambient_flow()
+            # else: A 가 진행 중 — active_turn(A) 를 덮지 않는다. B 는 pending 에 남아
+            # busy_injected 로 표시된 채 A 완료 후 idle drain 에서 승계된다.
+        self.persist_state()
+        self.write_egress_sidecar()
+        prompt = self.prompt_for_item(item)
+        try:
+            # codex clear_and_paste_prompt 미러: composer_lock 을 1회 잡고 clear+paste 를
+            # 원자적으로(단일쓰기) 수행 — 진행 중 slash 핸들러/idle 주입과의 경합 차단.
+            with self.repl.composer_lock():
+                self.busy_inject_guarded_clear()
+                self.repl._paste_prompt_unlocked(prompt, submit_key=busy_submit_key())
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"busy-inject failed: {exc}")
+            with self.lock:
+                item.busy_injected = False  # 롤백 — 다음 사이클 재시도 허용
+                if adopt and self.active_turn and self.active_turn.queue_id == item.queue_id:
+                    self.active_turn = None
+            if adopt:
+                # adopt 경로는 item 을 pending 에서 pop 했으므로 유실 방지 위해 failed 통지.
+                self.mark_directive_terminal(item, "failed", error=str(exc))
+            # else: B 는 pending 에 그대로(enqueued) — 조용히 다음 drain 에서 재시도.
+            self.persist_state()
+            self.write_egress_sidecar()
+            return True
+        if adopt:
+            with self.lock:
+                if self.active_turn and self.active_turn.queue_id == item.queue_id:
+                    self.active_turn.injected_at = time.time()
+            self.queue.append_status(item, "injected", busy_inject=True)
+        else:
+            # B 는 여전히 injectable(enqueued) 로 두되 busy_injected 를 durable 레코드에 실어
+            # 브릿지 재기동 후에도 중복 주입되지 않게 한다(item.to_json() 이 플래그 포함).
+            self.queue.append_status(item, "enqueued", busy_inject=True)
+        self.persist_state()
+        self.write_egress_sidecar()
+        if adopt:
+            self.begin_typing()
+        else:
+            # A 의 typing 루프가 이미 돌고 있으면 유지(끊지 않음), 없으면 시작.
+            self.ensure_typing()
+        log(
+            "INJECT",
+            f"busy-inject nonce={item.nonce} update={item.update_id} state=generating "
+            f"adopt={int(adopt)}",
+        )
+        return True
+
     def drain_queue(self) -> None:
+        if self.session_clear_pending():
+            log("BUSY", "skip inject state=clearing")
+            return
         state = self.busy_state()
         if state != "idle":
+            # T-260707-36 busy-inject: generating(진행 중 턴) + CLB_BUSY_INJECT 켜졌을 때만,
+            # Escape 없는 clear + paste + Enter 로 주입해 Claude Code TUI native 큐잉에 실어
+            # 다음 턴으로 반영시킨다. 진행 중 턴은 절대 끊지 않는다. approval_wait/hook_blocked/
+            # clearing 등 다른 non-idle 은 아래 기존 대기 경로 그대로(주입 안 함).
+            if state == "generating" and busy_inject_enabled() and self.try_busy_inject():
+                return
             # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
             # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
             # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 아니키 "백그라운드 작업일 때도
@@ -3000,6 +4610,7 @@ class Bridge:
             self.ensure_typing()
             log("BUSY", f"skip inject state={state}")
             return
+        promoted_busy_injected = False
         with self.lock:
             if self.active_turn or not self.pending:
                 return
@@ -3019,9 +4630,33 @@ class Bridge:
                     nonce=item.nonce,
                     injected_at=time.time(),
                     text=item.text,
+                    sent_at=item.sent_at,
+                    source=item.source,
+                    voice_reply_path=item.voice_reply_path,
+                    busy_injected=item.busy_injected,
+                    user_uuid=item.user_uuid or None,
+                    user_seen_at=item.user_seen_at,
+                    native_queue_seen_at=item.native_queue_seen_at,
                 )
                 # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
                 self.reset_ambient_flow()
+                # T-260707-36: busy 창에서 이미 native 큐잉된 항목이면 active_turn 으로
+                # 승계만 하고 재-paste 는 건너뛴다(중복 주입 방지). idle 이 됐다는 건 A 가
+                # 끝났고 TUI 가 B 를 다음 턴으로 처리한다는 뜻이므로 추적만 재개하면 된다.
+                promoted_busy_injected = item.busy_injected
+        if promoted_busy_injected:
+            with self.lock:
+                if self.active_turn and self.active_turn.queue_id == item.queue_id:
+                    self.active_turn.injected_at = time.time()
+            self.queue.append_status(item, "injected", busy_inject=True)
+            self.persist_state()
+            self.write_egress_sidecar()
+            self.begin_typing()
+            log(
+                "INJECT",
+                f"busy-inject promote (no re-paste) nonce={item.nonce} update={item.update_id}",
+            )
+            return
         if slash_command:
             # ── T-260702-14 슬래시 인터셉트 레이어 (codex 브릿지 동형) ──
             # escape hatch: '!' prefix 는 프리즈 가드를 명시적으로 우회해 원문 그대로 주입.
@@ -3056,8 +4691,7 @@ class Bridge:
                 self.repl.paste_prompt(prompt)
             except Exception as exc:  # noqa: BLE001
                 log("INJECT", f"slash failed: {exc}")
-                self.queue.append_status(item, "failed", error=str(exc))
-                self.telegram.send(f"claude bridge slash command delivery failed: {exc}")
+                self.mark_directive_terminal(item, "failed", error=str(exc), slash_command=command_token)
                 self.persist_state()
                 self.write_egress_sidecar()
                 return
@@ -3072,18 +4706,17 @@ class Bridge:
             return
         self.persist_state()
         self.write_egress_sidecar()
-        prompt = self.envelope_prompt(item)
+        prompt = self.prompt_for_item(item)
         try:
             for _ in range(self.config.composer_clear_retries):
                 self.repl.clear_composer()
             self.repl.paste_prompt(prompt)
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"failed: {exc}")
-            self.queue.append_status(item, "failed", error=str(exc))
             with self.lock:
                 if self.active_turn and self.active_turn.queue_id == item.queue_id:
                     self.active_turn = None
-            self.telegram.send(f"claude bridge delivery failed: {exc}")
+            self.mark_directive_terminal(item, "failed", error=str(exc))
             self.persist_state()
             self.write_egress_sidecar()
             return
@@ -3097,12 +4730,95 @@ class Bridge:
         self.begin_typing()
         log("INJECT", f"nonce={item.nonce} update={item.update_id}")
 
+    def active_turn_submit_key(self, active: ActiveTurn) -> str:
+        return busy_submit_key() if active.busy_injected else "Enter"
+
+    def active_composer_residual_text(self, active: ActiveTurn) -> str:
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception as exc:  # noqa: BLE001
+            if is_tmux_session_lost_error(exc):
+                self.release_active_turn_due_to_tmux_session_lost(str(exc))
+            else:
+                log("INJECT", f"submit verify capture failed queue={active.queue_id[:10]}: {exc}")
+            return ""
+        return composer_residual_text(screen)
+
+    def fail_active_submit_confirmation(self, active: ActiveTurn, item: QueueItem, error: str) -> None:
+        with self.lock:
+            if self.active_turn is not active:
+                return
+            self.active_turn = None
+            self.pending = [pending for pending in self.pending if pending.queue_id != item.queue_id]
+        self.stop_typing()
+        self.queue.append_status(item, "failed", error=error, submit_confirm_failed=True)
+        try:
+            preview = sanitize_text(item.text, limit=80)
+            self.telegram.send(
+                "⚠️ 브릿지 제출 실패: 지시를 Claude Code composer에 붙였지만 제출 확인이 안 돼 "
+                f"자동 재시도를 중단했어요. 최신 상황 기준으로 다시 보내주세요. (“{preview}…”)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"submit confirmation failure notice failed: {exc}")
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("QUEUE", f"directive submit confirmation failed queue={item.queue_id} error={error}")
+
+    def retry_active_submit_if_composer_residual(self, active: ActiveTurn) -> bool:
+        residual = self.active_composer_residual_text(active)
+        if not residual:
+            return False
+        item = self.queue_item_for_active(active)
+        if active.inject_attempts >= 2:
+            self.fail_active_submit_confirmation(
+                active,
+                item,
+                "prompt remained in composer after submit retry",
+            )
+            return True
+        submit_key = self.active_turn_submit_key(active)
+        try:
+            self.repl.submit_prompt(submit_key)
+        except Exception as exc:  # noqa: BLE001
+            self.fail_active_submit_confirmation(active, item, f"submit retry failed: {exc}")
+            return True
+        with self.lock:
+            if self.active_turn is not active:
+                return True
+            active.inject_attempts += 1
+            active.injected_at = time.time()
+            attempt = active.inject_attempts
+        self.queue.append_status(
+            item,
+            "submit_retry",
+            attempt=attempt,
+            residual_len=len(residual),
+            submit_key=submit_key,
+        )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("INJECT", f"composer still held prompt; submit retry queue={item.queue_id[:10]} attempt={attempt}")
+        return True
+
+    def retry_media_downloads(self) -> None:
+        # T-260705-56 (3): 만기 도래한 미디어 auto-requeue 를 재주입. telegram_loop 단일
+        # 스레드에서만 불려 media_retry 동시성 이슈 없음. 성공/최종실패 시 enqueue_update 가 pop.
+        now = time.time()
+        for key, (update, _attempts, retry_at) in list(self.media_retry.items()):
+            if retry_at > now:
+                continue
+            log("QUEUE", f"media auto-requeue retry update={update.get('update_id')} key={key[:10]}")
+            self.enqueue_update(update)
+
     def check_injection_timeout(self) -> None:
         with self.lock:
             active = self.active_turn
         if not active or active.user_uuid:
             return
         if time.time() - active.injected_at < self.config.injection_verify_timeout:
+            return
+
+        if self.retry_active_submit_if_composer_residual(active):
             return
 
         # Do not fail or clear-retry while the session is still busy. A long prior
@@ -3117,6 +4833,25 @@ class Bridge:
                     self.active_turn.injected_at = time.time()
             return
 
+        if active.busy_injected:
+            if active.native_queue_seen_at > 0:
+                log("INJECT", f"busy-inject nonce {active.nonce} awaiting native queue attachment")
+                return
+            try:
+                busy_timeout = float(os.environ.get("CLB_BUSY_INJECT_VERIFY_TIMEOUT_SEC", "60"))
+            except ValueError:
+                busy_timeout = 60.0
+            busy_timeout = max(busy_timeout, self.config.injection_verify_timeout)
+            if time.time() - active.injected_at < busy_timeout:
+                log("INJECT", f"busy-inject nonce {active.nonce} awaiting JSONL user record")
+                return
+
+        if self.mark_active_sidecar_consumed_seen(active):
+            with self.lock:
+                if self.active_turn and self.active_turn.queue_id == active.queue_id:
+                    self.active_turn.injected_at = time.time()
+            return
+
         item = QueueItem(
             active.queue_id,
             active.update_id,
@@ -3124,14 +4859,20 @@ class Bridge:
             active.text,
             active.nonce,
             active.injected_at,
+            sent_at=active.sent_at,
+            source=active.source,
+            voice_reply_path=active.voice_reply_path,
+            busy_injected=active.busy_injected,
+            user_uuid=active.user_uuid or "",
+            user_seen_at=active.user_seen_at,
+            native_queue_seen_at=active.native_queue_seen_at,
         )
         if active.inject_attempts >= 2:
             log("INJECT", f"nonce {active.nonce} not observed in JSONL after retry")
-            self.queue.append_status(item, "failed", error="nonce user JSONL not observed")
             with self.lock:
                 self.active_turn = None
             self.stop_typing()
-            self.telegram.send("메시지를 노드에 전달하지 못했어요. 한 번 더 보내주세요. (세션이 응답 중이면 끝난 뒤 자동 전달됩니다)")
+            self.mark_directive_terminal(item, "failed", error="nonce user JSONL not observed")
             self.persist_state()
             self.write_egress_sidecar()
             return
@@ -3139,14 +4880,13 @@ class Bridge:
         log("INJECT", f"nonce {active.nonce} not observed; composer clear/retry")
         try:
             self.repl.clear_composer()
-            self.repl.paste_prompt(self.envelope_prompt(item))
+            self.repl.paste_prompt(self.prompt_for_item(item))
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"retry failed: {exc}")
-            self.queue.append_status(item, "failed", error=f"retry failed: {exc}")
             with self.lock:
                 self.active_turn = None
             self.stop_typing()
-            self.telegram.send(f"claude bridge delivery retry failed: {exc}")
+            self.mark_directive_terminal(item, "failed", error=f"retry failed: {exc}")
             self.persist_state()
             self.write_egress_sidecar()
             return
@@ -3231,7 +4971,209 @@ class Bridge:
             active.text,
             active.nonce,
             active.injected_at,
+            sent_at=active.sent_at,
+            source=active.source,
+            voice_reply_path=active.voice_reply_path,
+            busy_injected=active.busy_injected,
+            user_uuid=active.user_uuid or "",
+            user_seen_at=active.user_seen_at,
+            native_queue_seen_at=active.native_queue_seen_at,
         )
+
+    def mark_pending_user_nonce_seen(self, nonce: str, record: dict[str, Any]) -> bool:
+        user_uuid = str(record.get("uuid") or "")
+        if not user_uuid:
+            return False
+        user_seen_at = record_timestamp_seconds(record) or time.time()
+        matched: QueueItem | None = None
+        with self.lock:
+            for item in self.pending:
+                if item.busy_injected and item.nonce == nonce:
+                    item.user_uuid = user_uuid
+                    item.user_seen_at = user_seen_at
+                    matched = item
+                    break
+        if not matched:
+            return False
+        self.queue.append_status(
+            matched,
+            "enqueued",
+            busy_inject=True,
+            jsonl_seen=True,
+            user_uuid=user_uuid,
+            user_seen_at=user_seen_at,
+        )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("JSONL", f"pending user nonce seen {nonce}")
+        return True
+
+    def mark_attachment_nonce_seen(self, record: dict[str, Any]) -> bool:
+        nonce = record_contains_nonce(record) or record_attachment_nonce(record)
+        if not nonce:
+            return False
+        user_uuid = str(record.get("uuid") or record.get("parentUuid") or f"attachment:{nonce}")
+        user_seen_at = record_timestamp_seconds(record) or time.time()
+        active_item: QueueItem | None = None
+        pending_item: QueueItem | None = None
+        with self.lock:
+            if self.active_turn and self.active_turn.nonce == nonce:
+                self.active_turn.user_uuid = user_uuid
+                self.active_turn.user_seen_at = user_seen_at
+                active_item = self.queue_item_for_active(self.active_turn)
+            else:
+                for item in self.pending:
+                    if item.nonce == nonce:
+                        item.user_uuid = user_uuid
+                        item.user_seen_at = user_seen_at
+                        pending_item = item
+                        break
+        if active_item:
+            self.queue.append_status(
+                active_item,
+                "user_jsonl_seen",
+                user_uuid=user_uuid,
+                user_seen_at=user_seen_at,
+                sidecar_attachment=True,
+            )
+        elif pending_item:
+            self.queue.append_status(
+                pending_item,
+                "enqueued",
+                jsonl_seen=True,
+                sidecar_attachment=True,
+                user_uuid=user_uuid,
+                user_seen_at=user_seen_at,
+            )
+        else:
+            return False
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("JSONL", f"attachment nonce seen {nonce}")
+        return True
+
+    def remember_native_queue_enqueue(self, record: dict[str, Any]) -> bool:
+        if record.get("operation") != "enqueue":
+            return False
+        content = record.get("content")
+        if not isinstance(content, str):
+            return False
+        match = NONCE_RE.search(content)
+        if not match:
+            return False
+        timestamp = str(record.get("timestamp") or "")
+        if not timestamp:
+            return False
+        nonce = match.group(0)
+        seen_at = record_timestamp_seconds(record) or time.time()
+        active_item: QueueItem | None = None
+        matched_item: QueueItem | None = None
+        with self.lock:
+            self.native_queue_nonce_by_timestamp[timestamp] = nonce
+            if len(self.native_queue_nonce_by_timestamp) > 200:
+                self.native_queue_nonce_by_timestamp = dict(
+                    list(self.native_queue_nonce_by_timestamp.items())[-120:]
+                )
+            if self.active_turn and self.active_turn.nonce == nonce:
+                self.active_turn.native_queue_seen_at = seen_at
+                active_item = self.queue_item_for_active(self.active_turn)
+            else:
+                for item in self.pending:
+                    if item.busy_injected and item.nonce == nonce:
+                        item.native_queue_seen_at = seen_at
+                        matched_item = item
+                        break
+        if active_item:
+            self.queue.append_status(active_item, "injected", busy_inject=True, native_queue_seen=True)
+        elif matched_item:
+            self.queue.append_status(matched_item, "enqueued", busy_inject=True, native_queue_seen=True)
+        if active_item or matched_item:
+            self.persist_state()
+            self.write_egress_sidecar()
+        log("JSONL", f"native queue nonce enqueued {nonce}")
+        return True
+
+    def mark_native_queue_attachment_seen(self, record: dict[str, Any]) -> bool:
+        timestamp = str(record.get("timestamp") or "")
+        user_uuid = str(record.get("uuid") or "")
+        if not timestamp or not user_uuid:
+            return False
+        with self.lock:
+            nonce = self.native_queue_nonce_by_timestamp.get(timestamp)
+        if not nonce:
+            return False
+        user_seen_at = record_timestamp_seconds(record) or time.time()
+        active_item: QueueItem | None = None
+        pending_item: QueueItem | None = None
+        with self.lock:
+            if self.active_turn and self.active_turn.nonce == nonce:
+                self.active_turn.user_uuid = user_uuid
+                self.active_turn.user_seen_at = user_seen_at
+                if self.active_turn.native_queue_seen_at <= 0:
+                    self.active_turn.native_queue_seen_at = user_seen_at
+                active_item = self.queue_item_for_active(self.active_turn)
+            else:
+                for item in self.pending:
+                    if item.busy_injected and item.nonce == nonce:
+                        item.user_uuid = user_uuid
+                        item.user_seen_at = user_seen_at
+                        if item.native_queue_seen_at <= 0:
+                            item.native_queue_seen_at = user_seen_at
+                        pending_item = item
+                        break
+        if active_item:
+            self.queue.append_status(
+                active_item,
+                "user_jsonl_seen",
+                user_uuid=user_uuid,
+                user_seen_at=user_seen_at,
+                native_queue_attachment=True,
+            )
+        elif pending_item:
+            self.queue.append_status(
+                pending_item,
+                "enqueued",
+                busy_inject=True,
+                jsonl_seen=True,
+                native_queue_attachment=True,
+                user_uuid=user_uuid,
+                user_seen_at=user_seen_at,
+            )
+        else:
+            return False
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("JSONL", f"native queue attachment seen {nonce}")
+        return True
+
+    def release_batched_busy_pending(self, active: ActiveTurn, status: str) -> None:
+        if status not in {"sent", "answered"} or not active.busy_injected or active.user_seen_at <= 0:
+            return
+        released: list[QueueItem] = []
+        with self.lock:
+            remaining: list[QueueItem] = []
+            releasing_prefix = True
+            for item in self.pending:
+                if (
+                    releasing_prefix
+                    and item.busy_injected
+                    and item.user_uuid
+                    and item.user_seen_at > 0
+                    and item.user_seen_at + 0.001 >= active.user_seen_at
+                ):
+                    released.append(item)
+                    continue
+                releasing_prefix = False
+                remaining.append(item)
+            if released:
+                self.pending = remaining
+        for item in released:
+            self.queue.append_status(item, status, busy_inject=True, batched_with=active.queue_id)
+        if released:
+            log(
+                "TURN",
+                f"released {len(released)} busy-inject batched pending item(s) with {active.queue_id[:10]}",
+            )
 
     def send_active_answer(self, active: ActiveTurn, assistant_uuid: str, answer: str) -> None:
         claim = self.claim_send_attempt(active, assistant_uuid, answer)
@@ -3293,17 +5235,23 @@ class Bridge:
     ) -> None:
         send_error = "telegram send failed"
         copy_payload_messages = split_copy_payload_messages(answer)
+        reply_to_message_id = active.message_id if active.message_id > 0 and active.source != "voice" else None
         try:
             if copy_payload_messages:
                 sent_ids = []
+                used_reply = False
                 for message in copy_payload_messages:
-                    part_ids = self.telegram.send(message)
+                    part_ids = self.telegram.send(
+                        message,
+                        reply_to_message_id=reply_to_message_id if not used_reply else None,
+                    )
+                    used_reply = True
                     if part_ids is None:
                         sent_ids = None
                         break
                     sent_ids.extend(part_ids)
             else:
-                sent_ids = self.telegram.send(answer)
+                sent_ids = self.telegram.send(answer, reply_to_message_id=reply_to_message_id)
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
             sent_ids = None
@@ -3343,6 +5291,10 @@ class Bridge:
             return
 
         self.outbox.mark_sent(key, sent_ids)
+        try:
+            write_voice_answer(active, assistant_uuid=assistant_uuid, answer=answer)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"voice answer sidecar write failed (non-fatal): {exc}")
         # 🧠 reasoning mirror — sent once, right after the deduped final answer
         # (sibling of codex-repl-telegram-bridge's 🧠 코덱스 사고). Empty/no-thinking
         # turns produce no block. Failures here never affect answer delivery.
@@ -3387,26 +5339,34 @@ class Bridge:
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = message.get("content")
 
+        if record_type == "queue-operation":
+            self.remember_native_queue_enqueue(record)
+            return
+
+        if record_type == "attachment":
+            if self.mark_native_queue_attachment_seen(record):
+                return
+            if self.mark_attachment_nonce_seen(record):
+                return
+
         if record_type == "user" and message.get("role") == "user":
             nonce = record_contains_nonce(record)
             if nonce and self.active_turn and nonce == self.active_turn.nonce:
                 self.active_turn.user_uuid = str(record.get("uuid") or "")
                 self.active_turn.user_seen_at = record_timestamp_seconds(record) or time.time()
                 self.queue.append_status(
-                    QueueItem(
-                        self.active_turn.queue_id,
-                        self.active_turn.update_id,
-                        self.active_turn.message_id,
-                        self.active_turn.text,
-                        self.active_turn.nonce,
-                        self.active_turn.injected_at,
-                    ),
+                    self.queue_item_for_active(self.active_turn),
                     "user_jsonl_seen",
                     user_uuid=self.active_turn.user_uuid,
+                    user_seen_at=self.active_turn.user_seen_at,
                 )
                 self.persist_state()
                 self.write_egress_sidecar()
                 log("JSONL", f"user nonce seen {nonce}")
+                return
+            if nonce and self.mark_pending_user_nonce_seen(nonce, record):
+                return
+            if not nonce and self.mark_active_sidecar_body_user_seen(record):
                 return
             # ⚙️ ambient flow mirror — node-originated incoming directive (다른 노드/오케가
             # 주입한 트리거 프롬프트). 텔레그램 active turn 도 nonce 도 없는 user 레코드 =
@@ -3659,17 +5619,8 @@ class Bridge:
                 return False
             self.active_turn = None
         self.stop_typing()
-        self.queue.append_status(
-            QueueItem(
-                active.queue_id,
-                active.update_id,
-                active.message_id,
-                active.text,
-                active.nonce,
-                active.injected_at,
-            ),
-            status,
-        )
+        self.queue.append_status(self.queue_item_for_active(active), status)
+        self.release_batched_busy_pending(active, status)
         self.persist_state()
         self.write_egress_sidecar()
         self.drain_queue()
@@ -3736,6 +5687,8 @@ class Bridge:
                     log("JSONL", f"watch error: {message}")
                     self.last_jsonl_watch_error = message
                     self.last_jsonl_watch_error_log_at = now
+                if is_tmux_session_lost_error(exc):
+                    self.release_active_turn_due_to_tmux_session_lost(message)
                 if isinstance(exc, FileNotFoundError):
                     with self.lock:
                         if self.session_identity is not None or (
@@ -3762,6 +5715,10 @@ class Bridge:
             )
         except Exception as exc:  # noqa: BLE001
             log("UPDATE", f"update offer failed: {exc}")
+
+    def service_external_queue_once(self) -> None:
+        self.load_pending_queue()
+        self.drain_queue()
 
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
@@ -3808,8 +5765,11 @@ class Bridge:
                 write_text_atomic(self.config.offset_file, offset)
                 self.drain_queue()
             self.check_injection_timeout()
+            self.check_queue_stuck_alert()
+            self.check_busy_stuck_rebind()
+            self.retry_media_downloads()
             self.retry_pending_send()
-            self.drain_queue()
+            self.service_external_queue_once()
 
     def run(self) -> None:
         self.repl.verify()
@@ -3884,9 +5844,28 @@ def validate_startup_config(config: "Config") -> None:
         )
 
 
+def enqueue_voice_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Enqueue a Jarvis voice question into the Claude Telegram bridge queue.")
+    parser.add_argument("--question", required=True)
+    parser.add_argument("--voice-reply-path", required=True)
+    parser.add_argument("--voice-request-id", default="")
+    args = parser.parse_args(argv)
+    config = Config.from_env()
+    result = enqueue_voice_prompt(
+        config,
+        question=args.question,
+        reply_path=Path(args.voice_reply_path).expanduser(),
+        request_id=args.voice_request_id,
+    )
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result.get("status") in {"enqueued", "duplicate"} else 1
+
+
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--health-check":
         return health_check_main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--enqueue-voice":
+        return enqueue_voice_main(sys.argv[2:])
     try:
         config = Config.from_env()
         validate_startup_config(config)

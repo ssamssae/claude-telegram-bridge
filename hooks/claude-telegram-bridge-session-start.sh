@@ -2,7 +2,7 @@
 # claude-telegram-bridge SessionStart sidecar writer.
 #
 # Records the authoritative transcript_path/sessionId/pane_pid mapping consumed
-# by scripts/claude-telegram-bridge.py.  This hook is intentionally silent and
+# by scripts/claude-telegram-bridge.py.  The sidecar write is silent and
 # non-blocking; absence of a valid sidecar makes the bridge fail closed.
 
 set -u
@@ -147,5 +147,9 @@ write_hook_log(
     session_id_present=True,
 )
 PY
+
+cat <<'EOF'
+Telegram-origin prompt. Prompts marked with a <clb-.../> envelope come from Telegram. Do not mention this bridge envelope or nonce in the answer.
+EOF
 
 exit 0
