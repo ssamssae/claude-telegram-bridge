@@ -9,6 +9,146 @@ answer back to Telegram.
 The bridge is Claude-specific. It is not a general multi-AI bridge and it does
 not share runtime code with the Codex Telegram Bridge.
 
+## Quick Start (No Prior Bot Experience Needed)
+
+In plain words: Claude Code runs on your computer, and this bridge lets you
+talk to that session from the Telegram app on your phone. You text your own
+private Telegram bot, the bridge types your message into the live Claude Code
+terminal, and when Claude finishes answering, the final answer is sent back to
+your phone.
+
+### What you need
+
+- A computer (Linux or macOS) where Claude Code is installed and logged in.
+- `tmux` and Python 3 installed on that computer.
+- The Telegram app on your phone, plus `curl` on the computer for one setup
+  step below.
+
+### Step 1 - Create your own bot with BotFather
+
+1. In Telegram, search for `@BotFather` (the official bot with a blue check)
+   and open a chat with it.
+2. Send `/newbot`.
+3. BotFather asks for a display name. Type anything, for example
+   `My Claude Bridge`.
+4. BotFather asks for a username. It must be unique and end in `bot`, for
+   example `my_claude_bridge_bot`.
+5. BotFather replies with an HTTP API token that looks like
+   `1234567890:AbCd...` (digits, a colon, then a long letter string). Copy
+   it. This token is a secret: paste it only into local files on your
+   computer, never into a Telegram chat and never into a public repository.
+
+### Step 2 - Find your chat id
+
+The bridge only answers one Telegram chat: yours. To learn your chat id:
+
+1. Open a chat with your new bot in Telegram and send it any message, for
+   example `hello`. (Bots cannot message you first; this step is required.)
+2. On your computer, run the following with your token substituted:
+
+```bash
+curl -s "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
+```
+
+3. In the JSON response, find `"chat":{"id":123456789,...}`. That number is
+   your chat id. If the response is empty, send the bot another message and
+   run the command again.
+
+### Step 3 - Install the bridge
+
+```bash
+pipx install claude-telegram-bridge
+```
+
+or, without pipx:
+
+```bash
+pip install --user claude-telegram-bridge
+```
+
+### Step 4 - Save the token and registry (one paste)
+
+This writes the two small local files the bridge requires: the token file and
+the token ownership registry. The `read -r -s` prompt keeps the token out of
+your shell history.
+
+```bash
+mkdir -p "$HOME/.config/claude-telegram-bridge"
+read -r -s -p "Paste your bot token, then press Enter: " CLB_BOT_TOKEN; echo
+CLB_BOT_TOKEN="$CLB_BOT_TOKEN" python3 - <<'PY'
+import hashlib, json, os, pathlib
+token = os.environ["CLB_BOT_TOKEN"].strip()
+root = pathlib.Path.home() / ".config/claude-telegram-bridge"
+(root / "token.json").write_text(json.dumps({"token": token}))
+(root / "token.json").chmod(0o600)
+token_id = hashlib.sha256(token.encode()).hexdigest()[:16]
+(root / "token-registry.json").write_text(json.dumps({
+    "tokens": {
+        "default": {
+            "token_id": token_id,
+            "mode": "polling",
+            "owner": "claude-telegram-bridge",
+            "expected_consumer": "claude",
+            "allow_delete_webhook": False
+        }
+    }
+}, indent=2))
+print("wrote token.json and token-registry.json")
+PY
+```
+
+### Step 5 - Start Claude Code in tmux and register the hook
+
+Start (or keep) a Claude Code session inside tmux:
+
+```bash
+tmux -L default new -s claude
+claude --dangerously-skip-permissions
+```
+
+Then download the SessionStart hook and register it, so the bridge can find
+Claude's transcript and capture final answers:
+
+```bash
+curl -fsSL -o "$HOME/.config/claude-telegram-bridge/session-start.sh" \
+  https://raw.githubusercontent.com/ssamssae/claude-telegram-bridge/main/hooks/claude-telegram-bridge-session-start.sh
+chmod +x "$HOME/.config/claude-telegram-bridge/session-start.sh"
+```
+
+Add the hook to your Claude Code settings using the JSON shown in
+[Minimal Manual Setup](#minimal-manual-setup) step 7, with
+`/absolute/path/to/hooks/claude-telegram-bridge-session-start.sh` replaced by
+the file you just downloaded. Then run `/clear` in the Claude session (or start
+a new one) so the hook fires at least once.
+
+### Step 6 - First run
+
+Only three environment variables are needed; everything else has safe
+defaults:
+
+```bash
+export CLB_TOKEN_FILE="$HOME/.config/claude-telegram-bridge/token.json"
+export CLB_TOKEN_REGISTRY="$HOME/.config/claude-telegram-bridge/token-registry.json"
+export CLB_CHAT_ID="123456789"   # your chat id from Step 2
+claude-telegram-bridge
+```
+
+### Step 7 - Say hello
+
+1. Send `/ping` to your bot. The bridge itself answers immediately; this
+   proves token and chat id are correct.
+2. Send a real prompt, for example `What directory are you in?`. You should
+   see the message appear inside the tmux Claude pane, and Claude's final
+   answer arrive back in Telegram.
+
+If `/ping` works but a real prompt gets no reply, the usual cause is the
+SessionStart hook from Step 5 not being registered or the Claude session not
+having been restarted after registering it. The bridge's terminal log says
+what it is waiting for.
+
+Done. For running from a clone, all environment variables, slash command
+behavior, and safety notes, keep reading below.
+
 ## What It Supports
 
 - Text prompts from Telegram into a live Claude Code tmux session.
