@@ -73,6 +73,8 @@ def strip_leading_emoji_decoration(text: str) -> str:
             continue
         break
     return value[index:].lstrip() if seen_decoration else value
+
+
 BRIDGE_OWNER = "claude-telegram-bridge"
 BRIDGE_HEALTH_SLASH_COMMANDS = {"/ping", "/start"}
 BRIDGE_STATUS_SLASH_COMMAND = "/status"
@@ -1965,13 +1967,15 @@ class TelegramClient:
 
     def with_emoji_prefix(self, text: str) -> str:
         text = strip_bridge_nonce_markers(text)
+        original_text = text
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
         private_chat = is_private_chat_id(self.chat_id)
         if first_line == self.emoji and not private_chat:
             return text
         text = strip_node_emoji_header(text)
         if private_chat:
-            return strip_leading_emoji_decoration(text)
+            text = strip_leading_emoji_decoration(text)
+            return text if text.strip() else original_text
         return f"{self.emoji}\n{text}"
 
     def chunks(self, text: str) -> list[str]:

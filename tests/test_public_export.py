@@ -37,6 +37,7 @@ class PublicExportTest(unittest.TestCase):
         }
 
         self.assertEqual(telegram.with_emoji_prefix("🙂😄👋 안녕하세요"), "안녕하세요")
+        self.assertEqual(telegram.with_emoji_prefix("🍎"), "🍎")
         telegram.send("🤖\n답변", reply_to_message_id=42)
 
         self.assertEqual(calls[-1][1]["text"], "답변")
