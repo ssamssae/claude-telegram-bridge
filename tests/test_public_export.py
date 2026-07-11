@@ -27,44 +27,33 @@ class PublicExportTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             mod.validate_startup_config(cfg)
 
-    def test_private_dm_removes_leading_decoration_and_keeps_reply_quote(self):
-        mod = self._load_bridge()
-        telegram = mod.TelegramClient("token", "1234", "🤖", 4096)
-        calls = []
-        telegram.call = lambda method, **params: calls.append((method, params)) or {
-            "ok": True,
-            "result": {"message_id": 1},
-        }
-
-        self.assertEqual(telegram.with_emoji_prefix("🙂😄👋 안녕하세요"), "안녕하세요")
-        self.assertEqual(telegram.with_emoji_prefix("🍎"), "🍎")
-        telegram.send("🤖\n답변", reply_to_message_id=42)
-
-        self.assertEqual(calls[-1][1]["text"], "답변")
-        self.assertEqual(calls[-1][1]["reply_to_message_id"], 42)
-
-    def test_group_keeps_node_emoji_and_reply_quote(self):
-        mod = self._load_bridge()
-        telegram = mod.TelegramClient("token", "-1234", "🤖", 4096)
-        calls = []
-        telegram.call = lambda method, **params: calls.append((method, params)) or {
-            "ok": True,
-            "result": {"message_id": 1},
-        }
-
-        telegram.send("답변", reply_to_message_id=42)
-
-        self.assertEqual(calls[-1][1]["text"], "🤖\n답변")
-        self.assertEqual(calls[-1][1]["reply_to_message_id"], 42)
-
-    @staticmethod
-    def _load_bridge():
+    def test_private_dm_removes_leading_decoration_and_group_keeps_context(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
         spec = importlib.util.spec_from_file_location("claude_telegram_bridge_behavior", path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
-        return mod
+
+        private = mod.TelegramClient("token", "1234", "🤖", 4096)
+        private_calls = []
+        private.call = lambda method, **params: private_calls.append((method, params)) or {
+            "ok": True,
+            "result": {"message_id": 1},
+        }
+        self.assertEqual(private.with_emoji_prefix("🙂😄👋 hello"), "hello")
+        self.assertEqual(private.with_emoji_prefix("🍎"), "🍎")
+        private.send("answer", reply_to_message_id=42)
+        self.assertEqual(private_calls[-1][1]["reply_to_message_id"], 42)
+
+        group = mod.TelegramClient("token", "-1234", "🤖", 4096)
+        group_calls = []
+        group.call = lambda method, **params: group_calls.append((method, params)) or {
+            "ok": True,
+            "result": {"message_id": 1},
+        }
+        group.send("answer", reply_to_message_id=42)
+        self.assertEqual(group_calls[-1][1]["text"], "🤖\nanswer")
+        self.assertEqual(group_calls[-1][1]["reply_to_message_id"], 42)
 
 
 if __name__ == "__main__":

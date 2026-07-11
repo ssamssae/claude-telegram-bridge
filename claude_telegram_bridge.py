@@ -73,8 +73,6 @@ def strip_leading_emoji_decoration(text: str) -> str:
             continue
         break
     return value[index:].lstrip() if seen_decoration else value
-
-
 BRIDGE_OWNER = "claude-telegram-bridge"
 BRIDGE_HEALTH_SLASH_COMMANDS = {"/ping", "/start"}
 BRIDGE_STATUS_SLASH_COMMAND = "/status"
@@ -91,9 +89,8 @@ MODEL_CALLBACK = "clb-model"
 # (하드코딩 최소화 — 새 모델은 env 로 주입, 현재 모델 표시는 settings SoT 에서 동적).
 DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
 # 프리즈 가드 밖 원문 강제 주입 escape hatch: 메시지 맨 앞 '!' 1자 (예: !/theme).
+# T-260710-80 이후 일반 슬래시는 기본 통과라 주로 /model 인터셉트·캡처미러 우회용.
 SLASH_ESCAPE_PREFIX = "!"
-# 인터셉트 없이 그대로 통과시키는 슬래시 — 대화상자를 열지 않는(프리즈 위험 0) 명령만.
-SAFE_PASSTHROUGH_SLASH_COMMANDS = {"/clear", "/exit", "/quit"}
 # 세션을 종료시키는 슬래시 — 통과 후 브릿지가 watchdog 자가복구를 앞당겨 트리거한다.
 # /clear 는 세션을 죽이지 않으므로(컨텍스트 리셋만) 제외.
 SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
@@ -236,6 +233,25 @@ def float_env(name: str, default: float, minimum: float = 0.0) -> float:
 def bool_env(name: str, default: bool = False) -> bool:
     fallback = "1" if default else "0"
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
+
+
+def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
+    original = text or ""
+    if not enabled:
+        return [original]
+    trimmed = original.rstrip("\r\n")
+    lines = trimmed.splitlines()
+    if not lines:
+        return [original]
+    match = re.fullmatch(r"<추천답변>([^\r\n]+)</추천답변>", lines[-1])
+    if not match:
+        return [original]
+    body = "\n".join(lines[:-1]).rstrip()
+    if not body:
+        return [original]
+    if surface == "aniki_dm":
+        return [body, match.group(1)]
+    return [body]
 
 
 def busy_inject_enabled() -> bool:
@@ -1988,6 +2004,22 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return chunks
 
+    def send_copy_content(self, text: str) -> list[int] | None:
+        message_ids: list[int] = []
+        chunks = [text[: self.chunk_size]]
+        rest = text[self.chunk_size :]
+        while rest:
+            chunks.append(rest[: self.chunk_size])
+            rest = rest[self.chunk_size :]
+        for chunk in chunks:
+            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+            if not payload or not payload.get("ok"):
+                return None
+            result = payload.get("result")
+            if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+                message_ids.append(int(result["message_id"]))
+        return message_ids
+
     def send(self, text: str, reply_to_message_id: int | None = None, mono: bool = False) -> list[int] | None:
         message_ids: list[int] = []
         for idx, chunk in enumerate(self.chunks(text)):
@@ -2119,6 +2151,7 @@ class Config:
     envelope_sidecar_off_flag_path: Path = ENVELOPE_SIDECAR_OFF_FLAG
     envelope_sidecar_path: Path = ENVELOPE_SIDECAR_PATH
     envelope_sidecar_ttl_seconds: float = DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS
+    suggested_reply_bubble: bool = False
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -2189,6 +2222,7 @@ class Config:
                 DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS,
                 minimum=1.0,
             ),
+            suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
         )
 
     @property
@@ -4942,17 +4976,6 @@ class Bridge:
         self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
         log("INJECT", f"/model menu sent update={item.update_id}")
 
-    def handle_blocked_slash(self, item: "QueueItem", command_token: str) -> None:
-        # 프리즈 가드 fail-safe (T-260702-14): 지원 목록 밖 슬래시는 인터랙티브
-        # 대화상자로 세션이 얼 수 있어 명령으로는 주입하지 않고, 원문 프롬프트로 재시도한다.
-        self.mark_directive_terminal(
-            item,
-            "blocked",
-            slash_command=command_token,
-            error=f"unsupported slash command {command_token}",
-        )
-        log("INJECT", f"slash blocked token={command_token} update={item.update_id}")
-
     def _emit_model_notice(self, text: str, menu_message_id: int | None) -> None:
         # 메뉴 메시지가 있으면 그 자리를 edit(적용/거부/대기 확인), 없으면 새 메시지로 회신.
         if menu_message_id is not None:
@@ -5271,12 +5294,10 @@ class Bridge:
                     self.persist_state()
                     self.write_egress_sidecar()
                     return
-                # 프리즈 가드 fail-safe: 지원 목록 밖 슬래시 = 주입 차단 + 안내.
-                if command_token not in SAFE_PASSTHROUGH_SLASH_COMMANDS:
-                    self.handle_blocked_slash(item, command_token)
-                    self.persist_state()
-                    self.write_egress_sidecar()
-                    return
+                # T-260710-80 (아니키 지시 2026-07-10): 그 외 슬래시는 codex 브릿지와
+                # 동형으로 원문 통과. 옛 fail-safe(allowlist 밖 차단)는 /effort 등 신규
+                # 명령까지 막아 폐기 — 인터랙티브 선택창 프리즈 위험은 /model 인터셉트
+                # (T-260703-17)와 watchdog 자가복구가 담당한다.
             prompt = escape_unsafe_slash(sanitize_text(inject_text))
             try:
                 for _ in range(self.config.composer_clear_retries):
@@ -5916,7 +5937,15 @@ class Bridge:
         key: str,
     ) -> None:
         send_error = "telegram send failed"
-        copy_payload_messages = split_copy_payload_messages(answer)
+        surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        answer_messages = suggested_reply_messages(
+            answer,
+            self.config.suggested_reply_bubble,
+            surface,
+        )
+        delivered_answer = answer_messages[0]
+        suggested_reply = answer_messages[1] if len(answer_messages) == 2 else ""
+        copy_payload_messages = split_copy_payload_messages(delivered_answer)
         reply_to_message_id = active.message_id if active.message_id > 0 and active.source != "voice" else None
         self.outbox.mark_sending(key, active.send_attempts)
         try:
@@ -5934,7 +5963,7 @@ class Bridge:
                         break
                     sent_ids.extend(part_ids)
             else:
-                sent_ids = self.telegram.send(answer, reply_to_message_id=reply_to_message_id)
+                sent_ids = self.telegram.send(delivered_answer, reply_to_message_id=reply_to_message_id)
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
             sent_ids = None
@@ -5974,9 +6003,15 @@ class Bridge:
             self.write_egress_sidecar()
             return
 
+        if suggested_reply:
+            bubble_ids = self.telegram.send_copy_content(suggested_reply)
+            if bubble_ids is None:
+                log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
+            else:
+                sent_ids.extend(bubble_ids)
         self.outbox.mark_sent(key, sent_ids)
         try:
-            write_voice_answer(active, assistant_uuid=assistant_uuid, answer=answer)
+            write_voice_answer(active, assistant_uuid=assistant_uuid, answer=delivered_answer)
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"voice answer sidecar write failed (non-fatal): {exc}")
         # 🧠 reasoning mirror — sent once, right after the deduped final answer
@@ -6236,14 +6271,23 @@ class Bridge:
                 return
         except OSError:
             pass
-        text = sanitize_text(content_text(content), limit=FLOW_MIRROR_LIMIT)
-        if not text:
+        raw_text = sanitize_text(content_text(content), limit=FLOW_MIRROR_LIMIT)
+        if not raw_text:
             return
-        key = hashlib.sha1(text.encode("utf-8")).hexdigest()
+        key = hashlib.sha1(raw_text.encode("utf-8")).hexdigest()
         if key == self.ambient_final_last_key:
-            mesh_ledger_record("sendMessage", self.config.chat_id, format_ambient_final(text), result="suppressed")
+            mesh_ledger_record("sendMessage", self.config.chat_id, format_ambient_final(raw_text), result="suppressed")
             return
         self.ambient_final_last_key = key
+        surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        answer_messages = suggested_reply_messages(
+            raw_text,
+            self.config.suggested_reply_bubble,
+            surface,
+        )
+        text = answer_messages[0]
+        suggested_reply = answer_messages[1] if len(answer_messages) == 2 else ""
+        delivered = False
         anchor = self.ambient_directive_message_id
         if anchor and alt3_narrative_enabled():
             # alt3 (spec v0.2 §6, T-260702-37 PR-B): 받은지시 카드 edit-통합 모델 폐기 →
@@ -6253,14 +6297,15 @@ class Bridge:
             try:
                 ids = self.telegram.send(text, reply_to_message_id=anchor)
                 if ids:
+                    delivered = True
                     log("SEND", f"sent ambient final as reply to directive root mid={anchor}")
                 else:
-                    self.telegram.send(format_ambient_final(text))
+                    delivered = bool(self.telegram.send(format_ambient_final(text)))
                     log("SEND", "ambient final reply failed → fallback card send")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final reply failed → fallback send (non-fatal): {exc}")
                 try:
-                    self.telegram.send(format_ambient_final(text))
+                    delivered = bool(self.telegram.send(format_ambient_final(text)))
                 except Exception as exc2:  # noqa: BLE001
                     log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
             self.ambient_directive_message_id = 0
@@ -6272,21 +6317,26 @@ class Bridge:
             unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text)}"
             try:
                 self.telegram.edit(anchor, unified)
+                delivered = True
                 log("SEND", f"edited ambient final into directive anchor mid={anchor}")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final anchor edit failed → fallback send (non-fatal): {exc}")
                 try:
-                    self.telegram.send(format_ambient_final(text))
+                    delivered = bool(self.telegram.send(format_ambient_final(text)))
                 except Exception as exc2:  # noqa: BLE001
                     log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
             self.ambient_directive_message_id = 0
             self.ambient_directive_body = ""
         else:
             try:
-                self.telegram.send(format_ambient_final(text))
+                delivered = bool(self.telegram.send(format_ambient_final(text)))
                 log("SEND", "sent ambient final")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final send failed (non-fatal): {exc}")
+        if delivered and suggested_reply:
+            bubble_ids = self.telegram.send_copy_content(suggested_reply)
+            if bubble_ids is None:
+                log("SEND", "suggested reply bubble failed after ambient final (non-fatal)")
         # 최종 답변 미러 후 flow 카드 bout 종료 -> 다음 노드 작업은 새 카드로.
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0

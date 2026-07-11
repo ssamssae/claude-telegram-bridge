@@ -39,7 +39,10 @@ Expected result: no matches.
 4. Compile and test import:
 
 ```bash
-python3 -m py_compile dist/claude-telegram-bridge/claude_telegram_bridge.py
+python3 -m py_compile \
+  dist/claude-telegram-bridge/bridge_setup.py \
+  dist/claude-telegram-bridge/bridge_watchdog.py \
+  dist/claude-telegram-bridge/claude_telegram_bridge.py
 python3 - <<'PY'
 import importlib.util
 import sys

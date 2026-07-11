@@ -28,6 +28,32 @@ both surfaces.
 - The Telegram app on your phone, plus `curl` on the computer for one setup
   step below.
 
+### Recommended - run the setup wizard
+
+Install the package, then run the six-step wizard:
+
+```bash
+pipx install claude-telegram-bridge
+claude-telegram-bridge setup
+```
+
+The wizard validates the hidden BotFather token, waits for `/start` to detect
+your chat id, writes `token.json` and `token-registry.json`, installs the
+SessionStart hook, backs up and merges `~/.claude/settings.json`, installs the
+local service/watchdog, and sends one test message. It preserves unrelated
+Claude settings and does not replace an existing hook chain.
+
+Check or remove the installation later with:
+
+```bash
+claude-telegram-bridge doctor
+claude-telegram-bridge uninstall
+claude-telegram-bridge uninstall --purge
+```
+
+The numbered steps below remain as the manual fallback and explain each file
+the wizard manages.
+
 ### Step 1 - Create your own bot with BotFather
 
 1. In Telegram, search for `@BotFather` (the official bot with a blue check)
@@ -64,7 +90,15 @@ curl -s "https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates"
 pipx install claude-telegram-bridge
 ```
 
-or, without pipx:
+If `pipx` is not installed yet (`pipx: command not found`), install it once and
+reopen your terminal so it lands on PATH:
+
+```bash
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+```
+
+or skip pipx entirely:
 
 ```bash
 pip install --user claude-telegram-bridge
@@ -110,6 +144,16 @@ tmux -L default new -s claude
 claude --dangerously-skip-permissions
 ```
 
+About `--dangerously-skip-permissions`: this flag lets Claude Code run its
+tools (file edits, shell commands) without stopping to ask you for per-action
+approval. It is suggested here because an unattended remote session cannot
+click an approval dialog — a pending permission prompt would leave your
+Telegram turn hanging until you return to the keyboard. Understand the
+tradeoff before using it: Claude can then act on your machine without asking.
+If you prefer to keep the permission prompts, start plain `claude` instead;
+the bridge still works, and Telegram turns simply wait whenever Claude is
+blocked on an approval dialog that you must answer at the terminal.
+
 Then download the SessionStart hook and register it, so the bridge can find
 Claude's transcript and capture final answers:
 
@@ -119,10 +163,35 @@ curl -fsSL -o "$HOME/.config/claude-telegram-bridge/session-start.sh" \
 chmod +x "$HOME/.config/claude-telegram-bridge/session-start.sh"
 ```
 
-Add the hook to your Claude Code settings using the JSON shown in
-[Minimal Manual Setup](#minimal-manual-setup) step 7, with
-`/absolute/path/to/hooks/claude-telegram-bridge-session-start.sh` replaced by
-the file you just downloaded. Then run `/clear` in the Claude session (or start
+Register the hook in `~/.claude/settings.json` — the user-level Claude Code
+settings file. Create the file with exactly this content if it does not exist
+yet:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/YOU/.config/claude-telegram-bridge/session-start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Replace `/home/YOU/...` with the absolute path of the file you downloaded
+above (`echo "$HOME/.config/claude-telegram-bridge/session-start.sh"` prints
+it; `~` is not expanded inside settings.json, so use the full path).
+
+If `~/.claude/settings.json` already has content, merge instead of
+overwriting: keep your existing keys and add the `"SessionStart"` entry inside
+your existing `"hooks"` object (or add the whole `"hooks"` object alongside
+your other top-level keys). Then run `/clear` in the Claude session (or start
 a new one) so the hook fires at least once.
 
 ### Step 6 - First run
@@ -253,6 +322,8 @@ Capture tuning for `/context`, `/usage`, and `/cost`:
 
 ## Files
 
+- `bridge_setup.py` - six-step setup wizard, doctor, and uninstall CLI.
+- `bridge_watchdog.py` - local service recovery helper installed by the wizard.
 - `claude_telegram_bridge.py` - bridge daemon.
 - `hooks/claude-telegram-bridge-session-start.sh` - records transcript and tmux
   pane binding for the daemon.
@@ -272,7 +343,9 @@ pipx install claude-telegram-bridge
 pip install --user claude-telegram-bridge
 ```
 
-This provides the `claude-telegram-bridge` command. Installed copies also get
+This provides the `claude-telegram-bridge` command and its `setup`, `doctor`,
+and `uninstall` subcommands. With no subcommand it starts the daemon as before.
+Installed copies also get
 the startup version check with a one-tap Telegram update button. Running from
 a clone works too: use `python3 claude_telegram_bridge.py` in place of the
 installed command.
@@ -337,8 +410,11 @@ token_id = hashlib.sha256(token.encode()).hexdigest()[:16]
 PY
 ```
 
-7. Register the SessionStart hook in Claude Code settings. The exact settings
-file location depends on your Claude Code install.
+7. Register the SessionStart hook in Claude Code settings. The user-level
+settings file is `~/.claude/settings.json` (project-level
+`.claude/settings.json` inside a repository also works). Create it if missing;
+if it already exists, merge the `hooks` block below into your existing JSON
+instead of replacing the file.
 
 ```json
 {
