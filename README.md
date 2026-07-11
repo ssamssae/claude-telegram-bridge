@@ -43,6 +43,10 @@ SessionStart hook, backs up and merges `~/.claude/settings.json`, installs the
 local service/watchdog, and sends one test message. It preserves unrelated
 Claude settings and does not replace an existing hook chain.
 
+Native Windows bridging is not supported: Windows Claude cannot execute the
+`.sh` SessionStart hook and the daemon requires tmux. Use WSL. If a `--user`
+install is not on PATH, run `py -m bridge_setup setup` (or `doctor`) instead.
+
 Check or remove the installation later with:
 
 ```bash

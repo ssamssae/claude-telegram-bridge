@@ -7,6 +7,7 @@ import argparse
 import getpass
 import hashlib
 import json
+import ntpath
 import os
 import platform
 import shlex
@@ -36,6 +37,10 @@ SESSION_START_HOOK_URL = (
     "main/hooks/claude-telegram-bridge-session-start.sh"
 )
 SETUP_TOTAL_STEPS = 6
+NATIVE_WINDOWS_GUIDANCE = (
+    "Native Windows bridging is unsupported: Claude cannot run the .sh SessionStart hook "
+    "and the daemon requires tmux. Run setup and the bridge inside WSL."
+)
 
 
 class SetupError(RuntimeError):
@@ -99,6 +104,24 @@ def setup_note(message: str) -> None:
 
 def expand_path(raw: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(raw)))).resolve()
+
+
+def is_native_windows(os_name: str | None = None) -> bool:
+    return (os_name or platform.system()) == "Windows" or os.name == "nt" or sys.platform == "win32"
+
+
+def show_native_windows_guidance() -> bool:
+    if not is_native_windows():
+        return False
+    warn(NATIVE_WINDOWS_GUIDANCE)
+    return True
+
+
+def show_cli_path_fallback(command: str) -> bool:
+    if not is_native_windows() or shutil.which("claude-telegram-bridge"):
+        return False
+    warn(f"claude-telegram-bridge is not on PATH; use: py -m bridge_setup {command}")
+    return True
 
 
 def default_config_dir() -> Path:
@@ -360,16 +383,32 @@ def load_settings(path: Path) -> tuple[dict[str, Any], int]:
     return value, file_mode(path) or 0o600
 
 
-def command_targets_hook(command: object, hook_file: Path) -> bool:
+def normalized_hook_path(value: object) -> tuple[str, str]:
+    raw = str(value).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+        raw = raw[1:-1]
+    is_windows_path = (
+        len(raw) >= 3 and raw[1] == ":" and raw[2] in {"\\", "/"}
+    ) or raw.startswith("\\\\")
+    if is_windows_path:
+        return "windows", ntpath.normcase(ntpath.normpath(raw.replace("/", "\\")))
+    expanded = os.path.expandvars(os.path.expanduser(raw))
+    return "posix", os.path.normcase(os.path.normpath(os.path.abspath(expanded)))
+
+
+def command_targets_hook(command: object, hook_file: object) -> bool:
     if not isinstance(command, str):
         return False
+    candidates = [command]
     try:
-        parts = shlex.split(command)
+        windows_command = "\\" in command or (len(command) >= 2 and command[1] == ":")
+        parts = shlex.split(command, posix=not windows_command)
     except ValueError:
         parts = [command]
-    if not parts:
-        return False
-    return expand_path(parts[-1]) == hook_file.resolve()
+    if parts:
+        candidates.append(parts[-1])
+    target = normalized_hook_path(hook_file)
+    return any(normalized_hook_path(candidate) == target for candidate in candidates)
 
 
 def hook_registered(settings: dict[str, Any], hook_file: Path) -> bool:
@@ -710,6 +749,7 @@ def setup_bridge(
 ) -> int:
     out("Claude Telegram Bridge setup")
     setup_note("You need a BotFather token, Telegram /start, Claude Code, and tmux.")
+    show_native_windows_guidance()
 
     setup_step(1, "Paste and validate the BotFather token")
     token = (options.token or "").strip()
@@ -786,6 +826,7 @@ def setup_bridge(
     out("")
     out("Setup complete. Start Claude in: tmux -L default new -s claude")
     out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
+    show_cli_path_fallback("setup")
     return 0
 
 
@@ -810,6 +851,8 @@ def doctor(
 ) -> int:
     failures = 0
     warnings = 0
+    if show_native_windows_guidance():
+        warnings += 1
     config = load_env_file(config_file)
     if config_file.exists():
         ok(f"config exists: {config_file}")
@@ -891,6 +934,8 @@ def doctor(
     (ok if status in {"active", "loaded"} else warn)(f"service status: {status}")
     (ok if watchdog in {"active", "loaded"} else warn)(f"watchdog status: {watchdog}")
     warnings += int(status not in {"active", "loaded"}) + int(watchdog not in {"active", "loaded"})
+    if show_cli_path_fallback("doctor"):
+        warnings += 1
     out(f"doctor complete: {failures} failure(s), {warnings} warning(s)")
     return 2 if failures else 0
 

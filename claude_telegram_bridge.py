@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-import fcntl
+try:
+    import fcntl
+except ModuleNotFoundError:  # Native Windows has no POSIX flock implementation.
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import http.client
 import json
@@ -42,6 +45,10 @@ from typing import Any
 
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
+NATIVE_WINDOWS_DAEMON_ERROR = (
+    "Native Windows daemon is unsupported — the bridge requires tmux and POSIX file locking. "
+    "Run it inside WSL."
+)
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
 
 
@@ -6596,6 +6603,12 @@ def enqueue_voice_main(argv: list[str]) -> int:
 
 
 def main() -> int:
+    if sys.platform == "win32" or os.name == "nt":
+        print(NATIVE_WINDOWS_DAEMON_ERROR, file=sys.stderr)
+        return 2
+    if fcntl is None:
+        print("POSIX file locking is unavailable; cannot start Claude Telegram Bridge.", file=sys.stderr)
+        return 2
     if len(sys.argv) > 1 and sys.argv[1] == "--health-check":
         return health_check_main()
     if len(sys.argv) > 1 and sys.argv[1] == "--enqueue-voice":
