@@ -17,6 +17,10 @@ private Telegram bot, the bridge types your message into the live Claude Code
 terminal, and when Claude finishes answering, the final answer is sent back to
 your phone.
 
+Private-chat replies omit node prefixes and leading decorative emoji. Group
+chats keep node emoji so senders remain clear; reply quoting works the same on
+both surfaces.
+
 ### What you need
 
 - A computer (Linux or macOS) where Claude Code is installed and logged in.
