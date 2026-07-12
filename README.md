@@ -129,11 +129,21 @@ python3 -m pip install --user pipx
 python3 -m pipx ensurepath
 ```
 
+On Windows PowerShell there is usually no `python3` command — use the `py`
+launcher instead:
+
+```powershell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
 or skip pipx entirely:
 
 ```bash
 pip install --user claude-telegram-bridge
 ```
+
+(Windows PowerShell: `py -m pip install --user claude-telegram-bridge`.)
 
 On Debian/Ubuntu (including the default WSL distro) a bare `pip install` may
 stop with `error: externally-managed-environment` (PEP 668). Prefer pipx
