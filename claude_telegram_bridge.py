@@ -152,6 +152,7 @@ TYPING_PULSE_FIRST_WAIT = 1.0
 TYPING_PULSE_WAIT = 4.0
 TYPING_LIVENESS_GRACE_PULSES = 5
 TYPING_LIVENESS_CHECK_EVERY = 5
+FLOW_MIRROR_ENV = "CLB_FLOW_MIRROR"
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
 ENVELOPE_SIDECAR_FLAG = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.on")).expanduser()
 ENVELOPE_SIDECAR_OFF_FLAG = Path(
@@ -1444,8 +1445,15 @@ def format_reasoning_mirror(text: str) -> str:
 
 
 def flow_mirror_enabled() -> bool:
-    """⚙️ flow mirror toggle — flag-file gated so it can be turned on/off at
-    runtime without restarting the bridge. Default OFF (flag absent)."""
+    """Return the explicit env toggle, or fall back to the runtime flag file.
+
+    ``CLB_FLOW_MIRROR`` lets service/config-file users select the behavior
+    without creating another file.  Leaving it unset preserves the live flag
+    toggle and its default-OFF behavior.
+    """
+    configured = os.environ.get(FLOW_MIRROR_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
     return os.path.exists(FLOW_MIRROR_FLAG)
 
 
