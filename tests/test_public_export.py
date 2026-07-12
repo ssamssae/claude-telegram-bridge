@@ -1,8 +1,11 @@
 import dataclasses
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 class PublicExportTest(unittest.TestCase):
@@ -26,6 +29,27 @@ class PublicExportTest(unittest.TestCase):
         cfg = dataclasses.replace(mod.Config.from_env(), chat_id="")
         with self.assertRaises(ValueError):
             mod.validate_startup_config(cfg)
+
+    def test_flow_mirror_supports_bridge_env_and_flag_fallback(self):
+        path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
+        spec = importlib.util.spec_from_file_location("claude_flow_mirror_behavior", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+
+        with tempfile.TemporaryDirectory() as td:
+            flag = Path(td) / "flow-mirror.on"
+            flag.touch()
+            with mock.patch.object(mod, "FLOW_MIRROR_FLAG", str(flag)), \
+                 mock.patch.dict(os.environ, {"CLB_FLOW_MIRROR": "0"}, clear=False):
+                self.assertFalse(mod.flow_mirror_enabled())
+            with mock.patch.object(mod, "FLOW_MIRROR_FLAG", str(flag)), \
+                 mock.patch.dict(os.environ, {"CLB_FLOW_MIRROR": "1"}, clear=False):
+                self.assertTrue(mod.flow_mirror_enabled())
+            with mock.patch.object(mod, "FLOW_MIRROR_FLAG", str(flag)), \
+                 mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("CLB_FLOW_MIRROR", None)
+                self.assertTrue(mod.flow_mirror_enabled())
 
     def test_private_dm_removes_leading_decoration_and_group_keeps_context(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"

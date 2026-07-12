@@ -511,11 +511,13 @@ Send `/ping` to the bot, then send a normal prompt.
 
 ## Optional Settings
 
-- `CLB_FLOW_MIRROR_FLAG` - path to a flag file that enables the flow mirror.
-  When the file exists, the bridge mirrors each tool-use step of the current
-  turn to Telegram as one live-updating card. Off by default (no file). Enable
-  with `touch "$HOME/.config/claude-telegram-bridge/flow-mirror.on"` and disable
-  by removing the file.
+- `CLB_FLOW_MIRROR` - set `1` or `0` in `bridge.env` to enable or disable the
+  flow mirror explicitly. It mirrors each tool-use step of the current turn to
+  Telegram as one live-updating card and is off by default.
+- `CLB_FLOW_MIRROR_FLAG` - path to the optional live-toggle flag used only when
+  `CLB_FLOW_MIRROR` is unset. Enable with
+  `touch "$HOME/.config/claude-telegram-bridge/flow-mirror.on"` and disable by
+  removing the file.
 - `CLB_ACTIVE_TURN_STALE_SECONDS` - releases a previously observed Telegram turn
   when Claude is idle but no final reply was captured, so later queued messages
   can continue instead of being blocked behind a stale active turn. Defaults to
