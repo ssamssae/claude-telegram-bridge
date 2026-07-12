@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 
@@ -38,8 +39,12 @@ SESSION_START_HOOK_URL = (
 )
 SETUP_TOTAL_STEPS = 6
 NATIVE_WINDOWS_GUIDANCE = (
-    "Native Windows bridging is unsupported: Claude cannot run the .sh SessionStart hook "
-    "and the daemon requires tmux. Run setup and the bridge inside WSL."
+    "Native Windows tmux mode is unsupported: Claude cannot run the .sh SessionStart hook. "
+    "Run the default setup inside WSL, or explicitly choose --transport conpty."
+)
+NATIVE_WINDOWS_CONPTY_GUIDANCE = (
+    "Experimental native Windows ConPTY mode uses an owned foreground host. "
+    "The host launches Claude itself and cannot attach to an existing Claude window."
 )
 
 
@@ -70,6 +75,8 @@ class SetupOptions:
     send_test: bool
     non_interactive: bool
     yes: bool
+    transport: str = "tmux"
+    conpty_state_path: Path | None = None
 
 
 ApiCall = Callable[..., dict[str, Any] | None]
@@ -107,7 +114,9 @@ def expand_path(raw: str | Path) -> Path:
 
 
 def is_native_windows(os_name: str | None = None) -> bool:
-    return (os_name or platform.system()) == "Windows" or os.name == "nt" or sys.platform == "win32"
+    if os_name is not None:
+        return os_name == "Windows"
+    return platform.system() == "Windows" or os.name == "nt" or sys.platform == "win32"
 
 
 def show_native_windows_guidance() -> bool:
@@ -115,6 +124,20 @@ def show_native_windows_guidance() -> bool:
         return False
     warn(NATIVE_WINDOWS_GUIDANCE)
     return True
+
+
+def validate_setup_transport(mode: str, *, os_name: str | None = None) -> str:
+    normalized = (mode or "tmux").strip().lower()
+    native_windows = is_native_windows(os_name)
+    if normalized == "tmux":
+        if native_windows:
+            raise SetupError(NATIVE_WINDOWS_GUIDANCE)
+        return normalized
+    if normalized == "conpty":
+        if not native_windows:
+            raise SetupError("CLB_REPL_TRANSPORT=conpty requires native Windows")
+        return normalized
+    raise SetupError(f"unsupported CLB_REPL_TRANSPORT: {mode!r}")
 
 
 def show_cli_path_fallback(command: str) -> bool:
@@ -154,6 +177,13 @@ def default_runner_file() -> Path:
 
 def default_state_dir() -> Path:
     return Path.home() / ".local" / "state" / APP_NAME
+
+
+def default_conpty_state_path() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or default_state_dir())
+    if os.environ.get("LOCALAPPDATA"):
+        return root / APP_NAME / "native-repl-host.json"
+    return root / "native-repl-host.json"
 
 
 def default_systemd_unit_file() -> Path:
@@ -314,23 +344,37 @@ def write_private_config(
     state_dir: Path,
     token: str,
     chat_id: str,
+    transport: str = "tmux",
+    conpty_state_path: Path | None = None,
 ) -> None:
     write_text_atomic(token_file, json.dumps({"token": token}) + "\n", mode=0o600)
     write_text_atomic(registry_file, json.dumps(token_registry(token), indent=2) + "\n", mode=0o600)
-    content = "\n".join(
-        [
+    config_lines = [
             "# Claude Telegram Bridge private config",
             f"CLB_TOKEN_FILE={shell_quote(token_file)}",
             f"CLB_TOKEN_REGISTRY={shell_quote(registry_file)}",
             f"CLB_CHAT_ID={shell_quote(chat_id)}",
             f"CLB_STATE_DIR={shell_quote(state_dir)}",
+            f"CLB_REPL_TRANSPORT={transport}",
+    ]
+    if transport == "conpty":
+        state_path = conpty_state_path or default_conpty_state_path()
+        config_lines.append(f"CLB_CONPTY_STATE_PATH={shell_quote(state_path)}")
+    else:
+        config_lines.extend(
+            [
             "CLB_TMUX_BIN=tmux",
             "CLB_TMUX_SOCKET=default",
             "CLB_TMUX_SESSION=claude",
+            ]
+        )
+    config_lines.extend(
+        [
             "CLB_START_AT_END=1",
             "",
         ]
     )
+    content = "\n".join(config_lines)
     write_text_atomic(config_file, content, mode=0o600)
 
 
@@ -747,9 +791,16 @@ def setup_bridge(
     api_call: ApiCall = telegram_call,
     hook_loader: HookLoader = download_session_start_hook,
 ) -> int:
+    os_name = platform.system()
+    transport = validate_setup_transport(options.transport, os_name=os_name)
+    native_conpty = os_name == "Windows" and transport == "conpty"
     out("Claude Telegram Bridge setup")
-    setup_note("You need a BotFather token, Telegram /start, Claude Code, and tmux.")
-    show_native_windows_guidance()
+    setup_note(
+        "You need a BotFather token, Telegram /start, and Claude Code."
+        + ("" if native_conpty else " tmux is also required.")
+    )
+    if native_conpty:
+        warn(NATIVE_WINDOWS_CONPTY_GUIDANCE)
 
     setup_step(1, "Paste and validate the BotFather token")
     token = (options.token or "").strip()
@@ -789,29 +840,37 @@ def setup_bridge(
         state_dir=options.state_dir,
         token=token,
         chat_id=chat_id,
+        transport=transport,
+        conpty_state_path=options.conpty_state_path,
     )
     ok(f"wrote private config: {options.config_file}")
     ok(f"wrote token files: {options.token_file}, {options.registry_file}")
 
     setup_step(4, "Install and register the Claude SessionStart hook")
-    install_session_start_hook(options.hook_file, loader=hook_loader)
-    change = merge_session_start_hook(options.settings_file, options.hook_file)
-    ok(f"installed SessionStart hook: {options.hook_file}")
-    if change.backup:
-        ok(f"backed up Claude settings: {change.backup}")
-    ok("Claude settings SessionStart hook registered")
+    if native_conpty:
+        setup_note("SessionStart hook skipped: the owned host binds Claude JSONL directly.")
+    else:
+        install_session_start_hook(options.hook_file, loader=hook_loader)
+        change = merge_session_start_hook(options.settings_file, options.hook_file)
+        ok(f"installed SessionStart hook: {options.hook_file}")
+        if change.backup:
+            ok(f"backed up Claude settings: {change.backup}")
+        ok("Claude settings SessionStart hook registered")
 
     setup_step(5, "Install the bridge service and watchdog")
-    install_runner(options.runner_file, options.config_file)
-    ok(f"installed runner: {options.runner_file}")
-    if options.install_service:
+    if native_conpty:
+        setup_note("Native host and bridge are not auto-started or installed as services.")
+    else:
+        install_runner(options.runner_file, options.config_file)
+        ok(f"installed runner: {options.runner_file}")
+    if options.install_service and not native_conpty:
         installed = install_service(options.runner_file, start=options.start_service)
         watchdog = install_watchdog(start=options.start_service)
         if installed:
             ok(f"installed service: {installed}")
         if watchdog:
             ok(f"installed watchdog: {watchdog}")
-    else:
+    elif not native_conpty:
         warn("service/watchdog install skipped")
 
     setup_step(6, "Send a setup-complete test message")
@@ -824,8 +883,15 @@ def setup_bridge(
         setup_note("Test message skipped by option.")
 
     out("")
-    out("Setup complete. Start Claude in: tmux -L default new -s claude")
-    out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
+    if native_conpty:
+        out("Setup complete. Open two PowerShell windows and run these commands in order:")
+        state_path = options.conpty_state_path or default_conpty_state_path()
+        out(f"claude-telegram-bridge host --workdir <your-project-directory> --state-path {state_path}")
+        out(f"claude-telegram-bridge run --config {options.config_file}")
+        out("The host must stay visible; closing it ends the owned Claude session.")
+    else:
+        out("Setup complete. Start Claude in: tmux -L default new -s claude")
+        out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
     show_cli_path_fallback("setup")
     return 0
 
@@ -838,6 +904,44 @@ def read_token(path: Path) -> str:
     return str(payload.get("token") or "").strip() if isinstance(payload, dict) else ""
 
 
+def probe_native_host(state_path: Path) -> dict[str, Any]:
+    try:
+        from claude_telegram_bridge import ClaudeConPtyTransport, NativeSessionUnbound
+
+        repl = ClaudeConPtyTransport(
+            SimpleNamespace(
+                conpty_state_path=state_path,
+                state_dir=state_path.parent,
+                conpty_timeout_ms=3000,
+            )
+        )
+        repl.verify()
+        identity = repl.host_identity()
+        generation = hashlib.sha256(str(identity["generation"]).encode()).hexdigest()[:12]
+        try:
+            transcript = repl.session_file()
+        except NativeSessionUnbound:
+            transcript = None
+        return {
+            "status": "ok",
+            "host_up": True,
+            "session_bound": transcript is not None,
+            "generation": generation,
+            "transcript_exists": bool(transcript and transcript.exists()),
+        }
+    except Exception as exc:  # noqa: BLE001 - doctor converts native failures to redacted status
+        name = type(exc).__name__
+        if name == "NativeHostUnavailable":
+            error_code = "native_host_unavailable"
+        elif name == "NativeHostGenerationChanged":
+            error_code = "native_host_generation_changed"
+        elif "generation" in str(exc).lower():
+            error_code = "native_host_generation_invalid"
+        else:
+            error_code = "native_host_invalid"
+        return {"status": "error", "error_code": error_code}
+
+
 def doctor(
     *,
     config_file: Path,
@@ -848,11 +952,12 @@ def doctor(
     state_dir: Path,
     api_call: ApiCall = telegram_call,
     run: RunCommand = run_command,
+    os_name: str | None = None,
+    native_probe: Callable[[Path], dict[str, Any]] = probe_native_host,
 ) -> int:
     failures = 0
     warnings = 0
-    if show_native_windows_guidance():
-        warnings += 1
+    os_name = os_name or platform.system()
     config = load_env_file(config_file)
     if config_file.exists():
         ok(f"config exists: {config_file}")
@@ -898,42 +1003,74 @@ def doctor(
         fail(f"token registry missing or mismatched: {registry_file}")
         failures += 1
 
-    proc = run(["tmux", "-L", "default", "has-session", "-t", "=claude"])
-    if proc.returncode == 0:
-        ok("tmux session found: default/claude")
-    else:
-        warn("tmux session missing: default/claude")
-        warnings += 1
-
+    transport = (config.get("CLB_REPL_TRANSPORT") or "tmux").strip().lower()
     try:
-        settings, _mode = load_settings(settings_file)
+        validate_setup_transport(transport, os_name=os_name)
     except SetupError as exc:
         fail(str(exc))
-        settings = {}
         failures += 1
-    if hook_file.is_file() and os.access(hook_file, os.X_OK):
-        ok(f"SessionStart hook executable: {hook_file}")
-    else:
-        fail(f"SessionStart hook missing or not executable: {hook_file}")
-        failures += 1
-    if hook_registered(settings, hook_file):
-        ok(f"SessionStart hook registered: {settings_file}")
-    else:
-        fail(f"SessionStart hook not registered: {settings_file}")
-        failures += 1
+        if show_cli_path_fallback("doctor"):
+            warnings += 1
+        out(f"doctor complete: {failures} failure(s), {warnings} warning(s)")
+        return 2
 
-    sidecar = Path(config.get("CLB_SESSION_SIDECAR", "") or state_dir / "claude-telegram-bridge-sessions.json")
-    if sidecar.exists():
-        ok(f"transcript sidecar exists: {sidecar}")
+    if transport == "conpty":
+        state_path = Path(config.get("CLB_CONPTY_STATE_PATH", "") or state_dir / "native-repl-host.json")
+        probe = native_probe(state_path)
+        if probe.get("status") == "ok" and probe.get("host_up"):
+            ok(f"native host up; generation={probe.get('generation', 'unknown')}")
+            if probe.get("session_bound"):
+                ok("native host session bound")
+            else:
+                warn("native host session unbound until first bridge input")
+                warnings += 1
+        else:
+            error_code = str(probe.get("error_code") or "native_host_invalid")
+            if error_code == "native_host_unavailable":
+                fail("native host unavailable; start the foreground host first")
+            elif error_code in {"native_host_generation_changed", "native_host_generation_invalid"}:
+                fail("native host generation invalid; restart the foreground host")
+            else:
+                fail("native host descriptor or IPC is invalid")
+            failures += 1
+        setup_note("Native ConPTY health checks complete.")
     else:
-        warn(f"transcript sidecar missing until SessionStart fires: {sidecar}")
-        warnings += 1
+        proc = run(["tmux", "-L", "default", "has-session", "-t", "=claude"])
+        if proc.returncode == 0:
+            ok("tmux session found: default/claude")
+        else:
+            warn("tmux session missing: default/claude")
+            warnings += 1
 
-    status = service_status(run=run)
-    watchdog = watchdog_status(run=run)
-    (ok if status in {"active", "loaded"} else warn)(f"service status: {status}")
-    (ok if watchdog in {"active", "loaded"} else warn)(f"watchdog status: {watchdog}")
-    warnings += int(status not in {"active", "loaded"}) + int(watchdog not in {"active", "loaded"})
+        try:
+            settings, _mode = load_settings(settings_file)
+        except SetupError as exc:
+            fail(str(exc))
+            settings = {}
+            failures += 1
+        if hook_file.is_file() and os.access(hook_file, os.X_OK):
+            ok(f"SessionStart hook executable: {hook_file}")
+        else:
+            fail(f"SessionStart hook missing or not executable: {hook_file}")
+            failures += 1
+        if hook_registered(settings, hook_file):
+            ok(f"SessionStart hook registered: {settings_file}")
+        else:
+            fail(f"SessionStart hook not registered: {settings_file}")
+            failures += 1
+
+        sidecar = Path(config.get("CLB_SESSION_SIDECAR", "") or state_dir / "claude-telegram-bridge-sessions.json")
+        if sidecar.exists():
+            ok(f"transcript sidecar exists: {sidecar}")
+        else:
+            warn(f"transcript sidecar missing until SessionStart fires: {sidecar}")
+            warnings += 1
+
+        status = service_status(os_name=os_name, run=run)
+        watchdog = watchdog_status(os_name=os_name, run=run)
+        (ok if status in {"active", "loaded"} else warn)(f"service status: {status}")
+        (ok if watchdog in {"active", "loaded"} else warn)(f"watchdog status: {watchdog}")
+        warnings += int(status not in {"active", "loaded"}) + int(watchdog not in {"active", "loaded"})
     if show_cli_path_fallback("doctor"):
         warnings += 1
     out(f"doctor complete: {failures} failure(s), {warnings} warning(s)")
@@ -981,6 +1118,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subparsers.add_parser("setup", help="interactive six-step setup wizard")
     doctor_parser = subparsers.add_parser("doctor", help="check token, tmux, hook, sidecar, and service")
     uninstall_parser = subparsers.add_parser("uninstall", help="remove service, runner, and hook registration")
+    subparsers.add_parser("run", help="start the bridge daemon")
+    subparsers.add_parser("host", add_help=False, help="start the native Windows owned Claude host")
 
     for child in (setup_parser, doctor_parser, uninstall_parser):
         child.add_argument("--config", type=expand_path, default=default_config_file())
@@ -998,6 +1137,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--no-test-message", action="store_true")
     setup_parser.add_argument("--non-interactive", action="store_true")
     setup_parser.add_argument("-y", "--yes", action="store_true")
+    setup_parser.add_argument(
+        "--transport",
+        choices=("tmux", "conpty"),
+        default=os.environ.get("CLB_REPL_TRANSPORT", "tmux"),
+    )
+    setup_parser.add_argument("--conpty-state", type=expand_path, default=default_conpty_state_path())
     doctor_parser.add_argument("--state-dir", type=expand_path, default=default_state_dir())
     uninstall_parser.add_argument("--runner", type=expand_path, default=default_runner_file())
     uninstall_parser.add_argument("--purge", action="store_true")
@@ -1006,11 +1151,40 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_bridge_daemon() -> int:
+    load_private_config_environment(default_config_file())
     try:
         from claude_telegram_bridge import main as bridge_main
     except ImportError as exc:
         raise SetupError(f"bridge module is unavailable: {exc}") from exc
     return int(bridge_main())
+
+
+def load_private_config_environment(config_file: Path) -> None:
+    for key, value in load_env_file(config_file).items():
+        os.environ.setdefault(key, value)
+
+
+def run_bridge_with_config(config_file: Path, daemon_args: list[str]) -> int:
+    load_private_config_environment(config_file)
+    original = sys.argv
+    try:
+        sys.argv = [original[0], *daemon_args]
+        return run_bridge_daemon()
+    finally:
+        sys.argv = original
+
+
+def run_native_host(argv: list[str]) -> int:
+    try:
+        import claude_repl_host_windows
+    except ImportError as exc:
+        raise SetupError(f"native host module is unavailable: {exc}") from exc
+    original = sys.argv
+    try:
+        sys.argv = ["claude-telegram-bridge host", *argv]
+        return int(claude_repl_host_windows.main())
+    finally:
+        sys.argv = original
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1021,6 +1195,17 @@ def main(argv: list[str] | None = None) -> int:
         except SetupError as exc:
             fail(str(exc))
             return 2
+    if values[0] == "host":
+        try:
+            return run_native_host(values[1:])
+        except SetupError as exc:
+            fail(str(exc))
+            return 2
+    if values[0] == "run":
+        run_parser = argparse.ArgumentParser(prog="claude-telegram-bridge run")
+        run_parser.add_argument("--config", type=expand_path, default=default_config_file())
+        run_args, daemon_args = run_parser.parse_known_args(values[1:])
+        return run_bridge_with_config(run_args.config, daemon_args)
     if values[0] not in {"setup", "doctor", "uninstall", "-h", "--help"}:
         return run_bridge_daemon()
     args = build_parser().parse_args(values)
@@ -1043,6 +1228,8 @@ def main(argv: list[str] | None = None) -> int:
                     send_test=not args.no_test_message,
                     non_interactive=args.non_interactive,
                     yes=args.yes,
+                    transport=args.transport,
+                    conpty_state_path=args.conpty_state,
                 )
             )
         if args.command == "doctor":

@@ -40,16 +40,22 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol, runtime_checkable
 
 
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
 NATIVE_WINDOWS_DAEMON_ERROR = (
-    "Native Windows daemon is unsupported — the bridge requires tmux and POSIX file locking. "
-    "Run it inside WSL."
+    "Native Windows tmux mode is unsupported — run the default transport inside WSL, "
+    "or explicitly configure CLB_REPL_TRANSPORT=conpty for the experimental owned host."
 )
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+
+
+def current_hostname() -> str:
+    if hasattr(os, "uname"):
+        return os.uname().nodename
+    return os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "windows"
 
 
 def is_private_chat_id(chat_id: object) -> bool:
@@ -106,6 +112,10 @@ SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
 MODEL_BUSY_DEFER_TEXT = (
     "⏳ 지금 진행 중인 턴이 있어 모델 전환을 미뤘어요 (진행 중 턴을 끊지 않아요).\n"
     "턴이 끝난 뒤 다시 선택해 주세요."
+)
+NATIVE_PANE_DEFER_TEXT = (
+    "Native ConPTY P0에서는 화면 캡처·선택형 명령을 아직 지원하지 않아요. "
+    "일반 텍스트 턴은 계속 사용할 수 있습니다."
 )
 MCP_TELEGRAM_REPLY_TOOL = "mcp__plugin_telegram_telegram__reply"
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -244,8 +254,6 @@ def bool_env(name: str, default: bool = False) -> bool:
 
 def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
     original = text or ""
-    if not enabled:
-        return [original]
     trimmed = original.rstrip("\r\n")
     lines = trimmed.splitlines()
     if not lines:
@@ -255,10 +263,88 @@ def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str
         return [original]
     body = "\n".join(lines[:-1]).rstrip()
     if not body:
-        return [original]
-    if surface == "aniki_dm":
+        return [match.group(1)]
+    if enabled and surface == "aniki_dm":
         return [body, match.group(1)]
     return [body]
+
+
+COPY_COMMAND_RE = re.compile(
+    r"^(?:"
+    r"(?:py(?:\.exe)?|python(?:3(?:\.\d+)?)?|pip3?|uv|uvx)\s+(?:-m\s+)?\S+.*"
+    r"|(?:git|gh)\s+(?:clone|pull|push|fetch|checkout|switch|restore|status|add|commit|rebase|merge|diff|log|pr|release|repo|workflow|run)\b.*"
+    r"|(?:npm|npx|pnpm|yarn|bun|flutter|dart|docker(?:-compose)?|kubectl|helm|cargo|go|java|gradle|mvn)\s+\S+.*"
+    r"|(?:bash|sh|zsh|pwsh|powershell|curl|wget|ssh|scp|rsync|winget|choco|scoop)\s+\S+.*"
+    r"|(?:cd|mkdir|touch|cp|mv|rm|chmod|chown|export|set)\s+\S+.*"
+    r"|(?:Get|Set|New|Remove|Copy|Move|Start|Stop|Test|Write|Invoke)-[A-Za-z][A-Za-z0-9-]*(?:\s+.*)?"
+    r"|(?:sudo\s+)?(?:\./|\.\\|~/|/)[^\s].*"
+    r"|[A-Za-z_][A-Za-z0-9_]*=.*\s+\S+.*"
+    r")$",
+    re.IGNORECASE,
+)
+COPY_LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+COPY_PROMPT_PREFIX_RE = re.compile(r"^(?:\$|PS(?:\s+[^>]*)?>)\s+", re.IGNORECASE)
+
+
+def copy_command_line(text: str) -> str | None:
+    candidate = text.strip()
+    decorated = False
+    list_match = COPY_LIST_PREFIX_RE.match(candidate)
+    if list_match:
+        candidate = candidate[list_match.end() :].strip()
+        decorated = True
+    prompt_match = COPY_PROMPT_PREFIX_RE.match(candidate)
+    if prompt_match:
+        candidate = candidate[prompt_match.end() :].strip()
+        decorated = True
+    if not COPY_COMMAND_RE.fullmatch(candidate):
+        return None
+    # Bare Korean prose that happens to begin with a command (for example
+    # "git pull 명령은 ...") stays prose. Lists/prompts are explicit copy intent.
+    if not decorated and re.search(r"[가-힣]", candidate):
+        return None
+    return candidate
+
+
+def copy_content_bubble_messages(text: str, surface: str) -> list[str]:
+    original = text or ""
+    if surface != "aniki_dm":
+        return [original]
+    lines = original.splitlines()
+    body_lines: list[str] = []
+    bubbles: list[str] = []
+    index = 0
+    while index < len(lines):
+        if re.match(r"^\s*```[^`]*$", lines[index]):
+            end = index + 1
+            while end < len(lines) and not re.match(r"^\s*```\s*$", lines[end]):
+                end += 1
+            if end < len(lines):
+                code = "\n".join(lines[index + 1 : end]).strip("\n")
+                if code:
+                    bubbles.append(code)
+                    body_lines.append("")
+                    index = end + 1
+                    continue
+        command = copy_command_line(lines[index])
+        if command is not None:
+            commands = [command]
+            index += 1
+            while index < len(lines):
+                command = copy_command_line(lines[index])
+                if command is None:
+                    break
+                commands.append(command)
+                index += 1
+            bubbles.append("\n".join(commands))
+            body_lines.append("")
+            continue
+        body_lines.append(lines[index])
+        index += 1
+    if not bubbles:
+        return [original]
+    body = re.sub(r"\n{3,}", "\n\n", "\n".join(body_lines)).strip()
+    return [body, *bubbles]
 
 
 def busy_inject_enabled() -> bool:
@@ -309,15 +395,15 @@ def composer_residual_text(screen: str) -> str:
     """
     if not screen:
         return ""
-    for line in reversed(screen.splitlines()):
+    # status bar가 composer 아래에 놓이는 Claude Code 레이아웃도 있으므로 마지막
+    # 비공백 줄 하나만 보지 않고 하단 영역의 가장 가까운 prompt marker를 찾는다.
+    for line in reversed(screen.splitlines()[-20:]):
         stripped = line.strip()
         if not stripped:
             continue
         core = stripped.strip("│").strip()  # box-drawing 테두리 제거
-        if core.startswith(">"):
+        if core.startswith((">", "❯")):
             return core[1:].strip()
-        # 프롬프트가 아닌 콘텐츠가 최하단이면 composer 는 비어있다고 본다
-        return ""
     return ""
 
 
@@ -1206,22 +1292,59 @@ def render_ansi_png(text: str, output_path: Path) -> Path:
     return output_path
 
 
-def claude_settings_model() -> str:
-    # 현재 모델은 settings SoT(~/.claude/settings.json "model")에서 동적으로 읽는다 —
-    # 모델명 하드코딩 금지 (T-260702-14). 테스트/특수 배치는 CLB_CLAUDE_SETTINGS 로 경로 오버라이드.
-    path = Path(os.environ.get("CLB_CLAUDE_SETTINGS") or (Path.home() / ".claude" / "settings.json"))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        model = str(data.get("model") or "").strip()
-        return model or "(설정에 model 없음 — 세션 디폴트)"
-    except Exception:  # noqa: BLE001
-        return "(settings 확인 불가)"
-
-
 def model_menu_aliases() -> list[str]:
     raw = os.environ.get("CLB_MODEL_CHOICES", "")
     aliases = [alias.strip() for alias in raw.split(",") if alias.strip()]
     return aliases or list(DEFAULT_MODEL_MENU_ALIASES)
+
+
+MODEL_STATUS_UNAVAILABLE = "(세션 상태줄에서 모델 확인 불가)"
+MODEL_STATUS_IGNORED_TERMS = {"claude", "default", "latest", "model"}
+MODEL_EFFORT_SUFFIX_RE = re.compile(r"\s+\((?:xhigh|high|medium|low)\)\s*$", re.IGNORECASE)
+
+
+def model_alias_terms(alias: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z]+", (alias or "").lower())
+        if len(token) >= 3 and token not in MODEL_STATUS_IGNORED_TERMS
+    ]
+
+
+def session_model_from_screen(screen: str) -> str:
+    terms = {
+        token
+        for alias in model_menu_aliases()
+        for token in model_alias_terms(alias)
+    }
+    if not terms:
+        return ""
+    for raw_line in reversed((screen or "").splitlines()):
+        line = strip_ansi_control(raw_line).strip()
+        lowered = line.lower()
+        if not line or not any(re.search(rf"\b{re.escape(term)}\b", lowered) for term in terms):
+            continue
+        if "·" not in line and "|" not in line and not line.startswith("🤖"):
+            continue
+        model = re.split(r"\s+(?:·|\|)\s*", line, maxsplit=1)[0].strip()
+        model = re.sub(r"^🤖\s*", "", model)
+        model = MODEL_EFFORT_SUFFIX_RE.sub("", model).strip()
+        model_lower = model.lower()
+        if any(re.search(rf"\b{re.escape(term)}\b", model_lower) for term in terms):
+            return model
+    return ""
+
+
+def model_alias_matches_session(alias: str, session_model: str) -> bool:
+    if not session_model:
+        return False
+    if alias == "default":
+        return False
+    lowered = session_model.lower()
+    return any(
+        re.search(rf"\b{re.escape(term)}\b", lowered)
+        for term in model_alias_terms(alias)
+    )
 
 
 def model_alias_allowed(alias: str) -> bool:
@@ -1239,6 +1362,16 @@ def model_alias_rejection_text(alias: str) -> str:
         f"전체 모델 ID 를 그대로 적용하려면 앞에 {SLASH_ESCAPE_PREFIX} 를 붙여 원문 주입하세요 "
         f"(예: {SLASH_ESCAPE_PREFIX}/model <id>)."
     )
+
+
+def model_interstitial(screen: str) -> str:
+    """Return the blocking model-menu TUI surface visible in a pane capture."""
+    normalized = strip_ansi_control(screen or "").lower()
+    if "switch model?" in normalized and "yes" in normalized and "no" in normalized:
+        return "switch_model"
+    if "rewind" in normalized and "restore the code" in normalized:
+        return "rewind"
+    return ""
 
 
 def escape_unsafe_slash(text: str) -> str:
@@ -1361,10 +1494,43 @@ def format_ambient_flow(text: str) -> str:
     return f"{FLOW_MIRROR_HEADER} (노드 자율)\n{body}" if body else ""
 
 
+_AMBIENT_TREE_PREFIX_RE = re.compile(
+    r"^[ \t]*(?:(?:[│┃┆┊├└┌┐┬┴┼╰╭╮╯─━┄┈╴╵]+)[ \t]*)+"
+)
+_AMBIENT_TRANSCRIPT_HINT_RE = re.compile(
+    r"\bctrl\s*\+\s*t\b.{0,80}\b(?:view|open)\s+(?:the\s+)?transcript\b",
+    re.IGNORECASE,
+)
+_AMBIENT_SEPARATOR_RE = re.compile(r"[=＿_─━┄┈·•]{3,}")
+_AMBIENT_UNDERLINE_RESIDUE_RE = re.compile(r"[\u0331-\u0333\ufe4d-\ufe4f]")
+
+
+def clean_ambient_final_text(text: str) -> str:
+    """Remove terminal chrome from ambient results without summarizing content."""
+    cleaned: list[str] = []
+    for raw in normalize_text(strip_ansi_control(text or "")).splitlines():
+        line = _AMBIENT_UNDERLINE_RESIDUE_RE.sub("", raw)
+        had_content = bool(line.strip())
+        line = _AMBIENT_TREE_PREFIX_RE.sub("", line).rstrip()
+        stripped = line.strip()
+        if _AMBIENT_TRANSCRIPT_HINT_RE.search(stripped):
+            continue
+        if stripped and _AMBIENT_SEPARATOR_RE.fullmatch(stripped):
+            continue
+        if not stripped:
+            if not had_content and cleaned and cleaned[-1]:
+                cleaned.append("")
+            continue
+        cleaned.append(line)
+    while cleaned and not cleaned[-1]:
+        cleaned.pop()
+    return "\n".join(cleaned).strip()
+
+
 def format_ambient_final(text: str) -> str:
     # ⚙️ ambient flow mirror — node-originated work 의 최종 답변(결론) 카드. flow 카드
     # (도구 단계, "작업 흐름")와 구분되는 "✅ 노드 결과" 헤더로 결론임을 표시한다.
-    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
+    body = clean_ambient_final_text(text)[:FLOW_MIRROR_LIMIT].strip()
     return f"{AMBIENT_FINAL_HEADER}\n{body}" if body else ""
 
 
@@ -2011,7 +2177,7 @@ class TelegramClient:
             rest = rest[self.chunk_size :]
         return chunks
 
-    def send_copy_content(self, text: str) -> list[int] | None:
+    def send_copy_content(self, text: str, code: bool = False) -> list[int] | None:
         message_ids: list[int] = []
         chunks = [text[: self.chunk_size]]
         rest = text[self.chunk_size :]
@@ -2019,7 +2185,11 @@ class TelegramClient:
             chunks.append(rest[: self.chunk_size])
             rest = rest[self.chunk_size :]
         for chunk in chunks:
-            payload = self.call("sendMessage", chat_id=self.chat_id, text=chunk)
+            params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+            if code:
+                utf16_len = len(chunk.encode("utf-16-le")) // 2
+                params["entities"] = json.dumps([{"type": "pre", "offset": 0, "length": utf16_len}])
+            payload = self.call("sendMessage", **params)
             if not payload or not payload.get("ok"):
                 return None
             result = payload.get("result")
@@ -2159,6 +2329,10 @@ class Config:
     envelope_sidecar_path: Path = ENVELOPE_SIDECAR_PATH
     envelope_sidecar_ttl_seconds: float = DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS
     suggested_reply_bubble: bool = False
+    transport_mode: str = "tmux"
+    conpty_state_path: Path | None = None
+    conpty_timeout_ms: int = 3000
+    native_turn_stale_seconds: float = 120.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -2201,7 +2375,7 @@ class Config:
             claude_projects_dir=Path(env("CLB_CLAUDE_PROJECTS_DIR", "~/.claude/projects") or "").expanduser(),
             token_owner=env("CLB_TOKEN_OWNER", BRIDGE_OWNER) or BRIDGE_OWNER,
             expected_consumer=env("CLB_EXPECTED_CONSUMER", node) or node,
-            expected_host=env("CLB_EXPECTED_HOST", os.uname().nodename) or os.uname().nodename,
+            expected_host=env("CLB_EXPECTED_HOST", current_hostname()) or current_hostname(),
             session_ttl_seconds=int_env("CLB_SESSION_TTL_SECONDS", 86400, minimum=60),
             egress_ttl_seconds=int_env("CLB_EGRESS_TTL_SECONDS", 900, minimum=60),
             pending_transcript_seconds=int_env("CLB_PENDING_TRANSCRIPT_SECONDS", 300, minimum=10),
@@ -2230,6 +2404,16 @@ class Config:
                 minimum=1.0,
             ),
             suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
+            transport_mode=(env("CLB_REPL_TRANSPORT", "tmux") or "tmux").strip().lower(),
+            conpty_state_path=Path(
+                env("CLB_CONPTY_STATE_PATH", str(state_dir / "native-repl-host.json")) or ""
+            ).expanduser(),
+            conpty_timeout_ms=int_env("CLB_CONPTY_TIMEOUT_MS", 3000, minimum=100),
+            native_turn_stale_seconds=float_env(
+                "CLB_NATIVE_TURN_STALE_SECONDS",
+                120.0,
+                minimum=1.0,
+            ),
         )
 
     @property
@@ -2245,6 +2429,21 @@ class Config:
         if target.startswith("%") or ":" in target or "." in target:
             return target
         return f"={target}:"
+
+
+def validate_transport_mode(mode: str, platform_name: str | None = None) -> str:
+    normalized = (mode or "tmux").strip().lower()
+    platform_name = sys.platform if platform_name is None else platform_name
+    native_windows = platform_name in {"nt", "win32", "windows"}
+    if normalized == "tmux":
+        if native_windows:
+            raise RuntimeError(NATIVE_WINDOWS_DAEMON_ERROR)
+        return normalized
+    if normalized == "conpty":
+        if not native_windows:
+            raise RuntimeError("CLB_REPL_TRANSPORT=conpty requires native Windows")
+        return normalized
+    raise RuntimeError(f"unsupported CLB_REPL_TRANSPORT: {mode!r}")
 
 
 @dataclass
@@ -2423,9 +2622,36 @@ class ClaudeSessionBinding:
     transcript_path: Path
     session_id: str
     pane_pid: int
+    transport: str = "tmux"
+    generation: str = ""
 
 
-class ClaudeRepl:
+def binding_public_payload(binding: ClaudeSessionBinding) -> dict[str, Any]:
+    return {
+        "transcript_path": str(binding.transcript_path),
+        "sessionId": binding.session_id,
+        "owner_pid": binding.pane_pid,
+        "transport": binding.transport,
+        "generation": binding.generation[:12],
+    }
+
+
+@runtime_checkable
+class ClaudeReplTransport(Protocol):
+    supports_pane_features: bool
+
+    def verify(self) -> None: ...
+
+    def replace_prompt(self, prompt: str, submit_key: str = "Enter") -> None: ...
+
+    def clear_composer(self, interrupt: bool = True) -> None: ...
+
+    def paste_prompt(self, prompt: str, submit_key: str = "Enter") -> None: ...
+
+
+class TmuxClaudeTransport:
+    supports_pane_features = True
+
     def __init__(self, config: Config) -> None:
         self.config = config
         self._session_target: str | None = None
@@ -2602,9 +2828,9 @@ class ClaudeRepl:
         with self.composer_lock():
             self._clear_composer_unlocked(interrupt)
 
-    def _paste_prompt_unlocked(self, prompt: str, submit_key: str = "Enter") -> None:
+    def _stage_prompt_unlocked(self, prompt: str) -> bool:
         if not prompt.strip():
-            return
+            return False
         if BRACKETED_PASTE_RE.search(prompt):
             raise RuntimeError("prompt contains bracketed paste control sequences")
         self.verify()
@@ -2620,6 +2846,11 @@ class ClaudeRepl:
         self.tmux("load-buffer", "-", input_text=buffer)
         self.tmux("paste-buffer", "-p", "-t", self.resolve_pane_target())
         time.sleep(0.1)
+        return True
+
+    def _paste_prompt_unlocked(self, prompt: str, submit_key: str = "Enter") -> None:
+        if not self._stage_prompt_unlocked(prompt):
+            return
         # submit_key 기본 Enter. codex TUI 는 진행 중 큐잉 제출키가 Tab 이라 별도 submit_key 를
         # 쓴다("Repeated Enter can leave text sitting in the composer"). Claude Code TUI 의
         # generating 중 큐잉 제출키가 Enter 가 맞는지는 미검증 — 아니면 CLB_BUSY_SUBMIT_KEY 로 교체.
@@ -2636,6 +2867,228 @@ class ClaudeRepl:
     def paste_prompt(self, prompt: str, submit_key: str = "Enter") -> None:
         with self.composer_lock():
             self._paste_prompt_unlocked(prompt, submit_key)
+
+    def stage_prompt(self, prompt: str) -> None:
+        with self.composer_lock():
+            self._stage_prompt_unlocked(prompt)
+
+    def replace_prompt(self, prompt: str, submit_key: str = "Enter") -> None:
+        with self.composer_lock():
+            self._clear_composer_unlocked()
+            self._paste_prompt_unlocked(prompt, submit_key)
+
+
+# Private callers and the existing test surface still import ClaudeRepl.
+ClaudeRepl = TmuxClaudeTransport
+
+
+CONPTY_DESCRIPTOR_SCHEMA = 1
+CONPTY_MAX_FRAME_BYTES = 256 * 1024
+
+
+class NativeHostUnavailable(RuntimeError):
+    pass
+
+
+class NativeHostGenerationChanged(RuntimeError):
+    pass
+
+
+class NativeSessionUnbound(RuntimeError):
+    pass
+
+
+class ClaudeConPtyTransport:
+    """Authenticated client for a foreground bridge-owned Claude ConPTY host."""
+
+    supports_pane_features = False
+
+    def __init__(
+        self,
+        config: Config,
+        requester: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.config = config
+        self.state_path = config.conpty_state_path or (config.state_dir / "native-repl-host.json")
+        descriptor = self._load_descriptor()
+        self.generation = self._descriptor_text(descriptor, "generation", 16)
+        self.capability = self._descriptor_text(descriptor, "capability", 32)
+        self.pipe_name = self._descriptor_text(descriptor, "pipe_name", 12)
+        self.host_pid = self._descriptor_pid(descriptor, "host_pid")
+        self.child_pid = self._descriptor_pid(descriptor, "child_pid")
+        self._requester = requester
+
+    @staticmethod
+    def _descriptor_text(descriptor: dict[str, Any], key: str, minimum: int) -> str:
+        value = descriptor.get(key)
+        if not isinstance(value, str) or len(value) < minimum:
+            raise RuntimeError(f"native host descriptor {key} is invalid")
+        return value
+
+    @staticmethod
+    def _descriptor_pid(descriptor: dict[str, Any], key: str) -> int:
+        try:
+            value = int(descriptor.get(key) or 0)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"native host descriptor {key} is invalid") from exc
+        if value <= 0:
+            raise RuntimeError(f"native host descriptor {key} is invalid")
+        return value
+
+    def _load_descriptor(self) -> dict[str, Any]:
+        try:
+            descriptor = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise NativeHostUnavailable("native host descriptor is unavailable") from exc
+        if not isinstance(descriptor, dict):
+            raise RuntimeError("native host descriptor is invalid")
+        if descriptor.get("schema") != CONPTY_DESCRIPTOR_SCHEMA:
+            raise RuntimeError("native host descriptor schema mismatch")
+        if descriptor.get("runtime") != "claude":
+            raise RuntimeError("native host descriptor runtime mismatch")
+        if descriptor.get("transport") != "conpty-owned":
+            raise RuntimeError("native host descriptor transport mismatch")
+        pipe_name = self._descriptor_text(descriptor, "pipe_name", 12)
+        if not pipe_name.startswith(r"\\.\pipe\claude-repl-host-"):
+            raise RuntimeError("native host descriptor pipe is invalid")
+        return descriptor
+
+    def _verify_pinned_generation(self) -> None:
+        descriptor = self._load_descriptor()
+        current = self._descriptor_text(descriptor, "generation", 16)
+        if not secrets.compare_digest(current, self.generation):
+            raise NativeHostGenerationChanged("native host generation changed")
+
+    def _pipe_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        if os.name != "nt":
+            raise NativeHostUnavailable("native ConPTY IPC requires Windows")
+        import ctypes
+
+        wait_named_pipe = ctypes.windll.kernel32.WaitNamedPipeW
+        wait_named_pipe.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        wait_named_pipe.restype = ctypes.c_int
+        if not wait_named_pipe(self.pipe_name, max(100, int(self.config.conpty_timeout_ms))):
+            raise NativeHostUnavailable("native host IPC is unavailable")
+        encoded = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(encoded) > CONPTY_MAX_FRAME_BYTES:
+            raise RuntimeError("native host request is too large")
+        try:
+            with open(self.pipe_name, "r+b", buffering=0) as pipe:
+                pipe.write(encoded)
+                raw = pipe.readline(CONPTY_MAX_FRAME_BYTES + 1)
+        except OSError as exc:
+            raise NativeHostUnavailable("native host IPC is unavailable") from exc
+        if not raw or len(raw) > CONPTY_MAX_FRAME_BYTES:
+            raise RuntimeError("native host response is invalid")
+        try:
+            response = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("native host response is invalid") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("native host response is invalid")
+        return response
+
+    def _request(self, op: str, **params: Any) -> dict[str, Any]:
+        self._verify_pinned_generation()
+        request_id = secrets.token_hex(12)
+        request = {
+            "schema": CONPTY_DESCRIPTOR_SCHEMA,
+            "request_id": request_id,
+            "generation": self.generation,
+            "capability": self.capability,
+            "op": op,
+            **params,
+        }
+        try:
+            response = self._requester(request) if self._requester else self._pipe_request(request)
+        except NativeHostGenerationChanged:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise NativeHostUnavailable("native host IPC is unavailable") from exc
+        if not isinstance(response, dict):
+            raise RuntimeError("native host response is invalid")
+        if response.get("request_id") != request_id:
+            raise RuntimeError("native host response request mismatch")
+        response_generation = str(response.get("generation") or "")
+        if not secrets.compare_digest(response_generation, self.generation):
+            raise NativeHostGenerationChanged("native host generation changed")
+        if response.get("ok") is not True:
+            error = str(response.get("error") or "request_failed")
+            if error == "session_unbound":
+                raise NativeSessionUnbound("native host session is unbound")
+            raise RuntimeError(f"native host rejected request: {error}")
+        return response
+
+    def verify(self) -> None:
+        self._request("verify")
+
+    def paste_prompt(self, prompt: str, submit_key: str = "Enter") -> None:
+        payload = prompt.rstrip("\n")
+        if payload:
+            self._request(
+                "paste",
+                text=payload,
+                clear_before=False,
+                submit_key=submit_key,
+                enter_count=1,
+            )
+
+    def replace_prompt(self, prompt: str, submit_key: str = "Enter") -> None:
+        payload = prompt.rstrip("\n")
+        if payload:
+            self._request(
+                "paste",
+                text=payload,
+                clear_before=True,
+                submit_key=submit_key,
+                enter_count=1,
+            )
+
+    def clear_composer(self, interrupt: bool = True) -> None:
+        self._request("clear", interrupt=bool(interrupt))
+
+    def capture_pane(self, lines: int = 80, ansi: bool = False) -> str:
+        del ansi
+        response = self._request("capture", lines=max(1, min(int(lines), 500)))
+        screen = response.get("screen")
+        return screen if isinstance(screen, str) else ""
+
+    @contextmanager
+    def temporary_window_width(self, columns: int = STATUS_WIDE_CAPTURE_COLUMNS):
+        del columns
+        yield
+
+    def send_key(self, key: str) -> None:
+        if not key.strip():
+            raise RuntimeError("native host key is empty")
+        self._request("key", key=key.strip())
+
+    def session_file(self) -> Path:
+        response = self._request("session")
+        raw = response.get("session_file")
+        if not isinstance(raw, str) or not raw:
+            raise NativeSessionUnbound("native host session is unbound")
+        return Path(raw).expanduser()
+
+    def host_identity(self) -> dict[str, Any]:
+        self._verify_pinned_generation()
+        return {
+            "generation": self.generation,
+            "host_pid": self.host_pid,
+            "child_pid": self.child_pid,
+        }
+
+
+def build_repl_transport(
+    config: Config,
+    *,
+    platform_name: str | None = None,
+    requester: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+) -> ClaudeReplTransport:
+    mode = validate_transport_mode(config.transport_mode, platform_name)
+    if mode == "tmux":
+        return TmuxClaudeTransport(config)
+    return ClaudeConPtyTransport(config, requester=requester)
 
 
 def proc_ppid(pid: int) -> int | None:
@@ -2933,7 +3386,7 @@ class SessionBinder:
         key = f"{binding.transcript_path}|{binding.session_id}"
         sessions[key] = {
             "bridge": BRIDGE_OWNER,
-            "host": os.uname().nodename,
+            "host": current_hostname(),
             "updated_at": time.time(),
             "transcript_path": str(binding.transcript_path),
             "sessionId": binding.session_id,
@@ -2945,6 +3398,26 @@ class SessionBinder:
         write_json_atomic(
             self.config.session_sidecar_path,
             {"updated_at": time.time(), "sessions": sessions},
+        )
+
+
+class OwnedHostSessionLocator:
+    """Resolve the Claude transcript from the authenticated owned-host descriptor."""
+
+    def __init__(self, config: Config, repl: ClaudeConPtyTransport) -> None:
+        self.config = config
+        self.repl = repl
+
+    def resolve(self) -> ClaudeSessionBinding:
+        transcript = self.repl.session_file().resolve()
+        identity = self.repl.host_identity()
+        session_id = session_id_from_transcript(transcript) if transcript.exists() else transcript.stem
+        return ClaudeSessionBinding(
+            transcript,
+            session_id,
+            int(identity["child_pid"]),
+            transport="conpty",
+            generation=str(identity["generation"]),
         )
 
 
@@ -2977,7 +3450,7 @@ class TokenOwnership:
                 "token expected_consumer mismatch: "
                 f"registry={expected_consumer!r} node={self.config.node!r}"
             )
-        if owner_host and owner_host not in {self.config.expected_host, os.uname().nodename}:
+        if owner_host and owner_host not in {self.config.expected_host, current_hostname()}:
             raise RuntimeError(
                 "token owner_host mismatch: "
                 f"registry={owner_host!r} expected_host={self.config.expected_host!r}"
@@ -3278,12 +3751,65 @@ class Outbox:
             write_json_atomic(self.path, {"sent": self.sent})
 
 
+def acquire_process_file_lock(
+    handle,
+    *,
+    platform_name: str | None = None,
+    msvcrt_module=None,
+) -> None:
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":
+        if msvcrt_module is None:
+            import msvcrt as msvcrt_module
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write("\0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RuntimeError("bridge already running") from exc
+        return
+    if fcntl is None:
+        raise RuntimeError("POSIX file locking is unavailable")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError("bridge already running") from exc
+
+
+def release_process_file_lock(
+    handle,
+    *,
+    platform_name: str | None = None,
+    msvcrt_module=None,
+) -> None:
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name == "nt":
+        if msvcrt_module is None:
+            import msvcrt as msvcrt_module
+        handle.seek(0)
+        msvcrt_module.locking(handle.fileno(), msvcrt_module.LK_UNLCK, 1)
+        return
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def repl_supports_pane_features(repl: Any) -> bool:
+    return bool(getattr(repl, "supports_pane_features", True))
+
+
 class Bridge:
-    def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeRepl, token: str) -> None:
+    def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeReplTransport, token: str) -> None:
         self.config = config
         self.telegram = telegram
         self.repl = repl
-        self.binder = SessionBinder(config, repl)
+        self.binder = (
+            SessionBinder(config, repl)
+            if repl_supports_pane_features(repl)
+            else OwnedHostSessionLocator(config, repl)
+        )
         self.token = token
         self.token_hash = token_fingerprint(token)
         self.queue = DurableQueue(config.queue_path, config.queue_compact_max_events)
@@ -3331,8 +3857,8 @@ class Bridge:
         self.config.pid_file.parent.mkdir(parents=True, exist_ok=True)
         self.pid_handle = self.config.pid_file.open("a+")
         try:
-            fcntl.flock(self.pid_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            acquire_process_file_lock(self.pid_handle)
+        except RuntimeError as exc:
             raise RuntimeError(f"bridge already running for pid file {self.config.pid_file}") from exc
         self.pid_handle.seek(0)
         self.pid_handle.truncate()
@@ -3346,7 +3872,7 @@ class Bridge:
         if handle is not None:
             try:
                 if not handle.closed:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    release_process_file_lock(handle)
             except (OSError, ValueError):
                 pass
             try:
@@ -3428,13 +3954,18 @@ class Bridge:
         binding = self.session_binding
         if not binding:
             return {}
-        return {
+        payload = {
             "transcript_path": str(binding.transcript_path),
             "sessionId": binding.session_id,
             "pane_pid": binding.pane_pid,
         }
+        if binding.transport != "tmux":
+            payload.update({"transport": binding.transport, "generation": binding.generation[:12]})
+        return payload
 
     def has_fresh_pending_sidecar_binding(self, binding: ClaudeSessionBinding) -> bool:
+        if not repl_supports_pane_features(self.repl):
+            return False
         if binding.transcript_path.exists():
             return False
         try:
@@ -3443,15 +3974,27 @@ class Bridge:
             return False
 
     def ensure_session_binding(self) -> ClaudeSessionBinding:
-        try:
+        if not repl_supports_pane_features(self.repl):
             binding = self.binder.resolve()
-        except RuntimeError as exc:
-            if "no SessionStart sidecar entry" not in str(exc):
-                raise
-            pending = self.binder._resolve_fresh_sidecar_metadata(self.repl.pane_pid())
-            if len(pending) != 1:
-                raise
-            binding = pending[0]
+        else:
+            try:
+                binding = self.binder.resolve()
+            except RuntimeError as exc:
+                if "no SessionStart sidecar entry" not in str(exc):
+                    raise
+                pending = self.binder._resolve_fresh_sidecar_metadata(self.repl.pane_pid())
+                if len(pending) != 1:
+                    raise
+                binding = pending[0]
+
+        previous = self.session_binding
+        if (
+            previous is not None
+            and previous.transport == "conpty"
+            and binding.transport == "conpty"
+            and (previous.generation != binding.generation or previous.transcript_path != binding.transcript_path)
+        ):
+            self.fail_native_active_turn("native_host_generation_changed")
 
         identity = session_identity(binding.transcript_path) if binding.transcript_path.exists() else None
         if self.session_binding != binding or (identity is not None and self.transcript_identity_changed(identity)):
@@ -3611,8 +4154,113 @@ class Bridge:
                 self.typing_stop.set()
                 self.typing_stop = None
 
+    def fail_native_active_turn(self, reason: str) -> bool:
+        with self.lock:
+            active = self.active_turn
+            if active is None:
+                return False
+            self.active_turn = None
+        item = self.queue_item_for_active(active)
+        self.stop_typing()
+        self.queue.append_status(
+            item,
+            "failed",
+            error=reason,
+            native_turn_loss=True,
+            auto_reinjected=False,
+        )
+        self.persist_state()
+        self.write_egress_sidecar()
+        try:
+            self.telegram.send(
+                "⚠️ 네이티브 Claude host 연결/세션이 바뀌어 현재 턴을 중단했어요. "
+                "중복 실행 방지를 위해 자동 재주입하지 않았습니다."
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("NATIVE", f"turn-loss notice failed: {exc}")
+        log("NATIVE", f"active turn failed without reinject queue={item.queue_id} reason={reason}")
+        return True
+
+    def check_native_turn_health(self, now: float | None = None) -> bool:
+        if repl_supports_pane_features(self.repl):
+            return True
+        with self.lock:
+            active = self.active_turn
+        if active is None:
+            return True
+        now = time.time() if now is None else now
+        threshold = max(1.0, float(self.config.native_turn_stale_seconds))
+        try:
+            self.repl.verify()
+            host = self.repl.host_identity()
+        except NativeHostGenerationChanged:
+            self.fail_native_active_turn("native_host_generation_changed")
+            return False
+        except Exception:  # noqa: BLE001
+            self.fail_native_active_turn("native_host_unavailable")
+            return False
+
+        try:
+            session_path = self.repl.session_file().resolve()
+        except NativeSessionUnbound:
+            if now - active.injected_at <= threshold:
+                return True
+            self.fail_native_active_turn("native_session_unbound")
+            return False
+        except Exception:  # noqa: BLE001
+            self.fail_native_active_turn("native_host_unavailable")
+            return False
+
+        binding = self.session_binding
+        if binding is None:
+            if now - active.injected_at <= threshold:
+                return True
+            self.fail_native_active_turn("native_session_unbound")
+            return False
+        if str(host.get("generation") or "") != binding.generation:
+            self.fail_native_active_turn("native_host_generation_changed")
+            return False
+        if session_path != binding.transcript_path.resolve():
+            self.fail_native_active_turn("native_session_changed")
+            return False
+
+        try:
+            transcript_mtime = session_path.stat().st_mtime
+        except OSError:
+            transcript_mtime = 0.0
+        activity_at = max(active.injected_at, self.last_jsonl_read_at, transcript_mtime)
+        if now - activity_at > threshold:
+            self.fail_native_active_turn("native_jsonl_stale")
+            return False
+        return True
+
     def busy_state(self) -> str:
         self.release_completed_active_turn_if_recorded()
+        if not repl_supports_pane_features(self.repl):
+            if not self.check_native_turn_health():
+                return "hook_blocked"
+            with self.lock:
+                if self.active_turn:
+                    return "generating"
+            if self.session_binding is None:
+                try:
+                    self.ensure_session_binding()
+                except NativeSessionUnbound:
+                    try:
+                        self.repl.verify()
+                    except Exception:  # noqa: BLE001
+                        return "hook_blocked"
+                    return "idle"
+                except Exception:  # noqa: BLE001
+                    return "hook_blocked"
+            binding = self.session_binding
+            if binding:
+                try:
+                    if time.time() - binding.transcript_path.stat().st_mtime < self.config.transcript_stable_seconds:
+                        return "generating"
+                except OSError:
+                    return "hook_blocked"
+            return "idle"
         self.release_stale_active_turn_if_idle()
         with self.lock:
             if self.active_turn:
@@ -3670,6 +4318,17 @@ class Bridge:
         failing while the session is genuinely busy.
         (2026-06-23 노트북, 아니키 ack: busy-aware delivery, 가역 패치.)
         """
+        if not repl_supports_pane_features(self.repl):
+            if not self.check_native_turn_health():
+                return False
+            binding = self.session_binding
+            if binding is None:
+                return bool(missing_transcript_busy)
+            try:
+                return time.time() - binding.transcript_path.stat().st_mtime < self.config.transcript_stable_seconds
+            except OSError:
+                return bool(missing_transcript_busy)
+
         binding = self.session_binding
         if binding:
             try:
@@ -4434,6 +5093,8 @@ class Bridge:
         # '기록파일 신선 + 화면 idle + pending 대기 + active_turn 없음' 모순이
         # threshold(기본 300s) 연속 지속되면 해당 transcript 를 격리하고 바인딩을
         # 리셋한다 — 다음 ensure_session_binding 이 화면 세션으로 재바인딩.
+        if not repl_supports_pane_features(self.repl):
+            return
         try:
             threshold = float(os.environ.get("CLB_BUSY_STUCK_REBIND_SEC", "300"))
         except ValueError:
@@ -4823,6 +5484,10 @@ class Bridge:
     def handle_status_command(self) -> None:
         # codex /status 패리티 (T-260703-01 확장): bridge 상태 한 줄 → 상태 + 컨텍스트 요약 바.
         # busy(generating) 중엔 composer 오염 방지를 위해 캡처 생략 — 기존 한 줄 응답 유지.
+        if not repl_supports_pane_features(self.repl):
+            self.telegram.send(NATIVE_PANE_DEFER_TEXT)
+            log("INJECT", "/status deferred on native ConPTY P0")
+            return
         state = self.busy_state()
         if state != "idle":
             self.telegram.send(f"claude bridge status: {state} (턴 진행 중 — 컨텍스트 캡처 생략)")
@@ -4849,6 +5514,16 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"/status capture failed: {exc}")
             self.telegram.send(f"claude bridge status: idle (컨텍스트 캡처 실패: {exc})")
+
+    def defer_native_pane_command(self, item: "QueueItem", command_token: str) -> None:
+        self.telegram.send(NATIVE_PANE_DEFER_TEXT)
+        self.queue.append_status(
+            item,
+            "blocked",
+            slash_command=command_token,
+            native_pane_feature_deferred=True,
+        )
+        log("INJECT", f"{command_token} deferred on native ConPTY P0")
 
     def handle_capture_command(self, item: "QueueItem", command_token: str) -> None:
         # /context /usage /cost — read-only 정보 명령. 시각화가 넓은 폭을 요구해 좁은
@@ -4929,9 +5604,197 @@ class Bridge:
             self.queue.append_status(item, "failed", error=str(exc))
             self.telegram.send(f"claude bridge {command_token} failed: {exc}")
 
+    def current_session_model(self) -> str:
+        try:
+            return session_model_from_screen(self.repl.capture_pane(40))
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/model session status capture failed: {exc}")
+            return ""
+
+    @staticmethod
+    def current_settings_model() -> str:
+        path = Path(os.environ.get("CLB_CLAUDE_SETTINGS", "~/.claude/settings.json")).expanduser()
+        payload = read_json(path) or {}
+        value = payload.get("model")
+        return value.strip() if isinstance(value, str) else ""
+
+    def model_transcript_checkpoint(self) -> int:
+        binding = self.session_binding
+        if binding is None:
+            return 0
+        try:
+            return binding.transcript_path.stat().st_size
+        except OSError:
+            return 0
+
+    def model_local_command_observed(self, alias: str, checkpoint: int) -> bool:
+        binding = self.session_binding
+        if binding is None:
+            return False
+        try:
+            with binding.transcript_path.open("rb") as handle:
+                handle.seek(max(0, checkpoint))
+                text = handle.read().decode("utf-8", errors="replace")
+        except OSError:
+            return False
+        for line in text.splitlines():
+            if "<command-name>/model</command-name>" not in line:
+                continue
+            args = re.search(r"<command-args>\s*([^<]*)</command-args>", line, re.IGNORECASE)
+            if args and args.group(1).strip().lower() == alias.lower():
+                return True
+            if any(
+                re.search(rf"\b{re.escape(term)}\b", line, re.IGNORECASE)
+                for term in model_alias_terms(alias)
+            ):
+                return True
+        return False
+
+    def stage_and_submit_model_choice(self, alias: str) -> bool:
+        """Land a model command in the tmux composer before allowing Enter."""
+        prompt = f"/model {alias}"
+        lock = getattr(self.repl, "composer_lock", None)
+        clear = getattr(self.repl, "_clear_composer_unlocked", None)
+        stage = getattr(self.repl, "_stage_prompt_unlocked", None)
+        submit = getattr(self.repl, "_submit_prompt_unlocked", None)
+        if not all(callable(method) for method in (lock, clear, stage, submit)):
+            raise RuntimeError("tmux transport does not support verified composer staging")
+
+        attempts = int_env("CLB_MODEL_INJECT_RETRIES", 2, minimum=1)
+        stage_settle = max(0.0, float(os.environ.get("CLB_MODEL_STAGE_SETTLE_SEC", "0.1")))
+        escape_used = False
+        with lock():
+            for attempt in range(1, attempts + 1):
+                screen = self.repl.capture_pane(80)
+                modal = model_interstitial(screen)
+                if modal:
+                    if escape_used:
+                        log("INJECT", f"/model stage blocked by persistent {modal}")
+                        return False
+                    submit("Escape")
+                    escape_used = True
+                    if stage_settle:
+                        time.sleep(stage_settle)
+                    continue
+
+                residual = composer_residual_text(screen)
+                clear_attempts = 0
+                while residual and clear_attempts < self.config.composer_clear_retries:
+                    clear(interrupt=False)
+                    clear_attempts += 1
+                    screen = self.repl.capture_pane(80)
+                    if model_interstitial(screen):
+                        break
+                    residual = composer_residual_text(screen)
+                if residual or model_interstitial(screen):
+                    log("INJECT", f"/model composer clear not verified attempt={attempt}")
+                    continue
+
+                stage(prompt)
+                if stage_settle:
+                    time.sleep(stage_settle)
+                screen = self.repl.capture_pane(80)
+                modal = model_interstitial(screen)
+                if modal:
+                    if not escape_used:
+                        submit("Escape")
+                        escape_used = True
+                    log("INJECT", f"/model stage diverted to {modal} attempt={attempt}")
+                    continue
+                if composer_residual_text(screen) == prompt:
+                    submit("Enter")
+                    return True
+                log("INJECT", f"/model composer landing not observed attempt={attempt}")
+        return False
+
+    def submit_model_alias(self, alias: str) -> None:
+        prompt = f"/model {alias}"
+        replace_prompt = getattr(self.repl, "replace_prompt", None)
+        if callable(replace_prompt):
+            replace_prompt(prompt)
+            return
+        self.repl.clear_composer()
+        self.repl.paste_prompt(prompt)
+
+    def wait_for_session_model(self, alias: str) -> tuple[bool, str]:
+        settle = max(0.0, float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
+        timeout = max(0.0, float(os.environ.get("CLB_MODEL_VERIFY_TIMEOUT_SEC", "3.0")))
+        poll = max(0.05, float(os.environ.get("CLB_MODEL_VERIFY_POLL_SEC", "0.2")))
+        if settle:
+            time.sleep(settle)
+        deadline = time.monotonic() + timeout
+        current = ""
+        while True:
+            current = self.current_session_model()
+            if model_alias_matches_session(alias, current):
+                return True, current
+            if time.monotonic() >= deadline:
+                return False, current
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+
+    def wait_for_model_choice_landing(self, alias: str, checkpoint: int) -> tuple[bool, str, str]:
+        settle = max(0.0, float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
+        timeout = max(0.0, float(os.environ.get("CLB_MODEL_VERIFY_TIMEOUT_SEC", "8.0")))
+        poll = max(0.05, float(os.environ.get("CLB_MODEL_VERIFY_POLL_SEC", "0.2")))
+        if settle:
+            time.sleep(settle)
+        deadline = time.monotonic() + timeout
+        current = ""
+        switch_confirmed = False
+        while True:
+            settings_model = self.current_settings_model()
+            if settings_model.lower() == alias.lower():
+                current = self.current_session_model()
+                if not model_alias_matches_session(alias, current):
+                    current = settings_model
+                return True, current, f"settings.json model={settings_model}"
+            if self.model_local_command_observed(alias, checkpoint):
+                current = self.current_session_model()
+                if not model_alias_matches_session(alias, current):
+                    current = alias
+                return True, current, "session JSONL local-command"
+
+            try:
+                screen = self.repl.capture_pane(80)
+            except Exception:  # noqa: BLE001
+                screen = ""
+            current = session_model_from_screen(screen) or current
+            if model_interstitial(screen) == "switch_model" and not switch_confirmed:
+                lock = getattr(self.repl, "composer_lock", None)
+                submit = getattr(self.repl, "_submit_prompt_unlocked", None)
+                if callable(lock) and callable(submit):
+                    with lock():
+                        # "1. Yes"가 기본 선택인 확인창에서 Enter로 Yes를 확정한다.
+                        if model_interstitial(self.repl.capture_pane(80)) == "switch_model":
+                            submit("Enter")
+                            switch_confirmed = True
+                            log("INJECT", f"/model choice={alias} Switch model Yes confirmed")
+                    continue
+            if time.monotonic() >= deadline:
+                return False, current, ""
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def model_apply_notice(
+        alias: str,
+        confirmed: bool,
+        current: str,
+        selected: bool = False,
+        evidence: str = "",
+    ) -> str:
+        label = current or MODEL_STATUS_UNAVAILABLE
+        if confirmed:
+            action = "모델 선택 적용" if selected else "모델 적용"
+            evidence_line = f"\n착지 확인: {evidence}" if evidence else ""
+            return f"✅ {action}: {alias}{evidence_line}\n현재 세션 모델: {label}"
+        return f"⚠️ 모델 전환 확인 실패: {alias}\n현재 세션 모델: {label}"
+
     def handle_model_command(self, item: "QueueItem") -> None:
         # /model 인터셉트 (T-260703-17 프리즈 실사고 재발방지): bare 는 선택지 키보드,
         # 인자형은 TUI 를 열지 않으므로 그대로 주입(비대화형 적용) + 적용 확인 회신.
+        if not repl_supports_pane_features(self.repl):
+            self.defer_native_pane_command(item, MODEL_SLASH_COMMAND)
+            return
         text = sanitize_text(item.text or "").strip()
         parts = text.split(maxsplit=1)
         if len(parts) > 1:
@@ -4943,17 +5806,14 @@ class Bridge:
                 log("INJECT", f"/model arg rejected (not allowlisted): {alias!r} update={item.update_id}")
                 return
             try:
-                for _ in range(self.config.composer_clear_retries):
-                    self.repl.clear_composer()
-                self.repl.paste_prompt(f"/model {alias}")
+                self.submit_model_alias(alias)
             except Exception as exc:  # noqa: BLE001
                 log("INJECT", f"/model arg apply failed: {exc}")
                 self.queue.append_status(item, "failed", error=str(exc))
                 self.telegram.send(f"claude bridge /model 적용 실패: {exc}")
                 return
-            time.sleep(float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
-            applied = claude_settings_model()
-            self.telegram.send(f"모델 적용을 보냈어요: {alias}\n현재 설정: {applied}")
+            confirmed, current = self.wait_for_session_model(alias)
+            self.telegram.send(self.model_apply_notice(alias, confirmed, current))
             self.queue.append_status(
                 item,
                 "injected",
@@ -4961,13 +5821,17 @@ class Bridge:
                 **self.terminal_retry_status_extra(item),
             )
             self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
-            log("INJECT", f"/model arg={alias} applied update={item.update_id}")
+            result = "confirmed" if confirmed else "unconfirmed"
+            log("INJECT", f"/model arg={alias} {result} model={current or 'unknown'} update={item.update_id}")
             return
-        current = claude_settings_model()
+        current = self.current_session_model()
+        current_label = current or MODEL_STATUS_UNAVAILABLE
         buttons = [
             [
                 {
-                    "text": ("✅ " if alias and alias in current else "") + alias,
+                    "text": (
+                        "✅ " if alias != "default" and model_alias_matches_session(alias, current) else ""
+                    ) + alias,
                     "callback_data": f"{MODEL_CALLBACK}::{alias}",
                 }
             ]
@@ -4977,7 +5841,7 @@ class Bridge:
         self.telegram.call(
             "sendMessage",
             chat_id=self.config.chat_id,
-            text=prefix(f"현재 모델: {current}\n바꿀 모델을 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"),
+            text=prefix(f"현재 세션 모델: {current_label}\n바꿀 모델을 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"),
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
         self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
@@ -5003,6 +5867,9 @@ class Bridge:
         #      Escape 라, busy 일 때 주입하면 진행 중 턴을 끊어버린다. 대기 안내만 하고 반환.
         #   두 실패 모두 composer 를 건드리지 않는다(턴 무영향).
         prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        if not repl_supports_pane_features(self.repl):
+            self._emit_model_notice(prefix(NATIVE_PANE_DEFER_TEXT), menu_message_id)
+            return
         if not model_alias_allowed(alias):
             self._emit_model_notice(prefix(model_alias_rejection_text(alias)), menu_message_id)
             log("INJECT", f"/model choice rejected (not allowlisted): {alias!r}")
@@ -5012,19 +5879,28 @@ class Bridge:
             self._emit_model_notice(prefix(MODEL_BUSY_DEFER_TEXT), menu_message_id)
             log("INJECT", f"/model choice deferred (busy state={state}): {alias}")
             return
+        checkpoint = self.model_transcript_checkpoint()
         try:
-            for _ in range(self.config.composer_clear_retries):
-                self.repl.clear_composer()
-            self.repl.paste_prompt(f"/model {alias}")
+            submitted = self.stage_and_submit_model_choice(alias)
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"/model choice apply failed: {exc}")
-            self.telegram.send(f"claude bridge /model 적용 실패: {exc}")
+            self._emit_model_notice(prefix(f"⚠️ 모델 전환 주입 실패: {alias}"), menu_message_id)
             return
-        time.sleep(float(os.environ.get("CLB_MODEL_SETTLE_SEC", "1.0")))
-        applied = claude_settings_model()
-        text = prefix(f"✅ 모델 선택 적용: {alias}\n현재 설정: {applied}")
+        if not submitted:
+            current = self.current_session_model()
+            self._emit_model_notice(
+                prefix(self.model_apply_notice(alias, False, current, selected=True)),
+                menu_message_id,
+            )
+            log("INJECT", f"/model choice={alias} failed reason=composer_not_landed")
+            return
+        confirmed, current, evidence = self.wait_for_model_choice_landing(alias, checkpoint)
+        text = prefix(self.model_apply_notice(alias, confirmed, current, selected=True, evidence=evidence))
         self._emit_model_notice(text, menu_message_id)
-        log("INJECT", f"/model choice={alias} applied")
+        if confirmed:
+            log("INJECT", f"/model choice={alias} applied evidence={evidence} model={current or 'unknown'}")
+        else:
+            log("INJECT", f"/model choice={alias} failed reason=landing_unverified model={current or 'unknown'}")
 
     def trigger_lifecycle_recovery(self, command_token: str) -> None:
         # /exit·/quit 통과 후 Claude Code 세션이 종료되면 브릿지는 inject 대상을 잃는다.
@@ -5084,6 +5960,8 @@ class Bridge:
         # 앞 항목은 이미 TUI native 큐에 올라간 것이므로 그 뒤 텍스트도 순서대로 추가
         # 제출한다. 단 head 가 slash/media 처럼 아직 올라가지 않은 보류 항목이면 뒤를
         # 먼저 태우지 않는다(순서 보존).
+        if not repl_supports_pane_features(self.repl):
+            return False
         with self.lock:
             if not self.pending:
                 return False
@@ -5197,7 +6075,12 @@ class Bridge:
             # Escape 없는 clear + paste + Enter 로 주입해 Claude Code TUI native 큐잉에 실어
             # 다음 턴으로 반영시킨다. 진행 중 턴은 절대 끊지 않는다. approval_wait/hook_blocked/
             # clearing 등 다른 non-idle 은 아래 기존 대기 경로 그대로(주입 안 함).
-            if state == "generating" and busy_inject_enabled() and self.try_busy_inject():
+            if (
+                state == "generating"
+                and repl_supports_pane_features(self.repl)
+                and busy_inject_enabled()
+                and self.try_busy_inject()
+            ):
                 return
             # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
             # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
@@ -5289,6 +6172,13 @@ class Bridge:
                 command_token = slash_token(inject_text)
             else:
                 command_token = slash_token(item.text)
+                if not repl_supports_pane_features(self.repl) and (
+                    command_token in CAPTURE_MIRROR_SLASH_COMMANDS or command_token == MODEL_SLASH_COMMAND
+                ):
+                    self.defer_native_pane_command(item, command_token)
+                    self.persist_state()
+                    self.write_egress_sidecar()
+                    return
                 # read-only 정보 명령(/context /usage /cost) = 넓힌 창 캡처 미러.
                 if command_token in CAPTURE_MIRROR_SLASH_COMMANDS:
                     self.handle_capture_command(item, command_token)
@@ -5326,7 +6216,7 @@ class Bridge:
             self.persist_state()
             self.write_egress_sidecar()
             # /exit·/quit 는 세션을 종료시키므로 watchdog 자가복구를 앞당겨 트리거 (graceful 재기동).
-            if command_token in SESSION_LIFECYCLE_SLASH_COMMANDS:
+            if command_token in SESSION_LIFECYCLE_SLASH_COMMANDS and repl_supports_pane_features(self.repl):
                 self.trigger_lifecycle_recovery(command_token)
             log("INJECT", f"slash={command_token} update={item.update_id}")
             return
@@ -5334,9 +6224,13 @@ class Bridge:
         self.write_egress_sidecar()
         prompt = self.prompt_for_item(item)
         try:
-            for _ in range(self.config.composer_clear_retries):
-                self.repl.clear_composer()
-            self.repl.paste_prompt(prompt)
+            replace_prompt = getattr(self.repl, "replace_prompt", None)
+            if callable(replace_prompt):
+                replace_prompt(prompt)
+            else:
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(prompt)
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"failed: {exc}")
             with self.lock:
@@ -5505,6 +6399,13 @@ class Bridge:
         with self.lock:
             active = self.active_turn
         if not active or active.user_uuid:
+            return
+        if not repl_supports_pane_features(self.repl):
+            # Native owned-host turns are never clear/paste retried: the first
+            # request may already be executing even when its JSONL record is
+            # delayed. Health/staleness decides terminal loss without duplicate
+            # tool execution.
+            self.check_native_turn_health()
             return
         if time.time() - active.injected_at < self.config.injection_verify_timeout:
             return
@@ -5952,6 +6853,9 @@ class Bridge:
         )
         delivered_answer = answer_messages[0]
         suggested_reply = answer_messages[1] if len(answer_messages) == 2 else ""
+        copy_content_messages = copy_content_bubble_messages(delivered_answer, surface)
+        delivered_answer = copy_content_messages[0]
+        copy_content_bubbles = copy_content_messages[1:]
         copy_payload_messages = split_copy_payload_messages(delivered_answer)
         reply_to_message_id = active.message_id if active.message_id > 0 and active.source != "voice" else None
         self.outbox.mark_sending(key, active.send_attempts)
@@ -5969,8 +6873,18 @@ class Bridge:
                         sent_ids = None
                         break
                     sent_ids.extend(part_ids)
-            else:
+            elif delivered_answer or not copy_content_bubbles:
                 sent_ids = self.telegram.send(delivered_answer, reply_to_message_id=reply_to_message_id)
+            else:
+                sent_ids = []
+            if sent_ids is not None:
+                for bubble in copy_content_bubbles:
+                    bubble_ids = self.telegram.send_copy_content(bubble, code=True)
+                    if bubble_ids is None:
+                        sent_ids = None
+                        send_error = "copy-content bubble send failed"
+                        break
+                    sent_ids.extend(bubble_ids)
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
             sent_ids = None
@@ -6278,7 +7192,7 @@ class Bridge:
                 return
         except OSError:
             pass
-        raw_text = sanitize_text(content_text(content), limit=FLOW_MIRROR_LIMIT)
+        raw_text = sanitize_text(clean_ambient_final_text(content_text(content)), limit=FLOW_MIRROR_LIMIT)
         if not raw_text:
             return
         key = hashlib.sha1(raw_text.encode("utf-8")).hexdigest()
@@ -6294,6 +7208,9 @@ class Bridge:
         )
         text = answer_messages[0]
         suggested_reply = answer_messages[1] if len(answer_messages) == 2 else ""
+        copy_content_messages = copy_content_bubble_messages(text, surface)
+        text = copy_content_messages[0]
+        copy_content_bubbles = copy_content_messages[1:]
         delivered = False
         anchor = self.ambient_directive_message_id
         if anchor and alt3_narrative_enabled():
@@ -6302,13 +7219,17 @@ class Bridge:
             # 본문은 R-C1 자연어 그대로(✅ chrome 없음) — 연결은 reply 인용이 표현한다.
             # reply send 실패 시 폴백 = 기존 ✅ 카드 send (결과 1장 보장).
             try:
-                ids = self.telegram.send(text, reply_to_message_id=anchor)
-                if ids:
+                if not text and copy_content_bubbles:
                     delivered = True
-                    log("SEND", f"sent ambient final as reply to directive root mid={anchor}")
+                    log("SEND", "skip empty ambient prose before copy-content bubble")
                 else:
-                    delivered = bool(self.telegram.send(format_ambient_final(text)))
-                    log("SEND", "ambient final reply failed → fallback card send")
+                    ids = self.telegram.send(text, reply_to_message_id=anchor)
+                    if ids:
+                        delivered = True
+                        log("SEND", f"sent ambient final as reply to directive root mid={anchor}")
+                    else:
+                        delivered = bool(self.telegram.send(format_ambient_final(text)))
+                        log("SEND", "ambient final reply failed → fallback card send")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final reply failed → fallback send (non-fatal): {exc}")
                 try:
@@ -6323,7 +7244,8 @@ class Bridge:
             # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
             unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text)}"
             try:
-                self.telegram.edit(anchor, unified)
+                if text or not copy_content_bubbles:
+                    self.telegram.edit(anchor, unified)
                 delivered = True
                 log("SEND", f"edited ambient final into directive anchor mid={anchor}")
             except Exception as exc:  # noqa: BLE001
@@ -6336,10 +7258,17 @@ class Bridge:
             self.ambient_directive_body = ""
         else:
             try:
-                delivered = bool(self.telegram.send(format_ambient_final(text)))
+                delivered = True if not text and copy_content_bubbles else bool(self.telegram.send(format_ambient_final(text)))
                 log("SEND", "sent ambient final")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final send failed (non-fatal): {exc}")
+        if delivered:
+            for bubble in copy_content_bubbles:
+                bubble_ids = self.telegram.send_copy_content(bubble, code=True)
+                if bubble_ids is None:
+                    delivered = False
+                    log("SEND", "copy-content bubble failed after ambient final (non-fatal)")
+                    break
         if delivered and suggested_reply:
             bubble_ids = self.telegram.send_copy_content(suggested_reply)
             if bubble_ids is None:
@@ -6430,6 +7359,8 @@ class Bridge:
                     self.last_jsonl_watch_error_log_at = now
                 if is_tmux_session_lost_error(exc):
                     self.release_active_turn_due_to_tmux_session_lost(message)
+                elif not repl_supports_pane_features(self.repl):
+                    self.check_native_turn_health()
                 if isinstance(exc, FileNotFoundError):
                     with self.lock:
                         if self.session_identity is not None or (
@@ -6536,12 +7467,40 @@ def handle_stop_signal(bridge: Bridge, signum: int) -> None:
     raise SystemExit(0)
 
 
-def health_check_main() -> int:
+def run_health_check(
+    config: Config,
+    *,
+    repl: ClaudeReplTransport | None = None,
+    binder_factory: Callable[[Config, ClaudeReplTransport], Any] = SessionBinder,
+) -> tuple[int, dict[str, Any]]:
     try:
-        config = Config.from_env()
-        repl = ClaudeRepl(config)
+        if repl is None:
+            validate_transport_mode(config.transport_mode)
+            repl = build_repl_transport(config)
         repl.verify()
-        binder = SessionBinder(config, repl)
+        if config.transport_mode == "conpty":
+            identity = repl.host_identity()
+            generation = hashlib.sha256(str(identity["generation"]).encode()).hexdigest()[:12]
+            try:
+                transcript = repl.session_file().resolve()
+            except NativeSessionUnbound:
+                transcript = None
+            payload = {
+                "ok": True,
+                "node": config.node,
+                "transport": "conpty",
+                "descriptor_path": str(config.conpty_state_path or (config.state_dir / "native-repl-host.json")),
+                "host_up": True,
+                "host_pid": int(identity["host_pid"]),
+                "child_pid": int(identity["child_pid"]),
+                "generation": generation,
+                "session_bound": transcript is not None,
+                "transcript_path": str(transcript) if transcript else "",
+                "transcript_exists": bool(transcript and transcript.exists()),
+                "transcript_pending": transcript is None or not transcript.exists(),
+            }
+            return 0, payload
+        binder = binder_factory(config, repl)
         transcript_pending = False
         try:
             binding = binder.resolve()
@@ -6561,16 +7520,35 @@ def health_check_main() -> int:
             "pane_pid": binding.pane_pid,
             "session_sidecar": str(config.session_sidecar_path),
         }
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
-        return 0
+        return 0, payload
     except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, NativeHostUnavailable):
+            error_code = "native_host_unavailable"
+        elif isinstance(exc, NativeHostGenerationChanged):
+            error_code = "native_host_generation_changed"
+        elif "generation" in str(exc).lower():
+            error_code = "native_host_generation_invalid"
+        else:
+            error_code = "health_check_failed"
         payload = {
             "ok": False,
-            "node": node_defaults()[0],
+            "node": config.node,
             "error": str(exc),
         }
+        if config.transport_mode == "conpty":
+            payload["transport"] = "conpty"
+            payload["error_code"] = error_code
+        return 20, payload
+
+
+def health_check_main() -> int:
+    config = Config.from_env()
+    rc, payload = run_health_check(config)
+    if rc == 0:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
-        return 20
+    return rc
 
 
 def validate_startup_config(config: "Config") -> None:
@@ -6603,24 +7581,22 @@ def enqueue_voice_main(argv: list[str]) -> int:
 
 
 def main() -> int:
-    if sys.platform == "win32" or os.name == "nt":
-        print(NATIVE_WINDOWS_DAEMON_ERROR, file=sys.stderr)
-        return 2
-    if fcntl is None:
-        print("POSIX file locking is unavailable; cannot start Claude Telegram Bridge.", file=sys.stderr)
-        return 2
     if len(sys.argv) > 1 and sys.argv[1] == "--health-check":
         return health_check_main()
     if len(sys.argv) > 1 and sys.argv[1] == "--enqueue-voice":
         return enqueue_voice_main(sys.argv[2:])
     try:
         config = Config.from_env()
+        validate_transport_mode(config.transport_mode)
+        if config.transport_mode == "tmux" and fcntl is None:
+            raise RuntimeError("POSIX file locking is unavailable; cannot start Claude Telegram Bridge.")
         validate_startup_config(config)
         token = load_token(config.token_file)
+        repl = build_repl_transport(config)
         bridge = Bridge(
             config,
             TelegramClient(token, config.chat_id, config.emoji, config.telegram_chunk),
-            ClaudeRepl(config),
+            repl,
             token,
         )
     except Exception as exc:  # noqa: BLE001
@@ -6630,12 +7606,19 @@ def main() -> int:
     def stop(signum: int, _frame: Any) -> None:
         handle_stop_signal(bridge, signum)
 
-    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    stop_signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        stop_signals.append(signal.SIGHUP)
+    for signum in stop_signals:
         signal.signal(signum, stop)
 
     log(
         "START",
-        f"node={config.node} chat={config.chat_id} tmux={config.tmux_socket}/{config.tmux_session}",
+        (
+            f"node={config.node} chat={config.chat_id} transport={config.transport_mode}"
+            if config.transport_mode == "conpty"
+            else f"node={config.node} chat={config.chat_id} transport=tmux tmux={config.tmux_socket}/{config.tmux_session}"
+        ),
     )
     try:
         bridge.run()

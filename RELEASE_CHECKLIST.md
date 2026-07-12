@@ -42,6 +42,8 @@ Expected result: no matches.
 python3 -m py_compile \
   dist/claude-telegram-bridge/bridge_setup.py \
   dist/claude-telegram-bridge/bridge_watchdog.py \
+  dist/claude-telegram-bridge/claude_repl_host_windows.py \
+  dist/claude-telegram-bridge/codex_repl_host_windows.py \
   dist/claude-telegram-bridge/claude_telegram_bridge.py
 python3 - <<'PY'
 import importlib.util
@@ -55,6 +57,7 @@ sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 print(mod.BRIDGE_OWNER)
 PY
+PYTHONPATH=dist/claude-telegram-bridge python3 -m claude_repl_host_windows --self-test
 ```
 
 5. Re-read README billing language. It must say billing classification is

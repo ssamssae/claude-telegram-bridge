@@ -23,8 +23,9 @@ both surfaces.
 
 ### What you need
 
-- A computer (Linux or macOS) where Claude Code is installed and logged in.
-- `tmux` and Python 3 installed on that computer.
+- A computer where Claude Code is installed and logged in. Linux and macOS use
+  the stable tmux transport; native Windows has an experimental opt-in ConPTY transport.
+- Python 3, plus `tmux` for the default Linux/macOS transport.
 - The Telegram app on your phone, plus `curl` on the computer for one setup
   step below.
 
@@ -43,9 +44,30 @@ SessionStart hook, backs up and merges `~/.claude/settings.json`, installs the
 local service/watchdog, and sends one test message. It preserves unrelated
 Claude settings and does not replace an existing hook chain.
 
-Native Windows bridging is not supported: Windows Claude cannot execute the
-`.sh` SessionStart hook and the daemon requires tmux. Use WSL. If a `--user`
-install is not on PATH, run `py -m bridge_setup setup` (or `doctor`) instead.
+Native Windows remains fail-closed by default: `tmux` mode must run inside WSL.
+When the bridge runs inside WSL, you can still watch the live Claude session
+from a plain PowerShell window:
+
+```powershell
+WSL.exe -- tmux -L default attach -t claude
+```
+
+Detach with `Ctrl+B` then `D` — the session keeps running.
+
+Experimental owned-host mode is enabled explicitly with
+`claude-telegram-bridge setup --transport conpty`. It skips the `.sh`
+SessionStart hook and settings merge, then prints two commands: a visible host
+that launches Claude itself and a separate bridge process. It cannot attach to
+an already-running Claude window, and the watchdog never starts the host. If a
+`--user` install is not on PATH, run `py -m bridge_setup setup` (or `doctor`)
+instead.
+
+After native setup, keep the first PowerShell window visible:
+
+```powershell
+claude-telegram-bridge host --workdir C:\path\to\project
+claude-telegram-bridge run
+```
 
 Check or remove the installation later with:
 
@@ -107,6 +129,11 @@ or skip pipx entirely:
 ```bash
 pip install --user claude-telegram-bridge
 ```
+
+On Debian/Ubuntu (including the default WSL distro) a bare `pip install` may
+stop with `error: externally-managed-environment` (PEP 668). Prefer pipx
+above, or append `--break-system-packages` to the pip command if you accept
+managing the package yourself.
 
 ### Step 4 - Save the token and registry (one paste)
 
@@ -326,9 +353,12 @@ Capture tuning for `/context`, `/usage`, and `/cost`:
 
 ## Files
 
-- `bridge_setup.py` - six-step setup wizard, doctor, and uninstall CLI.
+- `bridge_setup.py` - six-step setup wizard, doctor, native host entry point,
+  and uninstall CLI.
 - `bridge_watchdog.py` - local service recovery helper installed by the wizard.
 - `claude_telegram_bridge.py` - bridge daemon.
+- `claude_repl_host_windows.py` - Claude-owned native Windows ConPTY host.
+- `codex_repl_host_windows.py` - shared ConPTY and authenticated pipe primitives.
 - `hooks/claude-telegram-bridge-session-start.sh` - records transcript and tmux
   pane binding for the daemon.
 - `hooks/claude-telegram-bridge-pretool-block.sh` - blocks Telegram MCP replies
@@ -348,7 +378,8 @@ pip install --user claude-telegram-bridge
 ```
 
 This provides the `claude-telegram-bridge` command and its `setup`, `doctor`,
-and `uninstall` subcommands. With no subcommand it starts the daemon as before.
+`host`, `run`, and `uninstall` subcommands. With no subcommand it starts the
+daemon as before.
 Installed copies also get
 the startup version check with a one-tap Telegram update button. Running from
 a clone works too: use `python3 claude_telegram_bridge.py` in place of the
