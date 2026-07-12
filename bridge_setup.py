@@ -77,6 +77,7 @@ class SetupOptions:
     yes: bool
     transport: str = "tmux"
     conpty_state_path: Path | None = None
+    create_session: bool = False
 
 
 ApiCall = Callable[..., dict[str, Any] | None]
@@ -395,6 +396,48 @@ def load_env_file(path: Path) -> dict[str, str]:
         except ValueError:
             values[key.strip()] = value.strip().strip("'\"")
     return values
+
+
+def ensure_setup_tmux_session(
+    options: SetupOptions,
+    *,
+    run: RunCommand = run_command,
+) -> tuple[bool, str, str]:
+    config = load_env_file(options.config_file)
+    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
+    socket = config.get("CLB_TMUX_SOCKET") or "default"
+    session = config.get("CLB_TMUX_SESSION") or "claude"
+    target = f"={session}"
+    attach_command = shlex.join([tmux_bin, "-L", socket, "attach", "-t", session])
+    manual_command = shlex.join([tmux_bin, "-L", socket, "new", "-s", session])
+
+    probe = run([tmux_bin, "-L", socket, "has-session", "-t", target])
+    if probe.returncode == 0:
+        ok(f"tmux session already running: {socket}/{session}")
+        return True, attach_command, manual_command
+
+    if options.non_interactive:
+        should_create = options.create_session
+    else:
+        answer = input("Start the Claude tmux session now? [Y/n] ").strip().lower()
+        should_create = answer not in {"n", "no"}
+    if not should_create:
+        return False, attach_command, manual_command
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        warn("Claude CLI not found on PATH; tmux session creation skipped")
+        return False, attach_command, manual_command
+
+    started = run(
+        [tmux_bin, "-L", socket, "new-session", "-d", "-s", session, claude_bin]
+    )
+    if started.returncode == 0:
+        ok(f"started Claude tmux session: {socket}/{session}")
+        return True, attach_command, manual_command
+    detail = (started.stderr or started.stdout or f"exit {started.returncode}").strip()
+    warn(f"could not start Claude tmux session: {detail}; start it manually")
+    return False, attach_command, manual_command
 
 
 def download_session_start_hook() -> str:
@@ -790,6 +833,7 @@ def setup_bridge(
     *,
     api_call: ApiCall = telegram_call,
     hook_loader: HookLoader = download_session_start_hook,
+    run: RunCommand = run_command,
 ) -> int:
     os_name = platform.system()
     transport = validate_setup_transport(options.transport, os_name=os_name)
@@ -882,6 +926,12 @@ def setup_bridge(
     else:
         setup_note("Test message skipped by option.")
 
+    tmux_ready = False
+    attach_command = ""
+    manual_command = ""
+    if not native_conpty:
+        tmux_ready, attach_command, manual_command = ensure_setup_tmux_session(options, run=run)
+
     out("")
     if native_conpty:
         out("Setup complete. Open two PowerShell windows and run these commands in order:")
@@ -889,8 +939,12 @@ def setup_bridge(
         out(f"claude-telegram-bridge host --workdir <your-project-directory> --state-path {state_path}")
         out(f"claude-telegram-bridge run --config {options.config_file}")
         out("The host must stay visible; closing it ends the owned Claude session.")
+    elif tmux_ready:
+        out("Setup complete. Claude tmux session is ready.")
+        out(f"Attach with: {attach_command}")
+        out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
     else:
-        out("Setup complete. Start Claude in: tmux -L default new -s claude")
+        out(f"Setup complete. Start Claude in: {manual_command}")
         out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
     show_cli_path_fallback("setup")
     return 0
@@ -1136,6 +1190,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--no-start", action="store_true")
     setup_parser.add_argument("--no-test-message", action="store_true")
     setup_parser.add_argument("--non-interactive", action="store_true")
+    setup_parser.add_argument(
+        "--create-session",
+        action="store_true",
+        help="create a missing tmux Claude session (opt-in for non-interactive setup)",
+    )
     setup_parser.add_argument("-y", "--yes", action="store_true")
     setup_parser.add_argument(
         "--transport",
@@ -1230,6 +1289,7 @@ def main(argv: list[str] | None = None) -> int:
                     yes=args.yes,
                     transport=args.transport,
                     conpty_state_path=args.conpty_state,
+                    create_session=args.create_session,
                 )
             )
         if args.command == "doctor":

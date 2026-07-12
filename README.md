@@ -42,7 +42,12 @@ The wizard validates the hidden BotFather token, waits for `/start` to detect
 your chat id, writes `token.json` and `token-registry.json`, installs the
 SessionStart hook, backs up and merges `~/.claude/settings.json`, installs the
 local service/watchdog, and sends one test message. It preserves unrelated
-Claude settings and does not replace an existing hook chain.
+Claude settings and does not replace an existing hook chain. In interactive
+`tmux` setup, a missing `CLB_TMUX_SOCKET`/`CLB_TMUX_SESSION` target prompts
+`Start the Claude tmux session now? [Y/n]` and defaults to yes. For
+non-interactive setup, opt in with `--create-session`; without that flag the
+wizard keeps the manual start guidance. A ready session prints its attach
+command, for example `tmux -L default attach -t claude`.
 
 Native Windows remains fail-closed by default: `tmux` mode must run inside WSL.
 When the bridge runs inside WSL, you can still watch the live Claude session
