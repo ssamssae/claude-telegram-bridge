@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, runtime_checkable
 
 
+
+
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
 NATIVE_WINDOWS_DAEMON_ERROR = (
@@ -98,6 +100,7 @@ CAPTURE_MIRROR_SLASH_COMMANDS = {CONTEXT_SLASH_COMMAND, "/usage", "/cost"}
 # 주입 전 인터셉트해 inline keyboard 로 처리하고, 적용은 비대화형 인자형(/model <alias>)으로만 주입한다.
 MODEL_SLASH_COMMAND = "/model"
 MODEL_CALLBACK = "clb-model"
+SUGGESTED_LOOP_CALLBACK = "clb-suggest"
 # 선택지 목록: env CLB_MODEL_CHOICES(콤마) 우선. 아래 fallback 은 모델 id 가 아니라 CLI alias 토큰
 # (하드코딩 최소화 — 새 모델은 env 로 주입, 현재 모델 표시는 settings SoT 에서 동적).
 DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
@@ -164,21 +167,21 @@ DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS = 120.0
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
 # cards read like the Korean Codex cards. Unmapped tools keep their original name.
 TOOL_LABEL_KO = {
-    "Bash": "실행",
-    "Read": "읽기",
-    "Write": "작성",
-    "Edit": "편집",
-    "MultiEdit": "편집",
-    "NotebookEdit": "노트북편집",
-    "Grep": "검색",
-    "Glob": "파일찾기",
-    "Task": "위임",
-    "Agent": "위임",
-    "Skill": "스킬",
-    "ToolSearch": "도구검색",
-    "TodoWrite": "할일",
-    "WebFetch": "웹가져오기",
-    "WebSearch": "웹검색",
+    "Bash": "▶ 실행",
+    "Read": "📄 읽기",
+    "Write": "🖊 작성",
+    "Edit": "🖊 편집",
+    "MultiEdit": "🖊 편집",
+    "NotebookEdit": "🖊 문서 편집",
+    "Grep": "🔎 검색",
+    "Glob": "📁 파일 찾기",
+    "Task": "🤝 위임",
+    "Agent": "🤝 위임",
+    "Skill": "🧰 스킬",
+    "ToolSearch": "🔎 도구 검색",
+    "TodoWrite": "☑️ 할일",
+    "WebFetch": "🌐 웹 가져오기",
+    "WebSearch": "🌐 웹 검색",
 }
 APPROVAL_WAIT_RE = re.compile(
     # ⚠️ 제거 금지 (DO NOT REMOVE) — control-plane only: match the actual
@@ -186,7 +189,7 @@ APPROVAL_WAIT_RE = re.compile(
     # answer prose. Bare "allow"/"approve"/"permission"/"do you want" matched the
     # assistant's own answer text and wedged the bridge in approval_wait forever
     # → every later telegram msg stuck "enqueued", typing never cleared.
-    # (2026-06-28 라이덴 stuck-inject incident)
+    # (2026-06-28 작업 노드 stuck-inject incident)
     r"(?im)"
     r"^\s*❯?\s*1\.\s*yes\b"
     r"|^\s*\d+\.\s*no,\s*(?:and\s+)?(?:tell|keep)\b"
@@ -211,14 +214,23 @@ ACTIVE_FOREGROUND_TOOL_RE = re.compile(
 ACTIVE_BACKGROUND_HINT_RE = re.compile(
     r"(?i)\bctrl\+b\b.{0,80}\brun\s+in\s+background\b",
 )
+FEEDBACK_SURVEY_HEADERS = {
+    "How is Claude doing this session?",
+    "How is Claude doing this session? (optional)",
+}
+FEEDBACK_SURVEY_CHOICES = (("1", "Bad"), ("2", "Fine"), ("3", "Good"), ("0", "Dismiss"))
+FEEDBACK_SURVEY_CHOICE_RE = re.compile(r"(?<![\w])([0-9]):[ \t]+([A-Za-z]+)(?=\s|$)")
+PANEL_EDGE_CHARS = " \t│┃┆┊┌┐└┘├┤┬┴┼─━╭╮╰╯●•"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 AUDIO_EXTENSIONS = {".ogg", ".oga", ".opus", ".mp3", ".m4a", ".aac", ".wav", ".flac", ".weba"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+LOCATION_PROMPT_PREFIX = "[위치공유]"
 TELEGRAM_MEDIA_PROMPT_PREFIXES = (
     "[Telegram image received]",
     "[Telegram audio received]",
     "[Telegram video received]",
     "[Telegram file received]",
+    LOCATION_PROMPT_PREFIX,
 )
 
 
@@ -253,21 +265,203 @@ def bool_env(name: str, default: bool = False) -> bool:
     return (env(name, fallback) or fallback).lower() in {"1", "true", "yes", "on"}
 
 
-def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
+@dataclass(frozen=True)
+class SuggestedReply:
+    body: str
+    reply: str
+    declared_class: str
+    matched: bool = False
+
+
+@dataclass(frozen=True)
+class SuggestedDecision:
+    decision: str
+    reason: str
+
+
+SUGGESTED_REPLY_OPEN_RE = re.compile(r"^<추천답변(?P<attrs>(?:\s+[^>\r\n]*)?)>")
+SUGGESTED_REPLY_CLASS_RE = re.compile(
+    r'(?:^|\s)class\s*=\s*(?:"(?P<quoted>[^"]+)"|(?P<bare>[^\s>]+))',
+    re.I,
+)
+SUGGESTED_REPLY_CLOSE_RE = re.compile(r"\s*<\s*/\s*[^<>\r\n]+\s*>\s*$")
+SUGGESTED_EXCLUSIONS = (
+    ("main_merge", re.compile(r"(?:\bmain\b|메인).{0,24}(?:\bmerge\b|머지|병합|합치|합쳐|반영)|(?:\bmerge\b|머지|병합|합치|합쳐|반영).{0,24}(?:\bmain\b|메인)", re.I)),
+    ("store_submit", re.compile(r"(?:app\s*store|play\s*(?:store|console)|스토어).{0,30}(?:submit|review|제출|심사|등록|업로드|올려)|(?:submit|제출|등록|업로드|올려).{0,30}(?:app\s*store|play\s*(?:store|console)|스토어)", re.I)),
+    ("account_auth", re.compile(r"\b(?:login|credential|password|passwd|otp|token)\b|로그인|크리덴셜|비밀번호|비번|인증\s*코드|계정.{0,16}(?:인증|접속)", re.I)),
+    ("payment", re.compile(r"\b(?:pay|payment|purchase|checkout|wire\s+transfer)\b|결제|구매|송금", re.I)),
+    ("external_send", re.compile(r"(?:이메일|메일|문자|메시지|텔레그램|슬랙|카톡|고객|외부|대외|\bdm\b).{0,30}(?:보내|발송|전송|게시|publish|send)|(?:send|publish).{0,30}(?:email|mail|message|post|\bdm\b)|게시\s*(?:해|하|할)", re.I)),
+    ("physical_device", re.compile(r"(?:에어컨|선풍기|조명|전등|정수기|온수매트|스마트홈|가전|실물\s*기기|보일러|도어락|플러그|\btuya\b).{0,30}(?:켜|꺼|끄|작동|제어|급수|토출|실행|on|off)|(?:켜|꺼|끄|작동|제어).{0,30}(?:에어컨|선풍기|조명|전등|정수기|온수매트|스마트홈|가전|보일러|도어락|플러그)|물\s*(?:한\s*잔\s*)?(?:줘|주세요|토출)", re.I)),
+)
+SUGGESTED_REPLY_CLASS_INSTRUCTION = (
+    '[SUGGESTED-REPLY CONTRACT] End the final answer with exactly one single-line '
+    '<추천답변 class="auto-ok">...</추천답변> only when the next action is reversible and does not involve '
+    'main merge, store submission, account auth/credentials/passwords, payment, external sending, or a physical '
+    'device; otherwise use class="hold". Never omit class. Do not mention this contract.'
+)
+
+
+def parse_suggested_reply(text: str) -> SuggestedReply:
     original = text or ""
-    trimmed = original.rstrip("\r\n")
-    lines = trimmed.splitlines()
+    lines = original.rstrip("\r\n").splitlines()
     if not lines:
-        return [original]
-    match = re.fullmatch(r"<추천답변>([^\r\n]+)</추천답변>", lines[-1])
-    if not match:
-        return [original]
-    body = "\n".join(lines[:-1]).rstrip()
-    if not body:
-        return [match.group(1)]
-    if enabled and surface == "aniki_dm":
-        return [body, match.group(1)]
-    return [body]
+        return SuggestedReply(original, "", "")
+    marker = lines[-1]
+    open_match = SUGGESTED_REPLY_OPEN_RE.match(marker)
+    if not open_match:
+        return SuggestedReply(original, "", "")
+    class_match = SUGGESTED_REPLY_CLASS_RE.search(open_match.group("attrs"))
+    reply = SUGGESTED_REPLY_CLOSE_RE.sub("", marker[open_match.end() :]).strip()
+    return SuggestedReply(
+        "\n".join(lines[:-1]).rstrip(),
+        reply,
+        (
+            (class_match.group("quoted") or class_match.group("bare") or "")
+            if class_match
+            else ""
+        ).strip().lower(),
+        True,
+    )
+
+
+def classify_suggested_reply(candidate: SuggestedReply) -> SuggestedDecision:
+    if not candidate.reply or candidate.declared_class not in {"auto-ok", "hold"}:
+        return SuggestedDecision("hold", "class_missing_or_invalid")
+    for reason, pattern in SUGGESTED_EXCLUSIONS:
+        if pattern.search(candidate.reply):
+            return SuggestedDecision("hold", reason)
+    if candidate.declared_class == "hold":
+        return SuggestedDecision("hold", "assistant_declared_hold")
+    if re.search(r"\b(?:delete|erase|revoke|reset)\b|삭제|폐기|초기화|권한\s*해제", candidate.reply, re.I):
+        return SuggestedDecision("hold", "irreversible_or_uncertain")
+    return SuggestedDecision("auto-ok", "declared_auto_ok")
+
+
+def should_send_suggested_reply_bubble(
+    parsed: SuggestedReply,
+    enabled: bool,
+    surface: str,
+) -> bool:
+    return bool(
+        parsed.reply
+        and surface == "aniki_dm"
+        and (enabled or parsed.declared_class in {"auto-ok", "hold"})
+    )
+
+
+def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
+    parsed = parse_suggested_reply(text)
+    if not parsed.matched:
+        return [text or ""]
+    if not parsed.reply:
+        return [parsed.body] if parsed.body else [""]
+    if not parsed.body:
+        return [parsed.reply]
+    if should_send_suggested_reply_bubble(parsed, enabled, surface):
+        return [parsed.body, parsed.reply]
+    return [parsed.body]
+
+
+SUGGESTED_REPLY_CONFIRMATION_EMOJI = "👀"
+
+
+def suggested_reply_confirmation(
+    message_ids: list[int] | None,
+    surface: str,
+    enabled: bool = True,
+    origin: str = "telegram",
+) -> dict[str, Any] | None:
+    if not enabled or surface != "aniki_dm" or origin != "telegram" or not message_ids:
+        return None
+    for message_id in message_ids:
+        if isinstance(message_id, int) and message_id > 0:
+            return {"message_id": message_id, "emoji": SUGGESTED_REPLY_CONFIRMATION_EMOJI}
+    return None
+
+
+def apply_suggested_reply_confirmation(
+    telegram: Any,
+    message_ids: list[int] | None,
+    surface: str,
+    enabled: bool = True,
+    origin: str = "telegram",
+) -> None:
+    confirmation = suggested_reply_confirmation(message_ids, surface, enabled, origin)
+    if confirmation is None:
+        return
+    try:
+        reacted = telegram.set_message_reaction(
+            confirmation["message_id"],
+            confirmation["emoji"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log("SEND", f"suggested reply confirmation failed (non-fatal): {exc}")
+        return
+    if not reacted:
+        log("SEND", "suggested reply confirmation failed (non-fatal)")
+
+
+EYE_ACTIVITY_DIRECTIONS = ("↖", "↗", "↘", "↙")
+EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
+EYE_ACTIVITY_MAX_EDITS = 40
+
+
+def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
+    if not enabled or surface != "aniki_dm":
+        return []
+    clean_label = " ".join((label or "응답 처리 중").split())[:80] or "응답 처리 중"
+    return [f"👀{direction} {clean_label}" for direction in EYE_ACTIVITY_DIRECTIONS]
+
+
+def start_eye_activity_loop(
+    telegram: Any,
+    stop_event: threading.Event,
+    frames: list[str],
+    reply_to_message_id: int = 0,
+) -> threading.Thread | None:
+    send_activity = getattr(telegram, "send_activity_indicator", None)
+    edit_activity = getattr(telegram, "edit_activity_indicator", None)
+    delete_activity = getattr(telegram, "delete_activity_indicator", None)
+    if not frames or not all(callable(method) for method in (send_activity, edit_activity, delete_activity)):
+        return None
+
+    def loop() -> None:
+        if stop_event.is_set():
+            return
+        try:
+            message_id = send_activity(frames[0], reply_to_message_id or None)
+        except Exception as exc:  # noqa: BLE001
+            log("ACTIVITY", f"eyes start skipped: {exc}")
+            return
+        if not message_id:
+            log("ACTIVITY", "eyes start skipped: send failed")
+            return
+        try:
+            frame_index = 1
+            edits = 0
+            while edits < EYE_ACTIVITY_MAX_EDITS:
+                if stop_event.wait(EYE_ACTIVITY_EDIT_MIN_SECONDS):
+                    break
+                try:
+                    if not edit_activity(message_id, frames[frame_index % len(frames)]):
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    log("ACTIVITY", f"eyes edit skipped: {exc}")
+                    break
+                edits += 1
+                frame_index += 1
+            if not stop_event.is_set():
+                stop_event.wait()
+        finally:
+            try:
+                if not delete_activity(message_id):
+                    log("ACTIVITY", "eyes cleanup skipped: delete failed")
+            except Exception as exc:  # noqa: BLE001
+                log("ACTIVITY", f"eyes cleanup skipped: {exc}")
+
+    worker = threading.Thread(target=loop, daemon=True, name="clb-eyes-activity")
+    worker.start()
+    return worker
 
 
 COPY_COMMAND_RE = re.compile(
@@ -369,11 +563,15 @@ def busy_inject_promote_idle_stale_seconds() -> float:
 def busy_inject_media_enabled() -> bool:
     # T-260710-15: 미디어(이미지/보이스) 프롬프트의 busy-inject 참여 스위치 (기본 ON).
     # T-260708-22 가 미디어를 전면 제외해 긴 턴 중 첨부가 3~27분 pending 정체
-    # (+순서보존으로 뒤 텍스트까지 연쇄 지연)된 것이 실사고 근인 (2026-07-10 라이덴
+    # (+순서보존으로 뒤 텍스트까지 연쇄 지연)된 것이 실사고 근인 (2026-07-10 작업 노드
     # update=568752417/420/421 실측). 제외 당시 우려던 composer 잔류는 이후 가드
     # (composer residual retry·native queue 부착 관측·T-260710-27 promote-idle 해제)로
     # 회수 경로가 생겨 재허용한다. 문제 시 CLB_BUSY_INJECT_MEDIA=0 으로 옛 idle-only 복귀.
     return bool_env("CLB_BUSY_INJECT_MEDIA", True)
+
+
+def location_prompt_enabled() -> bool:
+    return bool_env("CLB_LOCATION_PROMPT", True)
 
 
 def is_telegram_media_prompt(text: str) -> bool:
@@ -392,7 +590,7 @@ def composer_residual_text(screen: str) -> str:
     generating 중 composer 에 사용자가 이미 타이핑해 둔 텍스트가 있으면, 우리가 paste 한
     프롬프트가 그 뒤에 이어붙어 오염된 채 Enter 될 수 있다. 주입 전 이 잔여를 감지해 Escape
     없는 clear 로 확실히 비운다. 빈 문자열 = 깨끗한 composer.
-    (2026-06-28 라이덴 stuck-inject 회귀 클래스 방지.)
+    (2026-06-28 작업 노드 stuck-inject 회귀 클래스 방지.)
     """
     if not screen:
         return ""
@@ -429,6 +627,7 @@ SELF_UPDATE_PACKAGE = "claude-telegram-bridge"
 SELF_UPDATE_MODULE = "claude_telegram_bridge"
 SELF_UPDATE_PREFIX = "CLB"
 SELF_UPDATE_CALLBACK = "clb_update"
+SELF_UPDATE_BREAK_CALLBACK = "clb_update_break"
 SELF_UPDATE_PYPI_TIMEOUT = 4
 
 
@@ -501,26 +700,112 @@ def self_update_available() -> str | None:
         return None
 
 
-def perform_self_update(latest: str) -> None:
-    """pip-upgrade to `latest` then re-exec so the new code runs. Fail-safe: any
-    error leaves the running version untouched."""
+@dataclass(frozen=True)
+class SelfUpdateResult:
+    status: str
+    message: str
+    restart_requested: bool = False
+
+
+def _self_update_notify(notify: Callable[[str], object] | None, message: str) -> None:
+    if notify is None:
+        return
     try:
-        log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
+        notify(message)
+    except Exception as exc:  # noqa: BLE001 — chat feedback cannot break updater safety
+        log("UPDATE", f"chat feedback failed: {exc}")
+
+
+def _self_update_failure_result(
+    latest: str,
+    output: str,
+    returncode: int,
+    *,
+    allow_break_system_packages: bool,
+) -> SelfUpdateResult:
+    lowered = output.lower()
+    if not allow_break_system_packages and (
+        "externally-managed-environment" in lowered or "pep 668" in lowered
+    ):
+        message = (
+            f"⚠️ v{latest} 업데이트가 Python PEP 668 보호로 중단됐습니다. "
+            "아래 동의 버튼을 누르면 --break-system-packages로 한 번 재시도합니다. "
+            "이 옵션은 시스템 Python 보호를 우회합니다."
+        )
+        return SelfUpdateResult("pep668_consent_required", message)
+    if "--user" in lowered and (
+        "pip 26" in lowered or "not supported" in lowered or "no longer" in lowered
+    ):
+        reason = "pip 26에서 --user 설치 미지원"
+    else:
+        reason = f"pip 종료 코드 {returncode}"
+    message = (
+        f"❌ v{latest} 업데이트 실패: {reason}. "
+        f"수동: pipx install --force {SELF_UPDATE_PACKAGE}"
+    )
+    return SelfUpdateResult("failed", message)
+
+
+def perform_self_update(
+    latest: str,
+    *,
+    notify: Callable[[str], object] | None = None,
+    allow_break_system_packages: bool = False,
+) -> SelfUpdateResult:
+    """Upgrade to ``latest``, report the outcome, then re-exec on success.
+
+    PEP 668 protection is only bypassed after the dedicated consent callback.
+    Any install error leaves the running version untouched.
+    """
+    log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
+    command = [sys.executable, "-m", "pip", "install", "--upgrade"]
+    if allow_break_system_packages:
+        command.append("--break-system-packages")
+    command.append(f"{SELF_UPDATE_PACKAGE}=={latest}")
+    try:
         proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", f"{SELF_UPDATE_PACKAGE}=={latest}"],
+            command,
             capture_output=True,
             text=True,
             timeout=300,
         )
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()[:200]
+            output = (proc.stderr or proc.stdout or "").strip()
+            detail = output[:200]
             log("UPDATE", f"pip upgrade failed (staying put): {detail}")
-            return
-        os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
-        log("UPDATE", f"upgraded to {latest}; restarting")
+            result = _self_update_failure_result(
+                latest,
+                output,
+                proc.returncode,
+                allow_break_system_packages=allow_break_system_packages,
+            )
+            if result.status != "pep668_consent_required":
+                _self_update_notify(notify, result.message)
+            return result
+    except Exception as exc:  # noqa: BLE001
+        log("UPDATE", f"self-update install error (staying put): {exc}")
+        message = (
+            f"❌ v{latest} 업데이트 실패: pip 실행 오류. "
+            f"수동: pipx install --force {SELF_UPDATE_PACKAGE}"
+        )
+        _self_update_notify(notify, message)
+        return SelfUpdateResult("failed", message)
+
+    os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
+    message = f"✅ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다."
+    log("UPDATE", f"upgraded to {latest}; restarting")
+    _self_update_notify(notify, message)
+    try:
         os.execv(sys.executable, [sys.executable, "-m", SELF_UPDATE_MODULE] + sys.argv[1:])
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update error (new version active next restart): {exc}")
+        message = (
+            f"⚠️ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공, 자동 재시작 실패. "
+            "브릿지를 수동 재시작하면 신버전이 적용됩니다."
+        )
+        _self_update_notify(notify, message)
+        return SelfUpdateResult("installed_restart_failed", message)
+    return SelfUpdateResult("updated", message, restart_requested=True)
 
 
 def node_defaults() -> tuple[str, str]:
@@ -556,7 +841,7 @@ def read_json(path: Path) -> dict[str, Any] | None:
 def _atomic_tmp(path: Path) -> tuple[int, Path]:
     # T-260704-37 F5: tmp 는 호출마다 유니크(mkstemp) — 고정 '<name>.tmp' 는 동시
     # 쓰기가 같은 경로를 공유하다 첫 replace 후 두번째 replace 가 FileNotFoundError
-    # 로 죽는 race (라이덴 2026-07-04 23:36 크래시 실측, exit 2 → 브릿지 전체 다운).
+    # 로 죽는 race (작업 노드 2026-07-04 23:36 크래시 실측, exit 2 → 브릿지 전체 다운).
     fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     return fd, Path(name)
 
@@ -785,7 +1070,7 @@ def extract_context_screen(screen: str) -> str:
 # 텍스트 막대라 일부러 제외한다(보존).
 CONTEXT_CHART_GLYPHS = "⛀⛁⛂⛃⛄⛅⛆⛇⛶⛷"
 # T-260710-20: /context 렌더 원폭(20열 ≈ 40자)은 폰 pre 폭(~24자)을 넘어 행마다
-# 2~3줄로 접혀 매트릭스 모양이 붕괴한다(아니키 스샷 실측 2026-07-10). 글리프를
+# 2~3줄로 접혀 매트릭스 모양이 붕괴한다(사용자 스샷 실측 2026-07-10). 글리프를
 # 읽기 순서대로 모아 10열(≈19자)로 재배열해 폰에서 무줄바꿈 표시.
 CONTEXT_GRID_REFLOW_COLS = 10
 CONTEXT_SYNTH_GRID_CELLS = 100
@@ -919,7 +1204,7 @@ def synth_context_grid(pct_text: str) -> list[str]:
 
 
 def context_grid_text(screen: str) -> str:
-    # T-260709-80 (아니키 "이 네모부분이 %와 함께 나오면 좋겠어" + "이미지말고 텍스트로"):
+    # T-260709-80 (사용자 "이 네모부분이 %와 함께 나오면 좋겠어" + "이미지말고 텍스트로"):
     # /context 의 동전 매트릭스(좌측 차트 열)만 %헤더와 함께 텍스트로 재조립한다.
     # 우측 카테고리 범례(선두 글리프 1개짜리 줄)는 절단 — 매트릭스 행은 글리프 2개 이상.
     # 전송은 모노스페이스(pre entity) 전제 — 옛 T-260703-01 "raw 그리드 금지" 는
@@ -1085,7 +1370,7 @@ def append_context_rate_limit_footer(text: str, screen: str) -> str:
 
 
 def context_capture_lines() -> int:
-    # T-260710-03: MCP 도구·스킬 목록이 긴 노드(라이덴 실측)는 /context 그리드가
+    # T-260710-03: MCP 도구·스킬 목록이 긴 노드(작업 노드 실측)는 /context 그리드가
     # 마지막 120줄 캡처 밖으로 밀려나 raw 덤프 폴백이 나갔다 — history 를 넉넉히 뜬다.
     try:
         lines = int(os.environ.get("CLB_CONTEXT_CAPTURE_LINES", "400"))
@@ -1097,7 +1382,7 @@ def context_capture_lines() -> int:
 def extract_slash_command_block(screen: str, command_token: str) -> str:
     # T-260704-38 F6: 통째 pane 캡처에서 '❯ <명령>' 에코 ~ 다음 프롬프트 마커(❯) 사이
     # 블록만 남긴다 — 직전 대화와 입력창 아래 크롬(셸 프롬프트/스테이터스라인/힌트)이
-    # 미러에 섞이는 것을 차단 (아니키 라이덴·맥미니 스샷 실측, 2026-07-04). 에코가
+    # 미러에 섞이는 것을 차단 (사용자 작업 노드·macOS 노드 스샷 실측, 2026-07-04). 에코가
     # 화면에 없으면 빈 문자열 반환 → 호출측이 전체 화면 정리로 폴백한다.
     token = (command_token or "").strip().lower()
     if not token:
@@ -1461,17 +1746,71 @@ def _tool_detail(name: str, inp: Any) -> str:
     """Pick the most meaningful single-line descriptor from a tool_use input."""
     if not isinstance(inp, dict):
         return ""
-    for key in ("description", "file_path", "path", "command", "query", "url", "pattern", "prompt", "skill"):
+    for key in (
+        "description",
+        "file_path",
+        "path",
+        "command",
+        "query",
+        "url",
+        "pattern",
+        "prompt",
+        "skill",
+        "element",
+        "selector",
+        "text",
+    ):
         val = inp.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip().splitlines()[0][:120]
     return ""
 
 
+def flow_tool_short_name(name: str) -> str:
+    key = (name or "tool").strip()
+    if "__" in key:
+        key = key.rsplit("__", 1)[-1]
+    elif "." in key:
+        key = key.rsplit(".", 1)[-1]
+    return key or "tool"
+
+
 def tool_label(name: str) -> str:
-    """⚙️ flow mirror — Korean action label for a harness tool name; unmapped
-    tools keep their original name."""
-    return TOOL_LABEL_KO.get(name, name)
+    """Friendly action label; unknown vendor tools fall back to a short name."""
+    if name in TOOL_LABEL_KO:
+        return TOOL_LABEL_KO[name]
+    short = flow_tool_short_name(name)
+    lowered = short.lower()
+    if "click" in lowered or lowered in {"tap", "press"}:
+        return "🖱 클릭"
+    if "navigate" in lowered or lowered in {"goto", "open_url"}:
+        return "🔗 이동"
+    if lowered.startswith("browser_") or "browser" in lowered:
+        return "🌐 브라우저"
+    if "read" in lowered or lowered in {"cat", "open_file"}:
+        return "📄 읽기"
+    if any(token in lowered for token in ("edit", "patch", "write")):
+        return "🖊 편집"
+    if any(token in lowered for token in ("exec", "execute", "shell", "bash", "run_command")):
+        return "▶ 실행"
+    if "search" in lowered:
+        return "🌐 웹 검색"
+    return f"🔧 {short}"
+
+
+def flow_tool_detail(name: str, detail: str) -> str:
+    short = flow_tool_short_name(name).lower()
+    value = " ".join((detail or "").split())
+    if not value:
+        return ""
+    if "navigate" in short or short in {"goto", "open_url"}:
+        parsed = urllib.parse.urlparse(value if "://" in value else f"https://{value}")
+        return parsed.hostname or value
+    if "read" in short:
+        path = value.replace("\\", "/").rstrip("/")
+        if "/" in path:
+            return path.rsplit("/", 1)[-1]
+    return value
 
 
 def content_tool_summary(content: Any) -> str:
@@ -1485,21 +1824,118 @@ def content_tool_summary(content: Any) -> str:
         if not (isinstance(item, dict) and item.get("type") == "tool_use"):
             continue
         name = str(item.get("name") or "tool")
-        detail = _tool_detail(name, item.get("input"))
-        lines.append(f"• {tool_label(name)}{' · ' + detail if detail else ''}")
+        detail = flow_tool_detail(name, _tool_detail(name, item.get("input")))
+        lines.append(f"{tool_label(name)}{' · ' + detail if detail else ''}")
     return "\n".join(lines).strip()
 
 
-def format_flow_mirror(text: str) -> str:
-    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
-    return f"{FLOW_MIRROR_HEADER}\n{body}" if body else ""
+_FLOW_TASK_ID_RE = re.compile(r"\bT-\d{6}-\d+\b")
 
 
-def format_ambient_flow(text: str) -> str:
-    # ⚙️ ambient flow mirror (v0.1.5) — distinct "(노드 자율)" marker so the user can
-    # tell node-autonomous work apart from active-turn flow cards.
-    body = text.strip()[:FLOW_MIRROR_LIMIT].strip()
-    return f"{FLOW_MIRROR_HEADER} (노드 자율)\n{body}" if body else ""
+def flow_cap_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > 0:
+        cut = cut[:space]
+    return cut.rstrip() + "…"
+
+
+def flow_context_summary(text: str, limit: int = 40) -> str:
+    """Extract a stable, friendly one-line context for a live flow card."""
+    for raw in strip_node_emoji_header(text or "").splitlines():
+        line = " ".join(raw.strip().split())
+        if not line or line in {FLOW_MIRROR_HEADER, AMBIENT_DIRECTIVE_HEADER, SENT_DIRECTIVE_HEADER}:
+            continue
+        if re.match(r"^from=\S+\s*\|?\s*task=", line, re.IGNORECASE):
+            continue
+        if "→" in line and _FLOW_TASK_ID_RE.search(line):
+            continue
+        line = re.sub(r"^\[[^\]]+\]\s*", "", line)
+        if " — " in line and _FLOW_TASK_ID_RE.search(line.split(" — ", 1)[0]):
+            line = line.split(" — ", 1)[1]
+        line = re.sub(r"^T-\d{6}-\d+\s*(?:[—:|-]+\s*)?", "", line).strip()
+        line = re.sub(r"(?:진행해\s*줘|진행해\s*주세요|해\s*줘|해\s*주세요)[.!]?\s*$", "", line).strip()
+        if not line:
+            continue
+        return flow_cap_text(line, limit)
+    return "작업 진행"
+
+
+def flow_card_steps(text: str) -> tuple[list[str], str]:
+    """Group consecutive identical tool labels and return rendered lines/current step."""
+    groups: list[dict[str, Any]] = []
+    for raw in (text or "").strip().splitlines():
+        line = raw.strip()
+        if line.startswith("• "):
+            line = line[2:].strip()
+        if not line:
+            continue
+        label, separator, detail = line.partition(" · ")
+        label = label.strip()
+        detail = detail.strip() if separator else ""
+        if groups and groups[-1]["label"] == label:
+            groups[-1]["count"] += 1
+            if detail:
+                groups[-1]["detail"] = detail
+        else:
+            groups.append({"label": label, "detail": detail, "count": 1})
+    rendered: list[str] = []
+    for group in groups:
+        count = f" ×{group['count']}" if group["count"] > 1 else ""
+        detail = f" · {group['detail']}" if group["detail"] else ""
+        rendered.append(f"{group['label']}{count}{detail}")
+    current = str(groups[-1]["label"]) if groups else ""
+    return rendered, current
+
+
+def format_flow_mirror(
+    text: str,
+    *,
+    node: str = "",
+    emoji: str = "",
+    context: str = "",
+    now: datetime | None = None,
+    autonomous: bool = False,
+) -> str:
+    lines, current = flow_card_steps(text)
+    if not lines:
+        return ""
+    default_node, default_emoji = node_defaults()
+    node_token = node or default_node
+    label, mapped_emoji = node_label_emoji(node_token)
+    label = label or node_token or "작업 노드"
+    node_emoji = emoji or mapped_emoji or default_emoji
+    timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
+    header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
+    state = "노드 자율 진행중" if autonomous else "진행중"
+    footer = f"→ {state} · 현재: {current}"
+    available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
+    while len(lines) > 1 and len("\n".join(lines)) > available:
+        lines.pop(0)
+    body = "\n".join(lines)
+    if len(body) > available:
+        body = body[: max(1, available - 1)].rstrip() + "…"
+    return f"{header}\n\n{body}\n\n{footer}"
+
+
+def format_ambient_flow(
+    text: str,
+    *,
+    node: str = "",
+    emoji: str = "",
+    context: str = "",
+    now: datetime | None = None,
+) -> str:
+    return format_flow_mirror(
+        text,
+        node=node,
+        emoji=emoji,
+        context=context,
+        now=now,
+        autonomous=True,
+    )
 
 
 _AMBIENT_TREE_PREFIX_RE = re.compile(
@@ -1543,7 +1979,7 @@ def format_ambient_final(text: str) -> str:
 
 
 # ⚙️ 받은-지시 카드 gist 정제 (T-260630-33) — 보일러플레이트 라우팅 헤더를 gist 에서
-# 빼고, 라우트 헤더의 from=<host>·task= 메타를 "🍎 본진 → 🖥 · T-…" 한 줄로 만든다.
+# 빼고, 라우트 헤더의 from=<host>·task= 메타를 "🤖 제어 노드 → 🤖 · T-…" 한 줄로 만든다.
 _DIRECTIVE_BOILERPLATE_RE = re.compile(
     r"^\[(?:claude-skills HEAD|CLAUDE-REVIEW-ROUTE|NODE-ACK-)"
 )
@@ -1567,7 +2003,7 @@ _LOCAL_COMMAND_RE = re.compile(
 )
 # T-260709-79: /context 로컬 명령의 마크다운 요약 레코드는 <command-*> 태그 없이
 # "## Context Usage" 로 시작하는 별도 레코드로 도착해 위 게이트를 통과 → context-show
-# fire 마다 "⌨️ 터미널 입력 ## Context Usage **Model:**…" 잡음 1통 중복(아니키 실사고
+# fire 마다 "⌨️ 터미널 입력 ## Context Usage **Model:**…" 잡음 1통 중복(사용자 실사고
 # 2026-07-09, 정식 2통과 겹침). 문서 헤더 앵커라 본문 중간에 언급된 지시는 영향 0.
 _LOCAL_CONTEXT_SUMMARY_RE = re.compile(r"^\s*#{1,3}\s+Context Usage\b")
 
@@ -1645,7 +2081,7 @@ def _format_directive_card(
 ) -> str:
     # ⚙️ ambient flow mirror — node-originated work 의 트리거(받은 지시) 카드. 라우팅
     # 보일러플레이트 헤더([claude-skills HEAD]/[CLAUDE-REVIEW-ROUTE]/[NODE-ACK-]/발신수신
-    # dedup)를 gist 에서 빼고, 라우트 헤더의 from=<host>·task= 를 "🍎 본진 → 🖥 · T-…"
+    # dedup)를 gist 에서 빼고, 라우트 헤더의 from=<host>·task= 를 "🤖 제어 노드 → 🤖 · T-…"
     # 한 줄로 만든 뒤 남은 의미있는 1~2줄을 내용 gist 로 붙인다. 헤더밖에 없어 내용이
     # 비어도 from/task 줄만이라도 보여 누가-무슨 task 인지는 드러난다. (T-260630-33)
     #
@@ -1774,6 +2210,33 @@ def screen_has_approval_wait(screen: str) -> bool:
 
 def screen_has_hook_block(screen: str) -> bool:
     return bool(HOOK_BLOCK_RE.search(screen_status_region(screen)))
+
+
+def screen_has_feedback_survey(screen: str) -> bool:
+    """Match only the exact Claude session survey currently occupying the pane."""
+    region = strip_ansi_control(screen_status_region(screen))
+    lines = region.splitlines()
+    header_indexes = [
+        index
+        for index, line in enumerate(lines)
+        if line.strip().strip(PANEL_EDGE_CHARS).strip() in FEEDBACK_SURVEY_HEADERS
+    ]
+    if len(header_indexes) != 1:
+        return False
+    option_lines = [
+        line.strip().strip(PANEL_EDGE_CHARS).strip()
+        for line in lines[header_indexes[0] + 1 :]
+    ]
+    option_block = "\n".join(option_lines)
+    matches = list(FEEDBACK_SURVEY_CHOICE_RE.finditer(option_block))
+    if [(match.group(1), match.group(2)) for match in matches] != list(FEEDBACK_SURVEY_CHOICES):
+        return False
+    # A composer prompt below the card means the survey is stale scrollback.
+    for line in option_block[matches[-1].end() :].splitlines():
+        core = line.strip().strip("│").strip()
+        if core.startswith((">", "❯")):
+            return False
+    return True
 
 
 def screen_has_active_work(screen: str) -> bool:
@@ -2111,6 +2574,46 @@ class TelegramClient:
     def send_typing(self) -> None:
         self.call("sendChatAction", chat_id=self.chat_id, action="typing")
 
+    def send_activity_indicator(self, text: str, reply_to_message_id: int | None = None) -> int | None:
+        params: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
+        if reply_to_message_id:
+            params["reply_to_message_id"] = reply_to_message_id
+            params["allow_sending_without_reply"] = "true"
+        payload = self.call(
+            "sendMessage",
+            **params,
+        )
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            return int(result["message_id"])
+        return None
+
+    def edit_activity_indicator(self, message_id: int, text: str) -> bool:
+        payload = self.call(
+            "editMessageText",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=text,
+        )
+        return bool(payload and payload.get("ok"))
+
+    def delete_activity_indicator(self, message_id: int) -> bool:
+        payload = self.call(
+            "deleteMessage",
+            chat_id=self.chat_id,
+            message_id=message_id,
+        )
+        return bool(payload and payload.get("ok"))
+
+    def set_message_reaction(self, message_id: int, emoji: str) -> bool:
+        payload = self.call(
+            "setMessageReaction",
+            chat_id=self.chat_id,
+            message_id=message_id,
+            reaction=json.dumps([{"type": "emoji", "emoji": emoji}], ensure_ascii=False),
+        )
+        return bool(payload and payload.get("ok"))
+
     def download_file(
         self,
         file_id: str,
@@ -2135,7 +2638,7 @@ class TelegramClient:
         quoted_path = urllib.parse.quote(file_path, safe="/")
         request = urllib.request.Request(f"https://api.telegram.org/file/bot{self.token}/{quoted_path}")
         # T-260705-43: 단발 통짜 read()는 텔레그램 파일서버 지연 국면에
-        # 'The read operation timed out' 으로 그대로 실패(2026-07-05 본진+라이덴 크로스노드 재현).
+        # 'The read operation timed out' 으로 그대로 실패(2026-07-05 제어 노드+작업 노드 크로스노드 재현).
         # chunk read 는 소켓 타임아웃이 청크마다 갱신되고, transient 실패는 백오프 재시도.
         last_err: Exception | None = None
         # T-260705-56 (2): per-attempt 60s→30s — 최악 단일스레드 블록 ~3min → ~1.6min.
@@ -2244,21 +2747,27 @@ class TelegramClient:
             return [int(result["message_id"])]
         return []
 
-    def send_update_button(self, text: str, callback_data: str) -> None:
+    def send_update_button(
+        self,
+        text: str,
+        callback_data: str,
+        button_text: str = "\U0001f504 지금 업데이트",
+    ) -> None:
         reply_markup = json.dumps(
-            {"inline_keyboard": [[{"text": "\U0001f504 지금 업데이트", "callback_data": callback_data}]]},
+            {"inline_keyboard": [[{"text": button_text, "callback_data": callback_data}]]},
             ensure_ascii=False,
         )
         self.call("sendMessage", chat_id=self.chat_id, text=self.with_emoji_prefix(text), reply_markup=reply_markup)
 
-    def edit(self, message_id: int, text: str) -> None:
+    def edit(self, message_id: int, text: str) -> bool:
         # ⚙️ flow mirror edit-in-place — update one card instead of sending many.
-        self.call(
+        payload = self.call(
             "editMessageText",
             chat_id=self.chat_id,
             message_id=message_id,
             text=strip_bridge_nonce_markers(text) or "(empty response)",
         )
+        return bool(payload and payload.get("ok"))
 
 
 @dataclass(frozen=True)
@@ -2332,21 +2841,33 @@ class Config:
     send_max_attempts: int
     queue_compact_max_events: int
     outbox_max_entries: int
+    poll_heartbeat_file: Path | None = None
+    submit_retry_max_attempts: int = 3
     envelope_sidecar_flag_path: Path = ENVELOPE_SIDECAR_FLAG
     envelope_sidecar_off_flag_path: Path = ENVELOPE_SIDECAR_OFF_FLAG
     envelope_sidecar_path: Path = ENVELOPE_SIDECAR_PATH
     envelope_sidecar_ttl_seconds: float = DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS
     suggested_reply_bubble: bool = False
+    suggested_reply_confirmation_enabled: bool = True
+    suggested_loop_enabled: bool = False
+    suggested_loop_veto_seconds: int = 20
+    suggested_loop_max_iterations: int = 3
+    suggested_loop_max_seconds: int = 900
+    suggested_loop_max_cost_units: int = 100000
+    suggested_loop_kill_path: Path = Path("~/.claude/state/claude-suggested-loop.off").expanduser()
+    suggested_loop_ledger_path: Path = Path("~/.claude/state/claude-suggested-loop.jsonl").expanduser()
     transport_mode: str = "tmux"
     conpty_state_path: Path | None = None
     conpty_timeout_ms: int = 3000
     native_turn_stale_seconds: float = 120.0
+    activity_eyes_enabled: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
         default_node, default_emoji = node_defaults()
         node = env("CLB_NODE", default_node) or default_node
         state_dir = Path(env("CLB_STATE_DIR", "~/.local/state/claude-telegram-bridge") or "").expanduser()
+        chat_id = env("CLB_CHAT_ID", "") or ""
         default_name = f"claude-telegram-bridge-{node}"
         return cls(
             node=node,
@@ -2354,7 +2875,7 @@ class Config:
             token_file=Path(
                 env("CLB_TOKEN_FILE", "~/.config/claude-telegram-bridge/token.json") or ""
             ).expanduser(),
-            chat_id=env("CLB_CHAT_ID", "") or "",
+            chat_id=chat_id,
             state_dir=state_dir,
             tmux_bin=env("CLB_TMUX_BIN", "tmux") or "tmux",
             tmux_socket=env("CLB_TMUX_SOCKET", "default") or "default",
@@ -2399,6 +2920,10 @@ class Config:
             send_max_attempts=int_env("CLB_SEND_MAX_ATTEMPTS", 3, minimum=1),
             queue_compact_max_events=int_env("CLB_QUEUE_COMPACT_MAX_EVENTS", 5000, minimum=100),
             outbox_max_entries=int_env("CLB_OUTBOX_MAX_ENTRIES", 2000, minimum=100),
+            poll_heartbeat_file=Path(
+                env("CLB_POLL_HEARTBEAT_FILE", str(state_dir / f"{default_name}.poll-heartbeat")) or ""
+            ).expanduser(),
+            submit_retry_max_attempts=int_env("CLB_SUBMIT_RETRY_MAX_ATTEMPTS", 3, minimum=2),
             envelope_sidecar_flag_path=Path(
                 env("CLB_ENVELOPE_SIDECAR_FLAG", str(ENVELOPE_SIDECAR_FLAG)) or ""
             ).expanduser(),
@@ -2412,6 +2937,16 @@ class Config:
                 minimum=1.0,
             ),
             suggested_reply_bubble=bool_env("SUGGESTED_REPLY_BUBBLE", False),
+            suggested_reply_confirmation_enabled=bool_env("CLB_SUGGESTED_REPLY_EYES", True),
+            suggested_loop_enabled=bool_env("CLB_SUGGESTED_LOOP", False),
+            suggested_loop_veto_seconds=min(30, max(15, int_env("CLB_SUGGESTED_LOOP_VETO_SECONDS", 20))),
+            suggested_loop_max_iterations=int_env("CLB_SUGGESTED_LOOP_MAX_ITERATIONS", 3, minimum=1),
+            suggested_loop_max_seconds=int_env("CLB_SUGGESTED_LOOP_MAX_SECONDS", 900, minimum=1),
+            suggested_loop_max_cost_units=int_env("CLB_SUGGESTED_LOOP_MAX_COST_UNITS", 100000, minimum=1),
+            suggested_loop_kill_path=Path(env(
+                "CLB_SUGGESTED_LOOP_KILL", "~/.claude/state/claude-suggested-loop.off") or "").expanduser(),
+            suggested_loop_ledger_path=Path(env(
+                "CLB_SUGGESTED_LOOP_LEDGER", str(state_dir / f"{default_name}.suggested-loop.jsonl")) or "").expanduser(),
             transport_mode=(env("CLB_REPL_TRANSPORT", "tmux") or "tmux").strip().lower(),
             conpty_state_path=Path(
                 env("CLB_CONPTY_STATE_PATH", str(state_dir / "native-repl-host.json")) or ""
@@ -2422,6 +2957,7 @@ class Config:
                 120.0,
                 minimum=1.0,
             ),
+            activity_eyes_enabled=bool_env("CLB_ACTIVITY_EYES", True),
         )
 
     @property
@@ -2462,7 +2998,7 @@ class QueueItem:
     text: str
     nonce: str
     received_at: float = field(default_factory=time.time)
-    # T-260705-67: 아니키 발신 시각(Telegram message.date, epoch sec). 0.0 = unknown(레거시/미상).
+    # T-260705-67: 사용자 발신 시각(Telegram message.date, epoch sec). 0.0 = unknown(레거시/미상).
     # finish_active_turn 등이 QueueItem 을 위치인자 6개로 재구성하므로 기존 위치 필드 순서는 유지.
     sent_at: float = 0.0
     source: str = ""
@@ -2472,15 +3008,22 @@ class QueueItem:
     # 다음 drain 이 재-paste 하지 않도록(그리고 브릿지 재기동 후에도 재주입 안 하도록) durable
     # queue 레코드에 함께 실려 복원된다.
     busy_injected: bool = False
+    # T-260713-24: busy_injected 는 native paste 전 낙관적 재진입 가드다. 실제 paste가
+    # 성공해 더는 kill로 회수할 수 없는 시점은 별도 durable 플래그로 구분한다.
+    native_queue_attached: bool = False
     # T-260708-46: 다중 busy-inject 에서는 후속 pending 의 user JSONL nonce 가 active_turn
     # 승계 전에 먼저 보일 수 있다. 관측 정보를 pending item 에 보존해 promote 뒤 verify
     # timeout 으로 빠지지 않게 한다.
     user_uuid: str = ""
     user_seen_at: float = 0.0
     native_queue_seen_at: float = 0.0
-    # T-260709-70: 음성 전사 에코를 아니키 채팅에 1회만 보내는 멱등 플래그. durable 레코드에
+    # T-260709-70: 음성 전사 에코를 사용자 채팅에 1회만 보내는 멱등 플래그. durable 레코드에
     # 실려 브릿지 재기동 복원 후에도 중복 에코를 막는다.
     voice_echo_sent: bool = False
+    auto_origin: bool = False
+    loop_iteration: int = 0
+    loop_started_at: float = 0.0
+    loop_cost_units: int = 0
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -2498,6 +3041,8 @@ class QueueItem:
             payload["voice_reply_path"] = self.voice_reply_path
         if self.busy_injected:
             payload["busy_injected"] = True
+        if self.native_queue_attached:
+            payload["native_queue_attached"] = True
         if self.user_uuid:
             payload["user_uuid"] = self.user_uuid
             payload["user_seen_at"] = self.user_seen_at
@@ -2505,6 +3050,12 @@ class QueueItem:
             payload["native_queue_seen_at"] = self.native_queue_seen_at
         if self.voice_echo_sent:
             payload["voice_echo_sent"] = True
+        if self.auto_origin:
+            payload["auto_origin"] = True
+        if self.loop_iteration:
+            payload["loop_iteration"] = self.loop_iteration
+            payload["loop_started_at"] = self.loop_started_at
+            payload["loop_cost_units"] = self.loop_cost_units
         return payload
 
     @classmethod
@@ -2520,10 +3071,20 @@ class QueueItem:
             source=str(payload.get("source") or ""),
             voice_reply_path=str(payload.get("voice_reply_path") or ""),
             busy_injected=bool(payload.get("busy_injected")),
+            native_queue_attached=bool(
+                payload.get("native_queue_attached")
+                or float(payload.get("native_queue_seen_at") or 0.0) > 0
+                or payload.get("user_uuid")
+                or float(payload.get("user_seen_at") or 0.0) > 0
+            ),
             user_uuid=str(payload.get("user_uuid") or ""),
             user_seen_at=float(payload.get("user_seen_at") or 0.0),
             native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
             voice_echo_sent=bool(payload.get("voice_echo_sent")),
+            auto_origin=bool(payload.get("auto_origin")),
+            loop_iteration=int(payload.get("loop_iteration") or 0),
+            loop_started_at=float(payload.get("loop_started_at") or 0.0),
+            loop_cost_units=int(payload.get("loop_cost_units") or 0),
         )
 
 
@@ -2540,6 +3101,7 @@ class ActiveTurn:
     assistant_uuid: str | None = None
     external_reply_seen: bool = False
     inject_attempts: int = 1
+    submit_attempts: int = 1
     pending_answer: str | None = None
     pending_assistant_uuid: str | None = None
     pending_outbox_key: str | None = None
@@ -2550,12 +3112,17 @@ class ActiveTurn:
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
     flow_message_id: int = 0  # persisted across restart (anti-fragmentation): telegram message id of this turn's ⚙️ flow card (edit-in-place)
     flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
-    sent_at: float = 0.0  # T-260705-67: 아니키 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
+    sent_at: float = 0.0  # T-260705-67: 사용자 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
     source: str = ""
     voice_reply_path: str = ""
     busy_injected: bool = False
+    native_queue_attached: bool = False
     native_queue_seen_at: float = 0.0
     sidecar_consumed_at: float = 0.0
+    auto_origin: bool = False
+    loop_iteration: int = 0
+    loop_started_at: float = 0.0
+    loop_cost_units: int = 0
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -2571,6 +3138,7 @@ class ActiveTurn:
             "assistant_uuid": self.assistant_uuid,
             "external_reply_seen": self.external_reply_seen,
             "inject_attempts": self.inject_attempts,
+            "submit_attempts": self.submit_attempts,
             "pending_answer": self.pending_answer,
             "pending_assistant_uuid": self.pending_assistant_uuid,
             "pending_outbox_key": self.pending_outbox_key,
@@ -2583,10 +3151,18 @@ class ActiveTurn:
         }
         if self.busy_injected:
             payload["busy_injected"] = True
+        if self.native_queue_attached:
+            payload["native_queue_attached"] = True
         if self.native_queue_seen_at > 0:
             payload["native_queue_seen_at"] = self.native_queue_seen_at
         if self.sidecar_consumed_at > 0:
             payload["sidecar_consumed_at"] = self.sidecar_consumed_at
+        if self.auto_origin:
+            payload["auto_origin"] = True
+        if self.loop_iteration:
+            payload["loop_iteration"] = self.loop_iteration
+            payload["loop_started_at"] = self.loop_started_at
+            payload["loop_cost_units"] = self.loop_cost_units
         return payload
 
     @classmethod
@@ -2603,6 +3179,7 @@ class ActiveTurn:
             assistant_uuid=payload.get("assistant_uuid") if isinstance(payload.get("assistant_uuid"), str) else None,
             external_reply_seen=bool(payload.get("external_reply_seen")),
             inject_attempts=int(payload.get("inject_attempts") or 1),
+            submit_attempts=int(payload.get("submit_attempts") or 1),
             pending_answer=payload.get("pending_answer") if isinstance(payload.get("pending_answer"), str) else None,
             pending_assistant_uuid=(
                 payload.get("pending_assistant_uuid")
@@ -2620,9 +3197,34 @@ class ActiveTurn:
             source=str(payload.get("source") or ""),
             voice_reply_path=str(payload.get("voice_reply_path") or ""),
             busy_injected=bool(payload.get("busy_injected")),
+            native_queue_attached=bool(
+                payload.get("native_queue_attached")
+                or float(payload.get("native_queue_seen_at") or 0.0) > 0
+                or payload.get("user_uuid")
+                or float(payload.get("user_seen_at") or 0.0) > 0
+            ),
             native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
             sidecar_consumed_at=float(payload.get("sidecar_consumed_at") or 0.0),
+            auto_origin=bool(payload.get("auto_origin")),
+            loop_iteration=int(payload.get("loop_iteration") or 0),
+            loop_started_at=float(payload.get("loop_started_at") or 0.0),
+            loop_cost_units=int(payload.get("loop_cost_units") or 0),
         )
+
+
+@dataclass
+class SuggestedLoopCandidate:
+    candidate_id: str
+    reply: str
+    decision: str
+    reason: str
+    status: str
+    created_at: float
+    deadline: float
+    iteration: int
+    started_at: float
+    cost_units: int
+    control_message_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -2925,6 +3527,7 @@ class ClaudeConPtyTransport:
         self.host_pid = self._descriptor_pid(descriptor, "host_pid")
         self.child_pid = self._descriptor_pid(descriptor, "child_pid")
         self._requester = requester
+        self._request_lock = threading.Lock()
 
     @staticmethod
     def _descriptor_text(descriptor: dict[str, Any], key: str, minimum: int) -> str:
@@ -2975,13 +3578,31 @@ class ClaudeConPtyTransport:
         wait_named_pipe = ctypes.windll.kernel32.WaitNamedPipeW
         wait_named_pipe.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
         wait_named_pipe.restype = ctypes.c_int
-        if not wait_named_pipe(self.pipe_name, max(100, int(self.config.conpty_timeout_ms))):
-            raise NativeHostUnavailable("native host IPC is unavailable")
+        timeout_ms = max(100, int(self.config.conpty_timeout_ms))
+        deadline = time.monotonic() + (timeout_ms / 1000.0)
         encoded = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         if len(encoded) > CONPTY_MAX_FRAME_BYTES:
             raise RuntimeError("native host request is too large")
+        # The host creates one pipe instance per request. Immediately after a
+        # client closes, Windows can briefly expose the old instance before the
+        # server recreates it. Retry only connection establishment in that gap;
+        # never retry after a request write, which could duplicate a paste.
+        pipe = None
+        last_open_error: OSError | None = None
+        while pipe is None:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0:
+                raise NativeHostUnavailable("native host IPC is unavailable") from last_open_error
+            if not wait_named_pipe(self.pipe_name, remaining_ms):
+                time.sleep(0.01)
+                continue
+            try:
+                pipe = open(self.pipe_name, "r+b", buffering=0)
+            except OSError as exc:
+                last_open_error = exc
+                time.sleep(0.01)
         try:
-            with open(self.pipe_name, "r+b", buffering=0) as pipe:
+            with pipe:
                 pipe.write(encoded)
                 raw = pipe.readline(CONPTY_MAX_FRAME_BYTES + 1)
         except OSError as exc:
@@ -2997,35 +3618,39 @@ class ClaudeConPtyTransport:
         return response
 
     def _request(self, op: str, **params: Any) -> dict[str, Any]:
-        self._verify_pinned_generation()
-        request_id = secrets.token_hex(12)
-        request = {
-            "schema": CONPTY_DESCRIPTOR_SCHEMA,
-            "request_id": request_id,
-            "generation": self.generation,
-            "capability": self.capability,
-            "op": op,
-            **params,
-        }
-        try:
-            response = self._requester(request) if self._requester else self._pipe_request(request)
-        except NativeHostGenerationChanged:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            raise NativeHostUnavailable("native host IPC is unavailable") from exc
-        if not isinstance(response, dict):
-            raise RuntimeError("native host response is invalid")
-        if response.get("request_id") != request_id:
-            raise RuntimeError("native host response request mismatch")
-        response_generation = str(response.get("generation") or "")
-        if not secrets.compare_digest(response_generation, self.generation):
-            raise NativeHostGenerationChanged("native host generation changed")
-        if response.get("ok") is not True:
-            error = str(response.get("error") or "request_failed")
-            if error == "session_unbound":
-                raise NativeSessionUnbound("native host session is unbound")
-            raise RuntimeError(f"native host rejected request: {error}")
-        return response
+        # The host exposes one current-user named-pipe instance. Bridge worker
+        # threads (JSONL watcher, health probe, and queue drain) must not race
+        # each other for it and misclassify a busy pipe as a dead generation.
+        with self._request_lock:
+            self._verify_pinned_generation()
+            request_id = secrets.token_hex(12)
+            request = {
+                "schema": CONPTY_DESCRIPTOR_SCHEMA,
+                "request_id": request_id,
+                "generation": self.generation,
+                "capability": self.capability,
+                "op": op,
+                **params,
+            }
+            try:
+                response = self._requester(request) if self._requester else self._pipe_request(request)
+            except NativeHostGenerationChanged:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise NativeHostUnavailable("native host IPC is unavailable") from exc
+            if not isinstance(response, dict):
+                raise RuntimeError("native host response is invalid")
+            if response.get("request_id") != request_id:
+                raise RuntimeError("native host response request mismatch")
+            response_generation = str(response.get("generation") or "")
+            if not secrets.compare_digest(response_generation, self.generation):
+                raise NativeHostGenerationChanged("native host generation changed")
+            if response.get("ok") is not True:
+                error = str(response.get("error") or "request_failed")
+                if error == "session_unbound":
+                    raise NativeSessionUnbound("native host session is unbound")
+                raise RuntimeError(f"native host rejected request: {error}")
+            return response
 
     def verify(self) -> None:
         self._request("verify")
@@ -3209,6 +3834,7 @@ class SessionBinder:
     def __init__(self, config: Config, repl: ClaudeRepl) -> None:
         self.config = config
         self.repl = repl
+        self.resolution_source = ""
         # T-260705-05: busy 고착 유령 transcript 격리 (path str → quarantined_at).
         # 사이드카 스코어링이 mtime 최신 우선이라, 격리 없이 재해석하면 유령이
         # 매번 다시 이긴다. TTL 만료로 자연 복권 (in-memory, 재시작 시 초기화).
@@ -3230,6 +3856,55 @@ class SessionBinder:
         for key in expired:
             del self.quarantined[key]
         return str(Path(path).resolve()) in self.quarantined
+
+    def resolve_for_health_check(self) -> ClaudeSessionBinding:
+        """Prefer the bridge's durable binding before heuristic route probes."""
+
+        pane_pid = self.repl.pane_pid()
+        persisted = self._resolve_from_persisted_state(pane_pid)
+        if persisted is not None:
+            self.resolution_source = "persisted-state"
+            return persisted
+        return self.resolve()
+
+    def _resolve_from_persisted_state(self, pane_pid: int) -> ClaudeSessionBinding | None:
+        payload = read_json(self.config.state_path) or {}
+        binding = payload.get("binding")
+        if not isinstance(binding, dict):
+            return None
+        transcript_raw = str(binding.get("transcript_path") or "")
+        if not transcript_raw:
+            return None
+        try:
+            binding_pane_pid = int(binding.get("pane_pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        if binding_pane_pid != pane_pid:
+            return None
+        transcript = Path(transcript_raw).expanduser()
+        try:
+            resolved = transcript.resolve(strict=True)
+            stat = resolved.stat()
+        except OSError:
+            return None
+        session_path_raw = str(payload.get("session_path") or "")
+        if session_path_raw:
+            try:
+                if Path(session_path_raw).expanduser().resolve(strict=True) != resolved:
+                    return None
+            except OSError:
+                return None
+        for key, actual in (("dev", stat.st_dev), ("ino", stat.st_ino)):
+            try:
+                expected = int(payload.get(key) or 0)
+            except (TypeError, ValueError):
+                return None
+            if expected and expected != actual:
+                return None
+        session_id = str(binding.get("sessionId") or binding.get("session_id") or "")
+        if not session_id:
+            session_id = session_id_from_transcript(resolved)
+        return ClaudeSessionBinding(resolved, session_id, pane_pid)
 
     def resolve(self) -> ClaudeSessionBinding:
         pane_pid = self.repl.pane_pid()
@@ -3627,17 +4302,56 @@ def prompt_sha256(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
 
 
+@contextmanager
+def advisory_path_lock(
+    path: Path,
+    *,
+    shared: bool = False,
+    platform_name: str | None = None,
+    msvcrt_module=None,
+):
+    """Serialize sidecar access without requiring POSIX ``fcntl`` on Windows.
+
+    The lock byte lives in a sibling file so creating it never corrupts a JSONL
+    payload. Windows ``msvcrt`` has no shared-lock primitive, so readers take
+    the same blocking exclusive byte lock there; sidecar reads are short.
+    """
+
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    platform_name = os.name if platform_name is None else platform_name
+    with lock_path.open("a+b") as lock_handle:
+        if platform_name == "nt":
+            if msvcrt_module is None:
+                import msvcrt as msvcrt_module
+            lock_handle.seek(0, os.SEEK_END)
+            if lock_handle.tell() == 0:
+                lock_handle.write(b"\0")
+                lock_handle.flush()
+            lock_handle.seek(0)
+            msvcrt_module.locking(lock_handle.fileno(), msvcrt_module.LK_LOCK, 1)
+        else:
+            if fcntl is None:
+                raise RuntimeError("POSIX file locking is unavailable")
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if platform_name == "nt":
+                lock_handle.seek(0)
+                msvcrt_module.locking(lock_handle.fileno(), msvcrt_module.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
 def append_jsonl_locked(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+    with advisory_path_lock(path):
+        with path.open("a", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def read_envelope_sidecar_records(path: Path) -> list[dict[str, Any]]:
@@ -3645,9 +4359,8 @@ def read_envelope_sidecar_records(path: Path) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            try:
+        with advisory_path_lock(path, shared=True):
+            with path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     try:
                         record = json.loads(line)
@@ -3655,8 +4368,6 @@ def read_envelope_sidecar_records(path: Path) -> list[dict[str, Any]]:
                         continue
                     if isinstance(record, dict) and record.get("schema") == ENVELOPE_SIDECAR_SCHEMA:
                         records.append(record)
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except OSError:
         return []
     return records
@@ -3825,6 +4536,7 @@ class Bridge:
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
         self.typing_lock = threading.Lock()
+        self.poll_heartbeat_lock = threading.Lock()
         self.typing_stop: threading.Event | None = None
         self.session_binding: ClaudeSessionBinding | None = None
         self.session_identity: SessionIdentity | None = None
@@ -3849,6 +4561,7 @@ class Bridge:
         self.last_jsonl_read_at = 0.0
         self.last_jsonl_watch_error = ""
         self.last_jsonl_watch_error_log_at = 0.0
+        self.last_poll_heartbeat_at = 0.0
         # T-260705-56 (3): 미디어 다운로드 실패 auto-requeue 대기열 — queue_key → (update, 시도수, 재시도시각).
         # T-260709-50 M1: Telegram offset 은 enqueue_update 복귀 직후 전진하므로 메모리만
         # 쓰면 그 사이 재기동 시 update 가 영구 유실된다. durable queue 의 별도
@@ -3860,6 +4573,316 @@ class Bridge:
         self.stuck_alert_sent: set[str] = set()
         # T-260705-05: '기록파일 신선 + 화면 idle + pending 대기' 모순 시작 시각.
         self.busy_stuck_since = 0.0
+        # T-260707-15: 설문 카드가 key=0을 즉시 소비하지 못해도 같은 카드에
+        # 반복 입력하지 않는다. 카드가 사라진 것이 재확인되면 자동 리셋된다.
+        self.feedback_survey_dismiss_attempted = False
+        self.feedback_survey_resume_pending = False
+        self.suggested_candidates: dict[str, SuggestedLoopCandidate] = {}
+        self.suggested_loop_runtime_enabled = config.suggested_loop_enabled
+
+    def suggested_ledger(self, candidate: SuggestedLoopCandidate, status: str, **extra: Any) -> bool:
+        try:
+            append_jsonl(self.config.suggested_loop_ledger_path, {
+                "ts": time.time(),
+                "candidate_id": candidate.candidate_id,
+                "status": status,
+                "decision": candidate.decision,
+                "reason": candidate.reason,
+                "reply_sha256": hashlib.sha256(candidate.reply.encode("utf-8")).hexdigest(),
+                "iteration": candidate.iteration,
+                "started_at": candidate.started_at,
+                "cost_units": candidate.cost_units,
+                **extra,
+            })
+            return True
+        except OSError as exc:
+            log("SUGGEST", f"ledger unavailable; fail-safe HOLD: {exc}")
+            return False
+
+    def suggested_loop_cap_reason(self, *, iteration: int, started_at: float, cost_units: int) -> str:
+        if iteration > self.config.suggested_loop_max_iterations:
+            return "iteration_cap"
+        if time.time() - started_at >= self.config.suggested_loop_max_seconds:
+            return "time_cap"
+        if cost_units >= self.config.suggested_loop_max_cost_units:
+            return "cost_cap"
+        return ""
+
+    def claim_suggested(self, candidate: SuggestedLoopCandidate, expected: str, claimed: str) -> bool:
+        with self.lock:
+            if candidate.status != expected:
+                return False
+            candidate.status = claimed
+            return True
+
+    def register_suggested_reply(self, active: ActiveTurn, parsed: SuggestedReply, answer: str) -> None:
+        if not self.suggested_loop_runtime_enabled or not is_private_chat_id(self.config.chat_id) or self.config.suggested_loop_kill_path.exists() or not parsed.reply:
+            return
+        decision = classify_suggested_reply(parsed)
+        now = time.time()
+        iteration = active.loop_iteration + 1
+        started_at = active.loop_started_at or now
+        cost_units = active.loop_cost_units or max(1, math.ceil(len(answer) / 4))
+        cap_reason = self.suggested_loop_cap_reason(
+            iteration=iteration, started_at=started_at, cost_units=cost_units
+        )
+        if cap_reason:
+            decision = SuggestedDecision("hold", cap_reason)
+        status = "veto_pending" if decision.decision == "auto-ok" else "hold"
+        candidate = SuggestedLoopCandidate(
+            candidate_id=secrets.token_hex(6),
+            reply=parsed.reply,
+            decision=decision.decision,
+            reason=decision.reason,
+            status=status,
+            created_at=now,
+            deadline=now + self.config.suggested_loop_veto_seconds,
+            iteration=iteration,
+            started_at=started_at,
+            cost_units=cost_units,
+        )
+        with self.lock:
+            self.suggested_candidates[candidate.candidate_id] = candidate
+        if not self.suggested_ledger(candidate, status):
+            candidate.status = "hold"
+            candidate.decision = "hold"
+            candidate.reason = "ledger_unavailable"
+            status = "hold"
+        if status == "veto_pending":
+            text = f"⏳ 자동 진행중 · {self.config.suggested_loop_veto_seconds}초 취소창\n{candidate.reply}"
+            buttons = [[
+                {"text": "취소", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::cancel"},
+                {"text": "전체 OFF", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::kill"},
+            ]]
+        else:
+            text = f"🛑 HOLD · {candidate.reason}\n{candidate.reply}"
+            buttons = [[
+                {"text": "확인하고 실행", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::confirm"},
+                {"text": "전체 OFF", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::kill"},
+            ]]
+        try:
+            payload = self.telegram.call(
+                "sendMessage", chat_id=self.config.chat_id, text=text,
+                reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+            )
+        except Exception as exc:  # noqa: BLE001
+            candidate.status = "surface_failed"
+            self.suggested_ledger(candidate, "surface_failed", error=type(exc).__name__)
+            log("SUGGEST", f"control surface failed; auto canceled: {exc}")
+            return
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if isinstance(result, dict):
+            candidate.control_message_id = int(result.get("message_id") or 0)
+        if not candidate.control_message_id:
+            candidate.status = "surface_failed"
+            self.suggested_ledger(candidate, "surface_failed", error="missing_message_id")
+
+    def edit_suggested_status(self, candidate: SuggestedLoopCandidate, text: str) -> None:
+        if candidate.control_message_id:
+            self.telegram.call(
+                "editMessageText",
+                chat_id=self.config.chat_id,
+                message_id=candidate.control_message_id,
+                text=text,
+            )
+
+    def enqueue_suggested_candidate(self, candidate: SuggestedLoopCandidate, *, auto_origin: bool) -> None:
+        item = QueueItem(
+            queue_id=f"suggested:{candidate.candidate_id}",
+            update_id=-int(candidate.candidate_id, 16),
+            message_id=0,
+            text=candidate.reply,
+            nonce=bridge_nonce(),
+            received_at=time.time(),
+            source="suggested_reply_auto" if auto_origin else "suggested_reply_confirmed",
+            auto_origin=auto_origin,
+            loop_iteration=candidate.iteration,
+            loop_started_at=candidate.started_at,
+            loop_cost_units=candidate.cost_units,
+        )
+        self.queue.append_status(item, "received")
+        self.queue.append_status(item, "enqueued")
+        with self.lock:
+            self.pending.append(item)
+
+    @staticmethod
+    def native_queue_attached(item: QueueItem | ActiveTurn) -> bool:
+        return bool(
+            item.native_queue_attached
+            or item.native_queue_seen_at > 0
+            or bool(item.user_uuid)
+            or item.user_seen_at > 0
+        )
+
+    def suggested_auto_disabled_locked(self) -> bool:
+        return not self.suggested_loop_runtime_enabled or self.config.suggested_loop_kill_path.exists()
+
+    def drop_pending_suggested_auto(self, reason: str) -> int:
+        dropped: list[QueueItem] = []
+        with self.lock:
+            remaining: list[QueueItem] = []
+            for item in self.pending:
+                if item.auto_origin and not self.native_queue_attached(item):
+                    dropped.append(item)
+                else:
+                    remaining.append(item)
+            self.pending = remaining
+            if (
+                self.active_turn
+                and self.active_turn.auto_origin
+                and not self.native_queue_attached(self.active_turn)
+            ):
+                dropped.append(self.queue_item_for_active(self.active_turn))
+                self.active_turn = None
+            already_injected = sum(
+                1 for item in self.pending if item.auto_origin and self.native_queue_attached(item)
+            )
+            if (
+                self.active_turn
+                and self.active_turn.auto_origin
+                and self.native_queue_attached(self.active_turn)
+            ):
+                already_injected += 1
+        for item in dropped:
+            self.queue.append_status(item, "dropped", suggested_loop_kill=True, drop_reason=reason)
+        if dropped:
+            log("SUGGEST", f"kill dropped pending auto-origin count={len(dropped)} reason={reason}")
+            self.persist_state()
+            self.write_egress_sidecar()
+        if already_injected:
+            log("SUGGEST", f"kill cannot retract native-attached auto-origin count={already_injected}")
+        return len(dropped)
+
+    def paste_with_suggested_kill_guard(
+        self,
+        item: QueueItem,
+        paste_action: Callable[[], None],
+        *,
+        reason: str,
+        allow_untracked_auto: bool = False,
+    ) -> bool:
+        dropped = False
+        with self.lock:
+            pending_match = any(existing.queue_id == item.queue_id for existing in self.pending)
+            active_match = bool(self.active_turn and self.active_turn.queue_id == item.queue_id)
+            if item.auto_origin and not (pending_match or active_match or allow_untracked_auto):
+                # A concurrent kill already removed this optimistic item.
+                return False
+            if item.auto_origin and self.suggested_auto_disabled_locked():
+                self.pending = [existing for existing in self.pending if existing.queue_id != item.queue_id]
+                if active_match:
+                    self.active_turn = None
+                dropped = True
+            else:
+                # Hold the same bridge lock from the final kill/runtime recheck through
+                # native paste. Kill therefore either wins and drops before paste, or
+                # waits and observes native_queue_attached after a successful paste.
+                paste_action()
+                item.native_queue_attached = True
+                if active_match and self.active_turn:
+                    self.active_turn.native_queue_attached = True
+                for pending_item in self.pending:
+                    if pending_item.queue_id == item.queue_id:
+                        pending_item.native_queue_attached = True
+                        break
+        if dropped:
+            self.queue.append_status(item, "dropped", suggested_loop_kill=True, drop_reason=reason)
+            log("SUGGEST", f"pre-paste kill dropped auto-origin queue={item.queue_id}")
+            self.persist_state()
+            self.write_egress_sidecar()
+            return False
+        return True
+
+
+    def handle_suggested_callback(self, callback: dict[str, Any]) -> bool:
+        data = str(callback.get("data") or "")
+        if not data.startswith(f"{SUGGESTED_LOOP_CALLBACK}::"):
+            return False
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id")) != str(self.config.chat_id):
+            return True
+        parts = data.split("::")
+        with self.lock:
+            candidate = self.suggested_candidates.get(parts[1]) if len(parts) == 3 else None
+        action = parts[2] if len(parts) == 3 else ""
+        if not candidate:
+            self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text="만료된 요청입니다.")
+            return True
+        if action == "kill":
+            with self.lock:
+                self.suggested_loop_runtime_enabled = False
+                for pending_candidate in self.suggested_candidates.values():
+                    if pending_candidate.status in {"veto_pending", "hold", "dispatching", "auto_enqueued"}:
+                        pending_candidate.status = "killed"
+                candidate.status = "killed"
+            dropped_pending = self.drop_pending_suggested_auto("callback_kill")
+            try:
+                self.config.suggested_loop_kill_path.parent.mkdir(parents=True, exist_ok=True)
+                self.config.suggested_loop_kill_path.touch()
+            except OSError as exc:
+                self.suggested_ledger(candidate, "killed", kill_persisted=False, error=type(exc).__name__, dropped_pending=dropped_pending)
+                toast = "현재 루프는 OFF 했지만 kill 파일 기록에 실패했습니다."
+            else:
+                self.suggested_ledger(candidate, "killed", kill_persisted=True, dropped_pending=dropped_pending)
+                toast = "추천답변 자동 루프를 OFF 했습니다."
+        elif action == "cancel" and self.claim_suggested(candidate, "veto_pending", "vetoed"):
+            self.suggested_ledger(candidate, "vetoed")
+            toast = "자동 진행을 취소했습니다."
+        elif action == "confirm" and self.claim_suggested(candidate, "hold", "confirming"):
+            if self.suggested_ledger(candidate, "confirmed_enqueued", human_confirmed=True):
+                self.enqueue_suggested_candidate(candidate, auto_origin=False)
+                candidate.status = "confirmed_enqueued"
+                toast = "확인되어 큐에 넣었습니다."
+            else:
+                candidate.status = "hold"
+                toast = "장부 기록 실패로 HOLD를 유지합니다."
+        else:
+            toast = "이미 처리된 요청입니다."
+        self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text=toast)
+        if candidate.status != "veto_pending":
+            self.edit_suggested_status(candidate, f"{toast}\n{candidate.reply}")
+        return True
+
+    def service_suggested_loop_once(self) -> bool:
+        now = time.time()
+        with self.lock:
+            candidates = list(self.suggested_candidates.values())
+        if not self.suggested_loop_runtime_enabled or self.config.suggested_loop_kill_path.exists():
+            self.drop_pending_suggested_auto("kill_switch")
+            for candidate in candidates:
+                if candidate.status in {"veto_pending", "hold", "dispatching", "auto_enqueued"}:
+                    candidate.status = "killed"
+                    self.suggested_ledger(candidate, "killed")
+            return False
+        for candidate in candidates:
+            if candidate.status != "veto_pending" or now < candidate.deadline:
+                continue
+            if not self.claim_suggested(candidate, "veto_pending", "dispatching"):
+                continue
+            cap_reason = self.suggested_loop_cap_reason(
+                iteration=candidate.iteration,
+                started_at=candidate.started_at,
+                cost_units=candidate.cost_units,
+            )
+            if cap_reason:
+                candidate.status = "hold"
+                candidate.reason = cap_reason
+                candidate.decision = "hold"
+                self.suggested_ledger(candidate, "hold")
+                return False
+            if self.config.suggested_loop_kill_path.exists() or candidate.status != "dispatching":
+                return False
+            if not self.suggested_ledger(candidate, "auto_enqueued", auto_origin=True):
+                candidate.status = "hold"
+                candidate.reason = "ledger_unavailable"
+                candidate.decision = "hold"
+                return False
+            self.enqueue_suggested_candidate(candidate, auto_origin=True)
+            candidate.status = "auto_enqueued"
+            self.edit_suggested_status(candidate, f"▶ 자동 큐 투입\n{candidate.reply}")
+            return True
+        return False
 
     def acquire_lock(self) -> None:
         self.config.pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -3874,6 +4897,23 @@ class Bridge:
         self.pid_handle.write("\n")
         self.pid_handle.flush()
         os.fsync(self.pid_handle.fileno())
+
+    def record_poll_heartbeat(self, *, force: bool = False) -> None:
+        """Persist metadata-only proof that the Telegram poll loop is returning."""
+
+        path = self.config.poll_heartbeat_file
+        if not isinstance(path, Path):
+            return
+        now = time.time()
+        with self.poll_heartbeat_lock:
+            if not force and now - self.last_poll_heartbeat_at < 10.0:
+                return
+            try:
+                write_text_atomic(path, f"{int(now)}\n")
+            except OSError as exc:
+                log("TG", f"poll heartbeat write failed: {exc}")
+                return
+            self.last_poll_heartbeat_at = now
 
     def release_lock(self) -> None:
         handle = getattr(self, "pid_handle", None)
@@ -4097,8 +5137,10 @@ class Bridge:
 
     def start_typing_loop(self, max_seconds: int | None = None) -> threading.Event:
         stop_event = threading.Event()
+        activity_frames, activity_reply_to = self.eye_activity_context()
 
         def loop() -> None:
+            start_eye_activity_loop(self.telegram, stop_event, activity_frames, activity_reply_to)
             deadline = time.monotonic() + max_seconds if max_seconds else None
             pulse_count = 0
             try:
@@ -4133,12 +5175,27 @@ class Bridge:
                         break
                     stop_event.wait(wait_seconds)
             finally:
+                stop_event.set()
                 with self.typing_lock:
                     if self.typing_stop is stop_event:
                         self.typing_stop = None
 
         threading.Thread(target=loop, daemon=True, name="clb-typing").start()
         return stop_event
+
+    def eye_activity_context(self) -> tuple[list[str], int]:
+        surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        enabled = bool(getattr(self.config, "activity_eyes_enabled", False))
+        with self.lock:
+            item: QueueItem | ActiveTurn | None = self.active_turn
+            if item is None and self.pending:
+                item = self.pending[0]
+        if item is None:
+            return [], 0
+        suggested = item.source in {"suggested_reply_auto", "suggested_reply_confirmed"}
+        if not suggested:
+            return [], 0
+        return eye_activity_frames("추천작업 진행 중", enabled, surface), int(item.message_id or 0)
 
     def has_typing_tracked_work(self) -> bool:
         with self.lock:
@@ -4324,7 +5381,7 @@ class Bridge:
         This mirrors busy_state()'s transcript-mtime + pane heuristics MINUS the
         active_turn check, so check_injection_timeout can wait instead of falsely
         failing while the session is genuinely busy.
-        (2026-06-23 노트북, 아니키 ack: busy-aware delivery, 가역 패치.)
+        (2026-06-23 작업 노드, 사용자 ack: busy-aware delivery, 가역 패치.)
         """
         if not repl_supports_pane_features(self.repl):
             if not self.check_native_turn_health():
@@ -4710,10 +5767,62 @@ class Bridge:
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def location_coordinate(value: object, minimum: float, maximum: float) -> str:
+        if isinstance(value, bool):
+            return ""
+        try:
+            coordinate = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(coordinate) or not minimum <= coordinate <= maximum:
+            return ""
+        formatted = f"{coordinate:.8f}".rstrip("0").rstrip(".")
+        return "0" if formatted == "-0" else formatted
+
+    @staticmethod
+    def location_label(value: object, limit: int = 300) -> str:
+        if not isinstance(value, str):
+            return ""
+        return " ".join(sanitize_text(value, limit=limit).split())
+
+    def location_prompt_text(self, message: dict[str, Any]) -> str:
+        venue = message.get("venue") if isinstance(message.get("venue"), dict) else None
+        location = venue.get("location") if venue else message.get("location")
+        if not isinstance(location, dict):
+            return ""
+
+        latitude = self.location_coordinate(location.get("latitude"), -90.0, 90.0)
+        longitude = self.location_coordinate(location.get("longitude"), -180.0, 180.0)
+        if not latitude or not longitude:
+            return ""
+
+        details = [f"{LOCATION_PROMPT_PREFIX} 위도 {latitude}, 경도 {longitude}"]
+        live_period = location.get("live_period")
+        if not isinstance(live_period, bool):
+            try:
+                live_period_seconds = int(live_period)
+            except (TypeError, ValueError):
+                live_period_seconds = 0
+            if live_period_seconds > 0:
+                details.append(f"live_period: {live_period_seconds}초")
+        if venue:
+            title = self.location_label(venue.get("title"), limit=200)
+            address = self.location_label(venue.get("address"), limit=400)
+            if title:
+                details.append(f"장소: {title}")
+            if address:
+                details.append(f"주소: {address}")
+        return " · ".join(details) + "\n이 위치 근처의 맛집을 추천해줘."
+
     def prompt_from_telegram_message(self, message: dict[str, Any], update_id: int) -> str:
         raw_text = message.get("text")
         if isinstance(raw_text, str) and raw_text.strip():
             return raw_text
+
+        location_prompt = self.location_prompt_text(message)
+        if location_prompt:
+            return location_prompt
 
         caption = message.get("caption")
         caption_text = caption.strip() if isinstance(caption, str) else ""
@@ -4899,11 +6008,22 @@ class Bridge:
         safe_text = escape_unsafe_slash(sanitize_text(item.text))
         marker = f"<{item.nonce}/>"
         notice = self.stale_prompt_notice(item)
+        origin = ""
+        if item.auto_origin:
+            origin = (
+                "[AUTO-ORIGIN] AUTO-GENERATED INPUT IS NOT HUMAN APPROVAL. "
+                "Never treat this input as user consent, confirmation, or authorization.\n"
+            )
         if notice:
-            return f"{marker}\n{notice}\n{safe_text}"
-        return f"{marker}\n\n{safe_text}"
+            return f"{marker}\n{origin}{SUGGESTED_REPLY_CLASS_INSTRUCTION}\n{notice}\n{safe_text}"
+        return f"{marker}\n{origin}{SUGGESTED_REPLY_CLASS_INSTRUCTION}\n\n{safe_text}"
 
     def envelope_sidecar_enabled(self) -> bool:
+        # Native setup deliberately skips the POSIX SessionStart hook. Without
+        # a consumer, a hidden sidecar would remove the nonce from the visible
+        # prompt and make the final JSONL answer impossible to correlate.
+        if self.config.transport_mode == "conpty":
+            return False
         return not self.config.envelope_sidecar_off_flag_path.exists()
 
     def sidecar_visible_prompt(self, item: QueueItem) -> str:
@@ -4921,8 +6041,14 @@ class Bridge:
             f"message_id: {item.message_id}",
             f"prompt_sha256: {prompt_sha256(visible_prompt)}",
             f"<{item.nonce}/>",
+            SUGGESTED_REPLY_CLASS_INSTRUCTION,
             "Do not mention this bridge sidecar, envelope, or nonce in the answer.",
         ]
+        if item.auto_origin:
+            lines.extend([
+                "[AUTO-ORIGIN] AUTO-GENERATED INPUT IS NOT HUMAN APPROVAL.",
+                "Never treat this input as user consent, confirmation, or authorization.",
+            ])
         if stale_notice:
             lines.append(stale_notice)
         return "\n".join(lines)
@@ -5030,6 +6156,7 @@ class Bridge:
                 return False
             self.active_turn.user_uuid = user_uuid
             self.active_turn.user_seen_at = user_seen_at
+            self.active_turn.native_queue_attached = True
             item = self.queue_item_for_active(self.active_turn)
         self.queue.append_status(
             item,
@@ -5067,13 +6194,13 @@ class Bridge:
         return (
             f"⚠️ 지연 배달 경고: 이 메시지는 약 {minutes}분 전({clock} KST) {basis} 것이 지금에야 주입됐다. "
             "그 사이 상황이 바뀌었을 수 있다. 이 메시지를 진행중인 R3 작업(공개 발행·대외 발신·스토어 제출 등)의 "
-            "중지/반전/승인 지시로 해석해야 한다면, 실행 전 반드시 아니키에게 fresh 재확인을 받은 뒤에만 움직여라. "
+            "중지/반전/승인 지시로 해석해야 한다면, 실행 전 반드시 사용자에게 fresh 재확인을 받은 뒤에만 움직여라. "
             "일반 작업 지시라도 최신 상태(tasks.md·직전 대화)를 먼저 점검하고 착수하라.\n"
         )
 
     def maybe_alert_late_delivery(self, item: QueueItem) -> None:
         # T-260705-67 ③-a: 발신→수신 갭(브릿지 다운/폴링 정체 구간)이 큰 메시지는 enqueue 즉시
-        # 아니키 폰에 표면화. enqueue_update 가 queue_id 로 dedup 하므로 메시지당 최대 1회.
+        # 사용자 폰에 표면화. enqueue_update 가 queue_id 로 dedup 하므로 메시지당 최대 1회.
         try:
             threshold = float(os.environ.get("CLB_STALE_PROMPT_SEC", "300"))
         except ValueError:
@@ -5097,7 +6224,7 @@ class Bridge:
     def check_busy_stuck_rebind(self) -> None:
         # T-260705-05: 이중(유령) 세션 busy 고착 self-heal. 유령 세션이 bound
         # transcript 를 계속 갱신하면 busy_state 가 영구 "generating" 이라 인바운드
-        # 주입이 죽는다 (2026-07-05 01:0x 본진 실사고 — 아니키 수동 재기동으로 복구).
+        # 주입이 죽는다 (2026-07-05 01:0x 제어 노드 실사고 — 사용자 수동 재기동으로 복구).
         # '기록파일 신선 + 화면 idle + pending 대기 + active_turn 없음' 모순이
         # threshold(기본 300s) 연속 지속되면 해당 transcript 를 격리하고 바인딩을
         # 리셋한다 — 다음 ensure_session_binding 이 화면 세션으로 재바인딩.
@@ -5216,9 +6343,71 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("BUSY", f"stuck self-heal notice failed: {exc}")
 
+    def dismiss_feedback_survey_if_pending(self) -> str:
+        """Dismiss an exact Claude feedback card once, only for a waiting queue."""
+        if not repl_supports_pane_features(self.repl) or self.session_clear_pending():
+            return "not_applicable"
+        with self.lock:
+            if not self.pending:
+                self.feedback_survey_resume_pending = False
+                return "not_applicable"
+            if self.active_turn is not None:
+                return "not_applicable"
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            return "not_applicable"
+        if not screen_has_feedback_survey(screen):
+            was_attempted = self.feedback_survey_dismiss_attempted
+            self.feedback_survey_dismiss_attempted = False
+            if was_attempted:
+                self.feedback_survey_resume_pending = True
+            return "dismissed" if was_attempted else "absent"
+        if self.feedback_survey_dismiss_attempted:
+            return "blocking"
+
+        composer_lock = getattr(self.repl, "composer_lock", None)
+        submit = getattr(self.repl, "_submit_prompt_unlocked", None)
+        if not callable(composer_lock) or not callable(submit):
+            return "blocking"
+
+        # Claude's digit shortcut ignores input during its short mount guard.
+        # Wait, then recapture under the single-writer lock before sending key 0.
+        time.sleep(0.7)
+        try:
+            with composer_lock():
+                with self.lock:
+                    if not self.pending or self.active_turn is not None:
+                        return "not_applicable"
+                if self.feedback_survey_dismiss_attempted:
+                    return "blocking"
+                if not screen_has_feedback_survey(self.repl.capture_pane(80)):
+                    self.feedback_survey_dismiss_attempted = False
+                    return "absent"
+                submit("0")
+                self.feedback_survey_dismiss_attempted = True
+        except Exception as exc:  # noqa: BLE001
+            log("BUSY", f"Claude session feedback survey dismiss failed: {exc}")
+            return "blocking"
+
+        log("BUSY", "Claude session feedback survey dismiss key=0 sent for pending queue")
+        time.sleep(0.1)
+        try:
+            remains = screen_has_feedback_survey(self.repl.capture_pane(80))
+        except Exception:  # noqa: BLE001
+            return "blocking"
+        if remains:
+            return "blocking"
+        self.feedback_survey_dismiss_attempted = False
+        self.feedback_survey_resume_pending = True
+        return "dismissed"
+
     def check_queue_stuck_alert(self) -> None:
         # T-260705-67 ③-b: 수신→주입 정체(세션 busy/브릿지 내부 문제로 pending 이 안 빠지는 상태)
         # 표면화. telegram_loop 틱(기본 2s)마다 불리므로 queue_id 별 1회성 set 로 스팸 차단.
+        survey_state = self.dismiss_feedback_survey_if_pending()
+        if survey_state == "dismissed" or self.feedback_survey_resume_pending:
+            self.drain_queue()
         try:
             threshold = float(os.environ.get("CLB_QUEUE_STUCK_ALERT_SEC", "180"))
         except ValueError:
@@ -5368,6 +6557,10 @@ class Bridge:
             source=item.source,
             voice_reply_path=item.voice_reply_path,
             busy_injected=False,
+            auto_origin=item.auto_origin,
+            loop_iteration=item.loop_iteration,
+            loop_started_at=item.loop_started_at,
+            loop_cost_units=item.loop_cost_units,
         )
         self.queue.append_status(
             retry_item,
@@ -5401,6 +6594,10 @@ class Bridge:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         if str(chat.get("id")) != self.config.chat_id:
             return
+        has_location = isinstance(message.get("location"), dict) or isinstance(message.get("venue"), dict)
+        if has_location and not location_prompt_enabled():
+            self.telegram.send("위치 공유 처리가 꺼져 있습니다 (CLB_LOCATION_PROMPT=0).")
+            return
         update_id = int(update["update_id"])
         retry_key = message_update_key(update, self.token_hash)
         media_retry_completion = ""
@@ -5419,7 +6616,7 @@ class Bridge:
                 text = caption_text
             else:
                 # T-260705-56 (3): 재전송 요구 전에 1회 자동 재시도 — transient 다운로드
-                # 실패(타임아웃/중간끊김)에서 아니키 손(재전송) 빌리는 UX 제거 (원칙 1 손0).
+                # 실패(타임아웃/중간끊김)에서 사용자 손(재전송) 빌리는 UX 제거 (원칙 1 손0).
                 attempts = self.media_retry.get(retry_key, (None, 0, 0.0))[1]
                 if attempts < 1:
                     try:
@@ -5456,7 +6653,7 @@ class Bridge:
         message_id = int(message.get("message_id") or 0)
         queue_id = message_update_key(update, self.token_hash)
         nonce = bridge_nonce()
-        # T-260705-67: Telegram message.date = 아니키 발신 시각(epoch sec). 사고(1895s 발신→수신 갭)의
+        # T-260705-67: Telegram message.date = 사용자 발신 시각(epoch sec). 사고(1895s 발신→수신 갭)의
         # 원인 이분(발신→수신 vs 수신→주입)을 durable queue 에 남기는 계측 기반.
         try:
             sent_at = float(message.get("date") or 0.0)
@@ -5567,7 +6764,7 @@ class Bridge:
                     screen = self.repl.capture_pane(context_capture_lines(), ansi=capture_ansi)
             if screen_has_active_work(screen):
                 # T-260704-38 F6-c: 세션이 긴 턴 작업 중이라 타임아웃 — 작업중 프레임
-                # 덤프(라이덴 'Frolicking...' 케이스) 대신 1줄 안내만 보낸다.
+                # 덤프(작업 노드 'Frolicking...' 케이스) 대신 1줄 안내만 보낸다.
                 self.telegram.send(
                     f"⏳ claude 세션이 다른 작업을 실행 중이라 {command_token} 화면을 못 잡았어요 — 유휴 때 다시 시도해주세요."
                 )
@@ -5586,7 +6783,7 @@ class Bridge:
             source = extract_slash_command_block(screen, command_token) or screen
             if command_token == CONTEXT_SLASH_COMMAND:
                 # T-260709-80: 이미지(render_ansi_png+sendPhoto) → 동전 매트릭스+% 텍스트(mono).
-                # 아니키 2026-07-09 23:30 "이미지말고 텍스트로" + "이 네모부분이 %와 함께".
+                # 사용자 2026-07-09 23:30 "이미지말고 텍스트로" + "이 네모부분이 %와 함께".
                 reply_to = item.message_id if item.message_id > 0 else None
                 answer = context_grid_text(source or screen)
                 if answer:
@@ -5951,6 +7148,52 @@ class Bridge:
         for _ in range(passes):
             self.repl._clear_composer_unlocked(interrupt=False)
 
+    def paste_idle_item(
+        self,
+        item: QueueItem,
+        prompt: str,
+        *,
+        allow_untracked_auto: bool = False,
+    ) -> bool:
+        if not item.auto_origin:
+            replace_prompt = getattr(self.repl, "replace_prompt", None)
+            if callable(replace_prompt):
+                replace_prompt(prompt)
+            else:
+                for _ in range(self.config.composer_clear_retries):
+                    self.repl.clear_composer()
+                self.repl.paste_prompt(prompt)
+            return True
+        composer_lock = getattr(self.repl, "composer_lock", None)
+        clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
+        paste_unlocked = getattr(self.repl, "_paste_prompt_unlocked", None)
+        if all(callable(method) for method in (composer_lock, clear_unlocked, paste_unlocked)):
+            with composer_lock():
+                for _ in range(self.config.composer_clear_retries):
+                    clear_unlocked()
+                return self.paste_with_suggested_kill_guard(
+                    item,
+                    lambda: paste_unlocked(prompt),
+                    reason="idle_pre_paste_guard",
+                    allow_untracked_auto=allow_untracked_auto,
+                )
+        replace_prompt = getattr(self.repl, "replace_prompt", None)
+        if callable(replace_prompt):
+            return self.paste_with_suggested_kill_guard(
+                item,
+                lambda: replace_prompt(prompt),
+                reason="idle_pre_paste_guard",
+                allow_untracked_auto=allow_untracked_auto,
+            )
+        for _ in range(self.config.composer_clear_retries):
+            self.repl.clear_composer()
+        return self.paste_with_suggested_kill_guard(
+            item,
+            lambda: self.repl.paste_prompt(prompt),
+            reason="idle_pre_paste_guard",
+            allow_untracked_auto=allow_untracked_auto,
+        )
+
     def try_busy_inject(self) -> bool:
         # T-260707-36: generating 중 Escape 없는 native 큐잉 주입. 주입하면 True,
         # 대기로 넘기면 False(호출부가 기존 대기 경로로). 슬래시 명령은 프리즈 가드(idle
@@ -5979,6 +7222,9 @@ class Bridge:
                     # 이미 native 큐잉됨 — 재-paste 금지(멱등성). 뒤 텍스트는 같은 native
                     # 큐 뒤에 추가 제출할 수 있다.
                     continue
+                if candidate.auto_origin and self.suggested_auto_disabled_locked():
+                    self.drop_pending_suggested_auto("busy_dequeue_guard")
+                    return True
                 stripped_text = (candidate.text or "").strip()
                 escape_slash = stripped_text.startswith(SLASH_ESCAPE_PREFIX) and bool(
                     slash_token(stripped_text[len(SLASH_ESCAPE_PREFIX):].lstrip())
@@ -6020,9 +7266,14 @@ class Bridge:
                     source=item.source,
                     voice_reply_path=item.voice_reply_path,
                     busy_injected=True,
+                    native_queue_attached=item.native_queue_attached,
                     user_uuid=item.user_uuid or None,
                     user_seen_at=item.user_seen_at,
                     native_queue_seen_at=item.native_queue_seen_at,
+                    auto_origin=item.auto_origin,
+                    loop_iteration=item.loop_iteration,
+                    loop_started_at=item.loop_started_at,
+                    loop_cost_units=item.loop_cost_units,
                 )
                 self.reset_ambient_flow()
             # else: A 가 진행 중 — active_turn(A) 를 덮지 않는다. B 는 pending 에 남아
@@ -6035,7 +7286,12 @@ class Bridge:
             # 원자적으로(단일쓰기) 수행 — 진행 중 slash 핸들러/idle 주입과의 경합 차단.
             with self.repl.composer_lock():
                 self.busy_inject_guarded_clear()
-                self.repl._paste_prompt_unlocked(prompt, submit_key=busy_submit_key())
+                if not self.paste_with_suggested_kill_guard(
+                    item,
+                    lambda: self.repl._paste_prompt_unlocked(prompt, submit_key=busy_submit_key()),
+                    reason="busy_pre_paste_guard",
+                ):
+                    return True
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"busy-inject failed: {exc}")
             with self.lock:
@@ -6074,8 +7330,13 @@ class Bridge:
         return True
 
     def drain_queue(self) -> None:
+        if not self.suggested_loop_runtime_enabled or self.config.suggested_loop_kill_path.exists():
+            self.drop_pending_suggested_auto("drain_guard")
         if self.session_clear_pending():
             log("BUSY", "skip inject state=clearing")
+            return
+        if self.dismiss_feedback_survey_if_pending() == "blocking":
+            self.ensure_typing()
             return
         state = self.busy_state()
         if state != "idle":
@@ -6092,15 +7353,19 @@ class Bridge:
                 return
             # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
             # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
-            # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 아니키 "백그라운드 작업일 때도
+            # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 사용자 "백그라운드 작업일 때도
             # 타이핑"). active typing 루프(begin_typing)가 이미 돌면 중복 안 쏨.
             self.ensure_typing()
             log("BUSY", f"skip inject state={state}")
             return
+        self.feedback_survey_resume_pending = False
         promoted_busy_injected = False
         busy_inject_demoted = False
         with self.lock:
             if self.active_turn or not self.pending:
+                return
+            if self.pending[0].auto_origin and self.suggested_auto_disabled_locked():
+                self.drop_pending_suggested_auto("idle_dequeue_guard")
                 return
             item = self.pending.pop(0)
             stripped_text = (item.text or "").strip()
@@ -6122,9 +7387,14 @@ class Bridge:
                     source=item.source,
                     voice_reply_path=item.voice_reply_path,
                     busy_injected=item.busy_injected,
+                    native_queue_attached=item.native_queue_attached,
                     user_uuid=item.user_uuid or None,
                     user_seen_at=item.user_seen_at,
                     native_queue_seen_at=item.native_queue_seen_at,
+                    auto_origin=item.auto_origin,
+                    loop_iteration=item.loop_iteration,
+                    loop_started_at=item.loop_started_at,
+                    loop_cost_units=item.loop_cost_units,
                 )
                 # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset.
                 self.reset_ambient_flow()
@@ -6149,7 +7419,9 @@ class Bridge:
                     or item.user_seen_at > 0
                 ):
                     item.busy_injected = False
+                    item.native_queue_attached = False
                     self.active_turn.busy_injected = False
+                    self.active_turn.native_queue_attached = False
                     busy_inject_demoted = True
                 promoted_busy_injected = item.busy_injected
         if busy_inject_demoted:
@@ -6199,15 +7471,14 @@ class Bridge:
                     self.persist_state()
                     self.write_egress_sidecar()
                     return
-                # T-260710-80 (아니키 지시 2026-07-10): 그 외 슬래시는 codex 브릿지와
+                # T-260710-80 (사용자 지시 2026-07-10): 그 외 슬래시는 codex 브릿지와
                 # 동형으로 원문 통과. 옛 fail-safe(allowlist 밖 차단)는 /effort 등 신규
                 # 명령까지 막아 폐기 — 인터랙티브 선택창 프리즈 위험은 /model 인터셉트
                 # (T-260703-17)와 watchdog 자가복구가 담당한다.
             prompt = escape_unsafe_slash(sanitize_text(inject_text))
             try:
-                for _ in range(self.config.composer_clear_retries):
-                    self.repl.clear_composer()
-                self.repl.paste_prompt(prompt)
+                if not self.paste_idle_item(item, prompt, allow_untracked_auto=True):
+                    return
             except Exception as exc:  # noqa: BLE001
                 log("INJECT", f"slash failed: {exc}")
                 self.mark_directive_terminal(item, "failed", error=str(exc), slash_command=command_token)
@@ -6232,13 +7503,8 @@ class Bridge:
         self.write_egress_sidecar()
         prompt = self.prompt_for_item(item)
         try:
-            replace_prompt = getattr(self.repl, "replace_prompt", None)
-            if callable(replace_prompt):
-                replace_prompt(prompt)
-            else:
-                for _ in range(self.config.composer_clear_retries):
-                    self.repl.clear_composer()
-                self.repl.paste_prompt(prompt)
+            if not self.paste_idle_item(item, prompt):
+                return
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"failed: {exc}")
             with self.lock:
@@ -6260,8 +7526,8 @@ class Bridge:
         log("INJECT", f"nonce={item.nonce} update={item.update_id}")
 
     def maybe_echo_voice_question(self, item: "QueueItem") -> None:
-        # T-260709-70: 자비스가 들은 음성 전사를 아니키 채팅방에 미러 — 인식 오류를
-        # 아니키가 즉시 볼 수 있게 한다. 에코 실패는 주입을 막지 않는다(best effort).
+        # T-260709-70: 자비스가 들은 음성 전사를 사용자 채팅방에 미러 — 인식 오류를
+        # 사용자가 즉시 볼 수 있게 한다. 에코 실패는 주입을 막지 않는다(best effort).
         if item.source != "voice" or item.voice_echo_sent:
             return
         question = voice_question_from_prompt(item.text)
@@ -6312,7 +7578,7 @@ class Bridge:
         if not residual:
             return False
         item = self.queue_item_for_active(active)
-        if active.inject_attempts >= 2:
+        if active.submit_attempts >= self.config.submit_retry_max_attempts:
             self.fail_active_submit_confirmation(
                 active,
                 item,
@@ -6328,9 +7594,9 @@ class Bridge:
         with self.lock:
             if self.active_turn is not active:
                 return True
-            active.inject_attempts += 1
+            active.submit_attempts += 1
             active.injected_at = time.time()
-            attempt = active.inject_attempts
+            attempt = active.submit_attempts
         self.queue.append_status(
             item,
             "submit_retry",
@@ -6418,6 +7684,24 @@ class Bridge:
         if time.time() - active.injected_at < self.config.injection_verify_timeout:
             return
 
+        # An idle-path inject can race a prior Claude turn whose pane/transcript
+        # briefly looked idle. While that prior turn is still active, text in the
+        # composer is a queued draft: pressing Enter again or clear/pasting it can
+        # duplicate or erase the directive. Wait before any residual handling.
+        if not active.busy_injected and self.session_occupied_excluding_active():
+            with self.lock:
+                if self.active_turn and self.active_turn.queue_id == active.queue_id:
+                    self.active_turn.injected_at = time.time()
+            return
+
+        # Claude Code emits queue-operation/enqueue as soon as it owns the
+        # prompt, before a JSONL user record exists. That record is positive
+        # submit confirmation, so a visible queued composer line must not be
+        # retried or failed while it waits for the preceding turn to finish.
+        if not active.busy_injected and active.native_queue_seen_at > 0:
+            log("INJECT", f"nonce {active.nonce} confirmed in native queue; awaiting user record")
+            return
+
         if self.retry_active_submit_if_composer_residual(active):
             return
 
@@ -6452,7 +7736,7 @@ class Bridge:
         # is free; clearing it here loses the user's message and shows a false
         # "delivery failed". Extend the grace window so only idle time counts
         # toward the timeout, and re-check next tick.
-        # (2026-06-23 노트북, 아니키 ack — busy 중 가짜 통신끊김 경보 차단.)
+        # (2026-06-23 작업 노드, 사용자 ack — busy 중 가짜 통신끊김 경보 차단.)
         if self.session_occupied_excluding_active():
             with self.lock:
                 if self.active_turn and self.active_turn.queue_id == active.queue_id:
@@ -6476,9 +7760,14 @@ class Bridge:
             source=active.source,
             voice_reply_path=active.voice_reply_path,
             busy_injected=active.busy_injected,
+            native_queue_attached=active.native_queue_attached,
             user_uuid=active.user_uuid or "",
             user_seen_at=active.user_seen_at,
             native_queue_seen_at=active.native_queue_seen_at,
+            auto_origin=active.auto_origin,
+            loop_iteration=active.loop_iteration,
+            loop_started_at=active.loop_started_at,
+            loop_cost_units=active.loop_cost_units,
         )
         if active.inject_attempts >= 2:
             log("INJECT", f"nonce {active.nonce} not observed in JSONL after retry")
@@ -6593,9 +7882,14 @@ class Bridge:
             source=active.source,
             voice_reply_path=active.voice_reply_path,
             busy_injected=active.busy_injected,
+            native_queue_attached=active.native_queue_attached,
             user_uuid=active.user_uuid or "",
             user_seen_at=active.user_seen_at,
             native_queue_seen_at=active.native_queue_seen_at,
+            auto_origin=active.auto_origin,
+            loop_iteration=active.loop_iteration,
+            loop_started_at=active.loop_started_at,
+            loop_cost_units=active.loop_cost_units,
         )
 
     def mark_pending_user_nonce_seen(self, nonce: str, record: dict[str, Any]) -> bool:
@@ -6609,6 +7903,7 @@ class Bridge:
                 if item.busy_injected and item.nonce == nonce:
                     item.user_uuid = user_uuid
                     item.user_seen_at = user_seen_at
+                    item.native_queue_attached = True
                     matched = item
                     break
         if not matched:
@@ -6638,12 +7933,14 @@ class Bridge:
             if self.active_turn and self.active_turn.nonce == nonce:
                 self.active_turn.user_uuid = user_uuid
                 self.active_turn.user_seen_at = user_seen_at
+                self.active_turn.native_queue_attached = True
                 active_item = self.queue_item_for_active(self.active_turn)
             else:
                 for item in self.pending:
                     if item.busy_injected and item.nonce == nonce:
                         item.user_uuid = user_uuid
                         item.user_seen_at = user_seen_at
+                        item.native_queue_attached = True
                         pending_item = item
                         break
         if active_item:
@@ -6678,13 +7975,23 @@ class Bridge:
         if not isinstance(content, str):
             return False
         match = NONCE_RE.search(content)
-        if not match:
-            return False
         timestamp = str(record.get("timestamp") or "")
         if not timestamp:
             return False
-        nonce = match.group(0)
         seen_at = record_timestamp_seconds(record) or time.time()
+        nonce = match.group(0) if match else ""
+        if not nonce:
+            # Sidecar mode deliberately keeps the nonce out of the visible
+            # prompt, so queue-operation content only contains the Telegram
+            # body. Correlate that fresh, exact body with the active turn.
+            with self.lock:
+                active = self.active_turn
+            if active and seen_at + 2.0 >= active.injected_at:
+                expected = self.sidecar_visible_prompt(self.queue_item_for_active(active))
+                if prompt_sha256(content) == prompt_sha256(expected):
+                    nonce = active.nonce
+        if not nonce:
+            return False
         active_item: QueueItem | None = None
         matched_item: QueueItem | None = None
         with self.lock:
@@ -6695,15 +8002,22 @@ class Bridge:
                 )
             if self.active_turn and self.active_turn.nonce == nonce:
                 self.active_turn.native_queue_seen_at = seen_at
+                self.active_turn.native_queue_attached = True
                 active_item = self.queue_item_for_active(self.active_turn)
             else:
                 for item in self.pending:
                     if item.busy_injected and item.nonce == nonce:
                         item.native_queue_seen_at = seen_at
+                        item.native_queue_attached = True
                         matched_item = item
                         break
         if active_item:
-            self.queue.append_status(active_item, "injected", busy_inject=True, native_queue_seen=True)
+            self.queue.append_status(
+                active_item,
+                "injected",
+                busy_inject=active_item.busy_injected,
+                native_queue_seen=True,
+            )
         elif matched_item:
             self.queue.append_status(matched_item, "enqueued", busy_inject=True, native_queue_seen=True)
         if active_item or matched_item:
@@ -6728,6 +8042,7 @@ class Bridge:
             if self.active_turn and self.active_turn.nonce == nonce:
                 self.active_turn.user_uuid = user_uuid
                 self.active_turn.user_seen_at = user_seen_at
+                self.active_turn.native_queue_attached = True
                 if self.active_turn.native_queue_seen_at <= 0:
                     self.active_turn.native_queue_seen_at = user_seen_at
                 active_item = self.queue_item_for_active(self.active_turn)
@@ -6736,6 +8051,7 @@ class Bridge:
                     if item.busy_injected and item.nonce == nonce:
                         item.user_uuid = user_uuid
                         item.user_seen_at = user_seen_at
+                        item.native_queue_attached = True
                         if item.native_queue_seen_at <= 0:
                             item.native_queue_seen_at = user_seen_at
                         pending_item = item
@@ -6854,6 +8170,7 @@ class Bridge:
     ) -> None:
         send_error = "telegram send failed"
         surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        parsed_suggested = parse_suggested_reply(answer)
         answer_messages = suggested_reply_messages(
             answer,
             self.config.suggested_reply_bubble,
@@ -6938,6 +8255,14 @@ class Bridge:
                 log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
             else:
                 sent_ids.extend(bubble_ids)
+                apply_suggested_reply_confirmation(
+                    self.telegram,
+                    bubble_ids,
+                    surface,
+                    getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                    "telegram" if active.message_id > 0 else "node",
+                )
+        self.register_suggested_reply(active, parsed_suggested, answer)
         self.outbox.mark_sent(key, sent_ids)
         try:
             write_voice_answer(active, assistant_uuid=assistant_uuid, answer=delivered_answer)
@@ -7002,6 +8327,7 @@ class Bridge:
             if nonce and self.active_turn and nonce == self.active_turn.nonce:
                 self.active_turn.user_uuid = str(record.get("uuid") or "")
                 self.active_turn.user_seen_at = record_timestamp_seconds(record) or time.time()
+                self.active_turn.native_queue_attached = True
                 self.queue.append_status(
                     self.queue_item_for_active(self.active_turn),
                     "user_jsonl_seen",
@@ -7062,7 +8388,7 @@ class Bridge:
         # Accumulate thinking across the whole turn. This Claude Code version emits
         # thinking in SEPARATE non-end_turn assistant messages, so the final
         # end_turn message content is text-only — reading thinking only there always
-        # misses it. (fc8024b 후속 fix, 2026-06-23 노트북 카나리 SPLIT 판정 근거.)
+        # misses it. (fc8024b 후속 fix, 2026-06-23 작업 노드 카나리 SPLIT 판정 근거.)
         stop_reason = message.get("stop_reason")
         turn_thinking = content_thinking(content)
         if turn_thinking:
@@ -7084,7 +8410,14 @@ class Bridge:
                         # first card of the turn, or overflow -> start a fresh card
                         active.flow_body = summary
                         try:
-                            ids = self.telegram.send(format_flow_mirror(active.flow_body))
+                            ids = self.telegram.send(
+                                format_flow_mirror(
+                                    active.flow_body,
+                                    node=self.config.node,
+                                    emoji=self.config.emoji,
+                                    context=active.text,
+                                )
+                            )
                             active.flow_message_id = ids[0] if ids else 0
                             log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                         except Exception as exc:  # noqa: BLE001
@@ -7093,7 +8426,15 @@ class Bridge:
                         # same turn -> grow the existing card in place
                         active.flow_body = candidate
                         try:
-                            self.telegram.edit(active.flow_message_id, format_flow_mirror(active.flow_body))
+                            self.telegram.edit(
+                                active.flow_message_id,
+                                format_flow_mirror(
+                                    active.flow_body,
+                                    node=self.config.node,
+                                    emoji=self.config.emoji,
+                                    context=active.text,
+                                ),
+                            )
                             log("SEND", f"edited flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                         except Exception as exc:  # noqa: BLE001
                             log("SEND", f"flow mirror edit failed (non-fatal): {exc}")
@@ -7109,6 +8450,12 @@ class Bridge:
             self.finish_active_turn("answered", active)
             return
         assistant_uuid = str(record.get("uuid") or "")
+        usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+        usage_units = sum(
+            int(value) for key, value in usage.items()
+            if key.endswith("_tokens") and isinstance(value, (int, float)) and value > 0
+        )
+        active.loop_cost_units += usage_units or max(1, math.ceil(len(answer) / 4))
         reasoning = active.accumulated_reasoning or content_thinking(content)
         active.pending_reasoning = sanitize_text(reasoning, limit=REASONING_MIRROR_LIMIT) or None
         self.send_active_answer(active, assistant_uuid, answer)
@@ -7133,7 +8480,14 @@ class Bridge:
             # first card of this ambient bout, or overflow -> start a fresh card
             self.ambient_flow_body = summary
             try:
-                ids = self.telegram.send(format_ambient_flow(self.ambient_flow_body))
+                ids = self.telegram.send(
+                    format_ambient_flow(
+                        self.ambient_flow_body,
+                        node=self.config.node,
+                        emoji=self.config.emoji,
+                        context=self.ambient_directive_body,
+                    )
+                )
                 self.ambient_flow_message_id = ids[0] if ids else 0
                 log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
             except Exception as exc:  # noqa: BLE001
@@ -7142,7 +8496,15 @@ class Bridge:
             # same ambient bout -> grow the existing card in place
             self.ambient_flow_body = candidate
             try:
-                self.telegram.edit(self.ambient_flow_message_id, format_ambient_flow(self.ambient_flow_body))
+                self.telegram.edit(
+                    self.ambient_flow_message_id,
+                    format_ambient_flow(
+                        self.ambient_flow_body,
+                        node=self.config.node,
+                        emoji=self.config.emoji,
+                        context=self.ambient_directive_body,
+                    ),
+                )
                 log("SEND", f"edited ambient flow mid={self.ambient_flow_message_id}")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient flow edit failed (non-fatal): {exc}")
@@ -7191,6 +8553,31 @@ class Bridge:
         suppress = os.path.expanduser(f"~/.config/claude-telegram-bridge/ambient-suppress-{self.config.node}")
         try:
             if os.path.exists(suppress) and (time.time() - os.path.getmtime(suppress)) < 90:
+                raw_text = sanitize_text(
+                    clean_ambient_final_text(content_text(content)),
+                    limit=FLOW_MIRROR_LIMIT,
+                )
+                surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+                parsed_suggested = parse_suggested_reply(raw_text)
+                if should_send_suggested_reply_bubble(
+                    parsed_suggested,
+                    self.config.suggested_reply_bubble,
+                    surface,
+                ):
+                    try:
+                        bubble_ids = self.telegram.send_copy_content(parsed_suggested.reply)
+                        if bubble_ids is None:
+                            log("SEND", "suggested reply bubble failed during ambient suppression (non-fatal)")
+                        else:
+                            apply_suggested_reply_confirmation(
+                                self.telegram,
+                                bubble_ids,
+                                surface,
+                                getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                                "telegram",
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log("SEND", f"suggested reply bubble failed during ambient suppression (non-fatal): {exc}")
                 # ⚙️ T-260630-48 — mac-report 가 노드 챗을 소유(suppress)하면 bridge 는 받은지시
                 # 앵커를 놓아준다(다음 final 이 옛 받은지시 카드를 잘못 edit 하지 않게 정리).
                 self.ambient_directive_message_id = 0
@@ -7252,8 +8639,8 @@ class Bridge:
             # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
             unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text)}"
             try:
-                if text or not copy_content_bubbles:
-                    self.telegram.edit(anchor, unified)
+                if (text or not copy_content_bubbles) and not self.telegram.edit(anchor, unified):
+                    raise RuntimeError("Telegram editMessageText returned failure")
                 delivered = True
                 log("SEND", f"edited ambient final into directive anchor mid={anchor}")
             except Exception as exc:  # noqa: BLE001
@@ -7281,6 +8668,14 @@ class Bridge:
             bubble_ids = self.telegram.send_copy_content(suggested_reply)
             if bubble_ids is None:
                 log("SEND", "suggested reply bubble failed after ambient final (non-fatal)")
+            else:
+                apply_suggested_reply_confirmation(
+                    self.telegram,
+                    bubble_ids,
+                    surface,
+                    getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                    "telegram" if surface == "aniki_dm" else "node",
+                )
         # 최종 답변 미러 후 flow 카드 bout 종료 -> 다음 노드 작업은 새 카드로.
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
@@ -7380,12 +8775,53 @@ class Bridge:
                             self.session_pos = 0
             self.stop_event.wait(0.5)
 
+    def send_self_update_break_consent(self, latest: str, message: str) -> None:
+        self.telegram.send_update_button(
+            message,
+            f"{SELF_UPDATE_BREAK_CALLBACK}::{latest}",
+            button_text="⚠️ 보호 설정 우회 동의",
+        )
+
+    def handle_self_update_callback(self, callback: dict[str, Any]) -> bool:
+        data = str(callback.get("data") or "")
+        is_standard = data.startswith(f"{SELF_UPDATE_CALLBACK}::")
+        is_break_consent = data.startswith(f"{SELF_UPDATE_BREAK_CALLBACK}::")
+        if not is_standard and not is_break_consent:
+            return False
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id")) != str(self.config.chat_id):
+            return True
+        callback_query_id = str(callback.get("id") or "")
+        if callback_query_id:
+            callback_text = (
+                "보호 설정 우회 동의를 확인했습니다…"
+                if is_break_consent
+                else "업데이트를 시작합니다…"
+            )
+            self.telegram.call(
+                "answerCallbackQuery",
+                callback_query_id=callback_query_id,
+                text=callback_text,
+            )
+        latest = data.split("::", 1)[1]
+        result = perform_self_update(
+            latest,
+            notify=self.telegram.send,
+            allow_break_system_packages=is_break_consent,
+        )
+        if result.status == "pep668_consent_required":
+            self.send_self_update_break_consent(latest, result.message)
+        return True
+
     def offer_update_if_available(self) -> None:
         latest = self_update_available()
         if not latest:
             return
         if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
-            perform_self_update(latest)
+            result = perform_self_update(latest, notify=self.telegram.send)
+            if result.status == "pep668_consent_required":
+                self.send_self_update_break_consent(latest, result.message)
             return
         current = _self_update_installed_version() or "?"
         try:
@@ -7404,6 +8840,7 @@ class Bridge:
         offset_raw = read_text(self.config.offset_file)
         offset = int(offset_raw) if offset_raw.isdigit() else 0
         TokenOwnership(self.config, self.telegram, self.token).verify_or_die(offset)
+        self.record_poll_heartbeat(force=True)
         self.offer_update_if_available()
         while not self.stop_event.is_set():
             try:
@@ -7416,6 +8853,7 @@ class Bridge:
                     )
                     raise RuntimeError("Telegram getUpdates 409; token ownership lost, fail-closed") from exc
                 raise
+            self.record_poll_heartbeat()
             for update in updates:
                 if not isinstance(update, dict) or "update_id" not in update:
                     continue
@@ -7425,12 +8863,11 @@ class Bridge:
                     data = str(cb.get("data") or "")
                     offset = update_id + 1
                     write_text_atomic(self.config.offset_file, offset)
-                    if data.startswith(f"{SELF_UPDATE_CALLBACK}::"):
-                        cb_chat = (cb.get("message") or {}).get("chat") or {}
-                        if str(cb_chat.get("id")) == str(self.config.chat_id):
-                            self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text="업데이트를 시작합니다…")
-                            perform_self_update(data.split("::", 1)[1])
-                    elif data.startswith(f"{MODEL_CALLBACK}::"):
+                    if self.handle_self_update_callback(cb):
+                        continue
+                    if self.handle_suggested_callback(cb):
+                        continue
+                    if data.startswith(f"{MODEL_CALLBACK}::"):
                         # /model inline keyboard 선택 → 비대화형 인자형 적용 (T-260702-14)
                         cb_chat = (cb.get("message") or {}).get("chat") or {}
                         if str(cb_chat.get("id")) == str(self.config.chat_id):
@@ -7449,6 +8886,7 @@ class Bridge:
             self.check_busy_stuck_rebind()
             self.retry_media_downloads()
             self.retry_pending_send()
+            self.service_suggested_loop_once()
             self.service_external_queue_once()
 
     def run(self) -> None:
@@ -7511,7 +8949,8 @@ def run_health_check(
         binder = binder_factory(config, repl)
         transcript_pending = False
         try:
-            binding = binder.resolve()
+            resolve_binding = getattr(binder, "resolve_for_health_check", binder.resolve)
+            binding = resolve_binding()
         except RuntimeError:
             pending = binder._resolve_fresh_sidecar_metadata(repl.pane_pid())
             if len(pending) != 1:
@@ -7528,6 +8967,9 @@ def run_health_check(
             "pane_pid": binding.pane_pid,
             "session_sidecar": str(config.session_sidecar_path),
         }
+        resolution_source = str(getattr(binder, "resolution_source", "") or "")
+        if resolution_source:
+            payload["binding_source"] = resolution_source
         return 0, payload
     except Exception as exc:  # noqa: BLE001
         if isinstance(exc, NativeHostUnavailable):
@@ -7536,6 +8978,8 @@ def run_health_check(
             error_code = "native_host_generation_changed"
         elif "generation" in str(exc).lower():
             error_code = "native_host_generation_invalid"
+        elif "ambiguous" in str(exc).lower():
+            error_code = "ambiguous_session_binding"
         else:
             error_code = "health_check_failed"
         payload = {
@@ -7545,7 +8989,7 @@ def run_health_check(
         }
         if config.transport_mode == "conpty":
             payload["transport"] = "conpty"
-            payload["error_code"] = error_code
+        payload["error_code"] = error_code
         return 20, payload
 
 

@@ -65,7 +65,7 @@ class PublicExportTest(unittest.TestCase):
             "result": {"message_id": 1},
         }
         self.assertEqual(private.with_emoji_prefix("🙂😄👋 hello"), "hello")
-        self.assertEqual(private.with_emoji_prefix("🍎"), "🍎")
+        self.assertEqual(private.with_emoji_prefix("🙂"), "🙂")
         private.send("answer", reply_to_message_id=42)
         self.assertEqual(private_calls[-1][1]["reply_to_message_id"], 42)
 

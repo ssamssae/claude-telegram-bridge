@@ -522,6 +522,12 @@ Send `/ping` to the bot, then send a normal prompt.
   when Claude is idle but no final reply was captured, so later queued messages
   can continue instead of being blocked behind a stale active turn. Defaults to
   900 seconds.
+- `SUGGESTED_REPLY_BUBBLE` - set `1` to split a final-line
+  `<추천답변>...</추천답변>` (suggested reply) marker out of the answer into a
+  separate copy-ready Telegram bubble you can tap and send back. Off by
+  default; markers that declare a class attribute (for example
+  `<추천답변 class="auto-ok">`) are always split so the marker text never
+  leaks into the answer body.
 
 ### Advanced settings
 

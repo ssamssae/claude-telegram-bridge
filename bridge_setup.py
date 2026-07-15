@@ -357,6 +357,7 @@ def write_private_config(
             f"CLB_CHAT_ID={shell_quote(chat_id)}",
             f"CLB_STATE_DIR={shell_quote(state_dir)}",
             f"CLB_REPL_TRANSPORT={transport}",
+            "SUGGESTED_REPLY_BUBBLE=1",
     ]
     if transport == "conpty":
         state_path = conpty_state_path or default_conpty_state_path()
