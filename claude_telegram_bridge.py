@@ -149,8 +149,8 @@ VOICE_PROMPT_INSTRUCTION = (
 )
 VOICE_ECHO_NOTICE_THRESHOLD = 2000
 # F9 (T-260705-04) — typing 루프 pulse/self-liveness 튜닝. 소등 호출을 놓친 경로가
-# 있어도(예: ambient 턴 종료) 루프가 세션 유휴를 스스로 감지해 소등한다. probe 실패는
-# 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
+# 있어도(예: ambient 턴 종료) 루프가 응답 턴 추적 상태를 확인해 소등한다. 추적 확인
+# 실패는 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
 TYPING_PULSE_FIRST_WAIT = 1.0
 TYPING_PULSE_WAIT = 4.0
 TYPING_LIVENESS_GRACE_PULSES = 5
@@ -4545,6 +4545,9 @@ class Bridge:
         self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
+        # T-260716-86: Telegram queue 밖에서 시작한 top-level 응답 턴 추적. 세션의
+        # background shell/output 자체는 응답 턴이 아니므로 이 플래그를 켜지 않는다.
+        self.ambient_response_active = False
         # ⚙️ ambient flow mirror (v0.1.5) — in-memory card for node-originated work
         # that has no active telegram turn (autonomous worker / cron / node-to-node).
         # Ephemeral (not persisted): on restart ambient starts fresh. Flag-gated OFF.
@@ -5148,19 +5151,17 @@ class Bridge:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
                     pulse_count += 1
-                    # F9 (T-260705-04) self-liveness: N pulse 마다 세션이 실제로 일하는지
-                    # 확인하고 유휴면 자가소등 — stop_typing 호출을 놓친 어떤 경로가 남아도
-                    # 유령이 TYPING_MAX(기본 2h)까지 살지 못한다. active_turn 무락 읽기는
-                    # 휴리스틱(최악 1 pulse 지연). probe 예외 = 소등하지 않음(fail-open).
+                    # F9 (T-260705-04) self-liveness: N pulse 마다 실제 응답 턴이 남았는지
+                    # 확인하고 없으면 자가소등 — stop_typing 호출을 놓친 어떤 경로가 남아도
+                    # 유령이 TYPING_MAX(기본 2h)까지 살지 못한다. background monitor 가
+                    # 세션 busy 를 유지해도 응답 턴 종료 뒤 typing 을 연장하지 않는다.
                     if (
                         pulse_count >= TYPING_LIVENESS_GRACE_PULSES
                         and pulse_count % TYPING_LIVENESS_CHECK_EVERY == 0
                     ):
                         try:
-                            if not self.has_typing_tracked_work() and not self.session_occupied_excluding_active(
-                                missing_transcript_busy=False
-                            ):
-                                log("TYPE", f"self-exit: session idle at pulse={pulse_count}")
+                            if not self.has_live_typing_work():
+                                log("TYPE", f"self-exit: no response work at pulse={pulse_count}")
                                 break
                         except Exception:  # noqa: BLE001
                             pass
@@ -5199,7 +5200,52 @@ class Bridge:
 
     def has_typing_tracked_work(self) -> bool:
         with self.lock:
-            return self.active_turn is not None or bool(self.pending)
+            return (
+                self.active_turn is not None
+                or bool(self.pending)
+                or bool(getattr(self, "ambient_response_active", False))
+            )
+
+    def has_live_typing_work(self) -> bool:
+        with self.lock:
+            if self.active_turn is not None or self.pending:
+                return True
+            ambient_response_active = bool(getattr(self, "ambient_response_active", False))
+        if not ambient_response_active:
+            return False
+        try:
+            foreground_response = self.session_has_foreground_response()
+        except Exception:  # noqa: BLE001
+            return True
+        if foreground_response:
+            return True
+        with self.lock:
+            if self.active_turn is not None or self.pending:
+                return True
+            self.ambient_response_active = False
+        return False
+
+    def session_has_foreground_response(self) -> bool:
+        if not repl_supports_pane_features(self.repl):
+            return self.session_occupied_excluding_active(missing_transcript_busy=False)
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            return True
+        return (
+            screen_has_approval_wait(screen)
+            or screen_has_hook_block(screen)
+            or screen_has_active_work(screen)
+        )
+
+    def begin_ambient_response(self) -> None:
+        with self.lock:
+            self.ambient_response_active = True
+
+    def finish_ambient_response(self) -> None:
+        with self.lock:
+            self.ambient_response_active = False
+        self.stop_typing()
 
     def begin_typing(self) -> None:
         with self.typing_lock:
@@ -7351,11 +7397,13 @@ class Bridge:
                 and self.try_busy_inject()
             ):
                 return
-            # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
-            # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
-            # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 사용자 "백그라운드 작업일 때도
-            # 타이핑"). active typing 루프(begin_typing)가 이미 돌면 중복 안 쏨.
-            self.ensure_typing()
+            # 세션이 busy 라 아직 inject 못 하는 구간에도 실제 응답/대기 턴은 입력중 유지.
+            # 응답 턴이 끝난 뒤 남은 passive background monitor 는 세션 busy 여도
+            # Telegram typing 을 재기동하지 않는다(T-260716-86).
+            if self.has_typing_tracked_work():
+                self.ensure_typing()
+            else:
+                self.stop_typing()
             log("BUSY", f"skip inject state={state}")
             return
         self.feedback_survey_resume_pending = False
@@ -8349,19 +8397,27 @@ class Bridge:
             # not nonce 로 배제(노드 디렉티브는 nonce 無). tool_result(도구결과)는
             # content_text 가 ""라 자동 제외, sub-agent sidechain 은 isSidechain 가드로
             # 제외. flow-mirror 토글 ON 한정.
-            if (
-                flow_mirror_enabled()
-                and not nonce
+            ambient_user_turn = (
+                not nonce
                 and not self.active_turn
                 and not record.get("isSidechain")
-            ):
-                self.mirror_ambient_directive(content)
+                and bool(content_text(content).strip())
+            )
+            if ambient_user_turn:
+                self.begin_ambient_response()
+                if flow_mirror_enabled():
+                    self.mirror_ambient_directive(content)
             return
 
         if record_type != "assistant" or message.get("role") != "assistant":
             return
         active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
         if not active:
+            if record.get("isSidechain") is False:
+                if message.get("stop_reason") == "end_turn":
+                    self.finish_ambient_response()
+                else:
+                    self.begin_ambient_response()
             # ⚙️ ambient flow mirror (v0.1.5) — node-originated work (autonomous worker /
             # cron / node-to-node) has no active telegram turn, so this assistant record
             # was dropped here and the work was invisible. When flow mirror is on,
