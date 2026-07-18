@@ -25,6 +25,10 @@ class PublicExportTest(unittest.TestCase):
         self.assertIsNone(mod.release_hold_response("출시 멈춰 memoyo"))
         # T-260701-68: stripped mesh layer must leave working no-op stubs
         self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}))
+        # T-260718-031: internal call sites pass bot_token=... — the stub must
+        # accept it, and the surviving except/raise sites need the exception type.
+        self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}, bot_token="tok"))
+        self.assertTrue(issubclass(mod.MeshRouteRetiredError, RuntimeError))
         self.assertIsNone(mod.mesh_ledger_record())
         cfg = dataclasses.replace(mod.Config.from_env(), chat_id="")
         with self.assertRaises(ValueError):

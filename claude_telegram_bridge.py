@@ -47,6 +47,8 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
+# mesh_send.py can spend 30s in three requests plus 3s in default backoff.
+DEFAULT_BRIDGE_MESH_SEND_TIMEOUT = 35.0
 NATIVE_WINDOWS_DAEMON_ERROR = (
     "Native Windows tmux mode is unsupported — run the default transport inside WSL, "
     "or explicitly configure CLB_REPL_TRANSPORT=conpty for the experimental owned host."
@@ -149,8 +151,8 @@ VOICE_PROMPT_INSTRUCTION = (
 )
 VOICE_ECHO_NOTICE_THRESHOLD = 2000
 # F9 (T-260705-04) — typing 루프 pulse/self-liveness 튜닝. 소등 호출을 놓친 경로가
-# 있어도(예: ambient 턴 종료) 루프가 응답 턴 추적 상태를 확인해 소등한다. 추적 확인
-# 실패는 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
+# 있어도(예: ambient 턴 종료) 루프가 세션 유휴를 스스로 감지해 소등한다. probe 실패는
+# 소등 사유가 아니다(legit 긴 턴 오탐 방지, TYPING_MAX deadline 이 최종 캡).
 TYPING_PULSE_FIRST_WAIT = 1.0
 TYPING_PULSE_WAIT = 4.0
 TYPING_LIVENESS_GRACE_PULSES = 5
@@ -299,6 +301,8 @@ SUGGESTED_REPLY_CLASS_INSTRUCTION = (
     'main merge, store submission, account auth/credentials/passwords, payment, external sending, or a physical '
     'device; otherwise use class="hold". Never omit class. Do not mention this contract.'
 )
+SUGGESTED_AUTH_AUTO_OK = "auto_ok_veto_elapsed"
+SUGGESTED_AUTH_HUMAN_CONFIRMED = "human_confirmed"
 
 
 def parse_suggested_reply(text: str) -> SuggestedReply:
@@ -335,6 +339,18 @@ def classify_suggested_reply(candidate: SuggestedReply) -> SuggestedDecision:
     if re.search(r"\b(?:delete|erase|revoke|reset)\b|삭제|폐기|초기화|권한\s*해제", candidate.reply, re.I):
         return SuggestedDecision("hold", "irreversible_or_uncertain")
     return SuggestedDecision("auto-ok", "declared_auto_ok")
+
+
+def suggested_loop_usage_units(usage: Any, answer: str) -> int:
+    # T-260717-056: cost_units 는 답변 스케일(≈output tokens) 단위 — 캡 기본값
+    # 100000 과 공개 문서 캡 표가 이 단위 기준이다. 이전 catch-all `*_tokens` 합산은
+    # cache_read/cache_creation/input 컨텍스트 재읽기까지 계수해 워밍 세션에서
+    # 턴당 ~37만 단위를 찍어 켜자마자 상시 cost_cap HOLD 가 났다 (3노드 실측 2026-07-17).
+    if isinstance(usage, dict):
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, (int, float)) and output_tokens > 0:
+            return int(output_tokens)
+    return max(1, math.ceil(len(answer) / 4))
 
 
 def should_send_suggested_reply_bubble(
@@ -819,8 +835,12 @@ def mesh_ledger_record(*args, **kwargs):
     return None
 
 
-def mesh_cutover_call(method, params):
+def mesh_cutover_call(method, params, *, bot_token=None):
     return None
+
+
+class MeshRouteRetiredError(RuntimeError):
+    """Stub for the stripped mesh layer; never raised on the direct API path."""
 
 
 def read_text(path: Path) -> str:
@@ -2447,7 +2467,7 @@ class TelegramClient:
         self.chunk_size = chunk_size
 
     def call(self, method: str, **params: Any) -> dict[str, Any] | None:
-        cutover_payload = mesh_cutover_call(method, params)
+        cutover_payload = mesh_cutover_call(method, params, bot_token=self.token)
         if cutover_payload is not None:
             return cutover_payload
         data = urllib.parse.urlencode(params).encode()
@@ -2701,11 +2721,15 @@ class TelegramClient:
                 utf16_len = len(chunk.encode("utf-16-le")) // 2
                 params["entities"] = json.dumps([{"type": "pre", "offset": 0, "length": utf16_len}])
             payload = self.call("sendMessage", **params)
+            if payload and payload.get("error_code") == "mesh_route_retired":
+                raise MeshRouteRetiredError(str(payload.get("description") or "mesh route retired"))
             if not payload or not payload.get("ok"):
                 return None
             result = payload.get("result")
             if isinstance(result, dict) and isinstance(result.get("message_id"), int):
                 message_ids.append(int(result["message_id"]))
+            else:
+                return None
         return message_ids
 
     def send(self, text: str, reply_to_message_id: int | None = None, mono: bool = False) -> list[int] | None:
@@ -2723,11 +2747,15 @@ class TelegramClient:
                 params["reply_to_message_id"] = reply_to_message_id
                 params["allow_sending_without_reply"] = "true"
             payload = self.call("sendMessage", **params)
+            if payload and payload.get("error_code") == "mesh_route_retired":
+                raise MeshRouteRetiredError(str(payload.get("description") or "mesh route retired"))
             if not payload or not payload.get("ok"):
                 return None
             result = payload.get("result")
             if isinstance(result, dict) and isinstance(result.get("message_id"), int):
                 message_ids.append(int(result["message_id"]))
+            else:
+                return None
         return message_ids
 
     def send_photo(self, path: Path, caption: str = "", reply_to_message_id: int | None = None) -> list[int] | None:
@@ -3021,6 +3049,7 @@ class QueueItem:
     # 실려 브릿지 재기동 복원 후에도 중복 에코를 막는다.
     voice_echo_sent: bool = False
     auto_origin: bool = False
+    suggested_authorization: str = ""
     loop_iteration: int = 0
     loop_started_at: float = 0.0
     loop_cost_units: int = 0
@@ -3052,6 +3081,8 @@ class QueueItem:
             payload["voice_echo_sent"] = True
         if self.auto_origin:
             payload["auto_origin"] = True
+        if self.suggested_authorization:
+            payload["suggested_authorization"] = self.suggested_authorization
         if self.loop_iteration:
             payload["loop_iteration"] = self.loop_iteration
             payload["loop_started_at"] = self.loop_started_at
@@ -3082,6 +3113,7 @@ class QueueItem:
             native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
             voice_echo_sent=bool(payload.get("voice_echo_sent")),
             auto_origin=bool(payload.get("auto_origin")),
+            suggested_authorization=str(payload.get("suggested_authorization") or ""),
             loop_iteration=int(payload.get("loop_iteration") or 0),
             loop_started_at=float(payload.get("loop_started_at") or 0.0),
             loop_cost_units=int(payload.get("loop_cost_units") or 0),
@@ -3120,6 +3152,7 @@ class ActiveTurn:
     native_queue_seen_at: float = 0.0
     sidecar_consumed_at: float = 0.0
     auto_origin: bool = False
+    suggested_authorization: str = ""
     loop_iteration: int = 0
     loop_started_at: float = 0.0
     loop_cost_units: int = 0
@@ -3159,6 +3192,8 @@ class ActiveTurn:
             payload["sidecar_consumed_at"] = self.sidecar_consumed_at
         if self.auto_origin:
             payload["auto_origin"] = True
+        if self.suggested_authorization:
+            payload["suggested_authorization"] = self.suggested_authorization
         if self.loop_iteration:
             payload["loop_iteration"] = self.loop_iteration
             payload["loop_started_at"] = self.loop_started_at
@@ -3206,6 +3241,7 @@ class ActiveTurn:
             native_queue_seen_at=float(payload.get("native_queue_seen_at") or 0.0),
             sidecar_consumed_at=float(payload.get("sidecar_consumed_at") or 0.0),
             auto_origin=bool(payload.get("auto_origin")),
+            suggested_authorization=str(payload.get("suggested_authorization") or ""),
             loop_iteration=int(payload.get("loop_iteration") or 0),
             loop_started_at=float(payload.get("loop_started_at") or 0.0),
             loop_cost_units=int(payload.get("loop_cost_units") or 0),
@@ -4545,8 +4581,8 @@ class Bridge:
         self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
-        # T-260716-86: Telegram queue 밖에서 시작한 top-level 응답 턴 추적. 세션의
-        # background shell/output 자체는 응답 턴이 아니므로 이 플래그를 켜지 않는다.
+        # T-260716-92: top-level node-originated response turn whose typing lifetime
+        # is independent from passive background processes shown in the pane.
         self.ambient_response_active = False
         # ⚙️ ambient flow mirror (v0.1.5) — in-memory card for node-originated work
         # that has no active telegram turn (autonomous worker / cron / node-to-node).
@@ -4574,6 +4610,10 @@ class Bridge:
         # T-260705-67 ③-b: pending 정체 1회성 알림 발송분 (queue_id). ephemeral —
         # 재시작 시 초기화돼 여전히 정체면 1회 재알림되는 쪽이 안전.
         self.stuck_alert_sent: set[str] = set()
+        # T-260716-67: 임계 초과 시점이 엇갈린 pending 알림을 짧은 창에 모아 한 장으로 보낸다.
+        # queue_id 별 dedup 은 위 set 에서 수집 시점에 선점하고, pending 이탈 시 함께 정리한다.
+        self.stuck_notice_batch: dict[str, QueueItem] = {}
+        self.stuck_notice_batch_started_at: float | None = None
         # T-260705-05: '기록파일 신선 + 화면 idle + pending 대기' 모순 시작 시각.
         self.busy_stuck_since = 0.0
         # T-260707-15: 설문 카드가 key=0을 즉시 소비하지 못해도 같은 카드에
@@ -4582,6 +4622,11 @@ class Bridge:
         self.feedback_survey_resume_pending = False
         self.suggested_candidates: dict[str, SuggestedLoopCandidate] = {}
         self.suggested_loop_runtime_enabled = config.suggested_loop_enabled
+        # T-260716-44: a later user prompt supersedes queued automation derived
+        # from an older turn (suggested reply / directive delivery retry).
+        self.latest_human_input_at = 0.0
+        self.latest_human_update_id = -1
+        self.superseded_queue_ids: set[str] = set()
 
     def suggested_ledger(self, candidate: SuggestedLoopCandidate, status: str, **extra: Any) -> bool:
         try:
@@ -4689,7 +4734,48 @@ class Bridge:
                 text=text,
             )
 
-    def enqueue_suggested_candidate(self, candidate: SuggestedLoopCandidate, *, auto_origin: bool) -> None:
+    def enqueue_suggested_candidate(
+        self,
+        candidate: SuggestedLoopCandidate,
+        *,
+        auto_origin: bool,
+    ) -> bool:
+        with self.lock:
+            if candidate.created_at <= self.latest_human_input_at:
+                candidate.status = "superseded"
+                candidate.reason = "newer_human_input"
+                superseded = True
+            else:
+                superseded = False
+        if superseded:
+            self.suggested_ledger(candidate, "superseded", superseded_by_human=True)
+            return False
+        if auto_origin:
+            if candidate.decision != "auto-ok" or candidate.status != "dispatching":
+                candidate.status = "hold"
+                self.suggested_ledger(
+                    candidate,
+                    "auto_blocked",
+                    auto_origin=True,
+                    block_reason=(
+                        "decision_not_auto_ok"
+                        if candidate.decision != "auto-ok"
+                        else "status_not_dispatching"
+                    ),
+                )
+                return False
+            suggested_authorization = SUGGESTED_AUTH_AUTO_OK
+        else:
+            if candidate.status != "confirming":
+                candidate.status = "hold"
+                self.suggested_ledger(
+                    candidate,
+                    "confirmation_blocked",
+                    human_confirmed=False,
+                    block_reason="status_not_confirming",
+                )
+                return False
+            suggested_authorization = SUGGESTED_AUTH_HUMAN_CONFIRMED
         item = QueueItem(
             queue_id=f"suggested:{candidate.candidate_id}",
             update_id=-int(candidate.candidate_id, 16),
@@ -4699,6 +4785,7 @@ class Bridge:
             received_at=time.time(),
             source="suggested_reply_auto" if auto_origin else "suggested_reply_confirmed",
             auto_origin=auto_origin,
+            suggested_authorization=suggested_authorization,
             loop_iteration=candidate.iteration,
             loop_started_at=candidate.started_at,
             loop_cost_units=candidate.cost_units,
@@ -4707,6 +4794,7 @@ class Bridge:
         self.queue.append_status(item, "enqueued")
         with self.lock:
             self.pending.append(item)
+        return True
 
     @staticmethod
     def native_queue_attached(item: QueueItem | ActiveTurn) -> bool:
@@ -4716,6 +4804,213 @@ class Bridge:
             or bool(item.user_uuid)
             or item.user_seen_at > 0
         )
+
+    @staticmethod
+    def native_queue_observed(item: QueueItem | ActiveTurn) -> bool:
+        # native_queue_attached is also set optimistically after the tmux paste
+        # call returns (suggested-loop kill guard), so only transcript-derived
+        # fields count as delivery evidence for re-paste decisions.
+        return bool(
+            item.native_queue_seen_at > 0
+            or bool(item.user_uuid)
+            or item.user_seen_at > 0
+        )
+
+    @staticmethod
+    def suggested_item_authorization_error(item: QueueItem) -> str:
+        suggested = item.queue_id.startswith("suggested:") or item.source.startswith(
+            "suggested_reply_"
+        )
+        if not suggested:
+            return ""
+        if not item.queue_id.startswith("suggested:"):
+            return "queue_id_not_suggested"
+        candidate_id = item.queue_id.split(":", 1)[1]
+        if not re.fullmatch(r"[0-9a-f]+", candidate_id):
+            return "candidate_id_invalid"
+        if (
+            item.message_id != 0
+            or item.update_id >= 0
+            or item.update_id != -int(candidate_id, 16)
+        ):
+            return "synthetic_signature_mismatch"
+        if item.source == "suggested_reply_auto":
+            if not item.auto_origin:
+                return "auto_origin_missing"
+            if item.suggested_authorization != SUGGESTED_AUTH_AUTO_OK:
+                return "auto_ok_authorization_missing"
+            return ""
+        if item.source == "suggested_reply_confirmed":
+            if item.auto_origin:
+                return "confirmed_marked_auto"
+            if item.suggested_authorization != SUGGESTED_AUTH_HUMAN_CONFIRMED:
+                return "human_confirmation_missing"
+            return ""
+        return "suggested_source_invalid"
+
+    def record_suggested_authorization_drop(
+        self,
+        item: QueueItem,
+        *,
+        guard: str,
+        error: str,
+    ) -> None:
+        self.queue.append_status(
+            item,
+            "dropped",
+            suggested_authorization_failed=True,
+            authorization_error=error,
+            drop_reason=guard,
+        )
+        log(
+            "SUGGEST",
+            f"unauthorized synthetic input dropped queue={item.queue_id} "
+            f"guard={guard} error={error}",
+        )
+
+    def drop_unauthorized_suggested_inputs(self, guard: str) -> int:
+        dropped: list[tuple[QueueItem, str]] = []
+        dropped_queue_ids: set[str] = set()
+        with self.lock:
+            remaining: list[QueueItem] = []
+            for item in self.pending:
+                error = self.suggested_item_authorization_error(item)
+                if error and not self.native_queue_attached(item):
+                    dropped.append((item, error))
+                    dropped_queue_ids.add(item.queue_id)
+                else:
+                    remaining.append(item)
+            self.pending = remaining
+            active = self.active_turn
+            if active:
+                active_item = self.queue_item_for_active(active)
+                error = self.suggested_item_authorization_error(active_item)
+                if error and not self.native_queue_attached(active):
+                    self.active_turn = None
+                    if active.queue_id not in dropped_queue_ids:
+                        dropped.append((active_item, error))
+        for item, error in dropped:
+            self.record_suggested_authorization_drop(item, guard=guard, error=error)
+        if dropped:
+            self.persist_state()
+            self.write_egress_sidecar()
+        return len(dropped)
+
+    def supersedable_queued_input(self, item: QueueItem | ActiveTurn) -> bool:
+        queue_item = self.queue_item_for_active(item) if isinstance(item, ActiveTurn) else item
+        return item.source in {"suggested_reply_auto", "suggested_reply_confirmed"} or (
+            self.terminal_retry_count(queue_item) > 0
+        )
+
+    def queued_input_origin_at(self, item: QueueItem | ActiveTurn) -> float:
+        queue_item = self.queue_item_for_active(item) if isinstance(item, ActiveTurn) else item
+        if queue_item.queue_id.startswith("suggested:"):
+            candidate_id = queue_item.queue_id.split(":", 1)[1]
+            candidate = self.suggested_candidates.get(candidate_id)
+            if candidate:
+                return candidate.created_at
+            if queue_item.loop_started_at > 0:
+                return queue_item.loop_started_at
+        return queue_item.sent_at if queue_item.sent_at > 0 else queue_item.received_at
+
+    def queued_input_precedes_human(
+        self,
+        item: QueueItem | ActiveTurn,
+        newer_at: float,
+        newer_update_id: int = -1,
+    ) -> bool:
+        origin_at = self.queued_input_origin_at(item)
+        if origin_at < newer_at:
+            return True
+        return (
+            origin_at == newer_at
+            and newer_update_id >= 0
+            and item.update_id >= 0
+            and item.update_id < newer_update_id
+        )
+
+    def latest_human_input_is_newer(self, item: QueueItem | ActiveTurn) -> bool:
+        return self.queued_input_precedes_human(
+            item,
+            self.latest_human_input_at,
+            self.latest_human_update_id,
+        )
+
+    def supersede_stale_queued_inputs(
+        self,
+        newer_at: float,
+        *,
+        reason: str,
+        newer_update_id: int = -1,
+    ) -> int:
+        if newer_at <= 0:
+            return 0
+        dropped: list[QueueItem] = []
+        superseded_candidates: list[SuggestedLoopCandidate] = []
+        with self.lock:
+            if (newer_at, newer_update_id) > (
+                self.latest_human_input_at,
+                self.latest_human_update_id,
+            ):
+                self.latest_human_input_at = newer_at
+                self.latest_human_update_id = newer_update_id
+            for candidate in self.suggested_candidates.values():
+                if (
+                    candidate.status in {"veto_pending", "hold", "dispatching"}
+                    and candidate.created_at <= newer_at
+                ):
+                    candidate.status = "superseded"
+                    candidate.reason = "newer_human_input"
+                    superseded_candidates.append(candidate)
+
+            remaining: list[QueueItem] = []
+            for item in self.pending:
+                if (
+                    self.supersedable_queued_input(item)
+                    and self.queued_input_precedes_human(item, newer_at, newer_update_id)
+                    and not self.native_queue_attached(item)
+                ):
+                    dropped.append(item)
+                    self.superseded_queue_ids.add(item.queue_id)
+                else:
+                    remaining.append(item)
+            self.pending = remaining
+
+            active = self.active_turn
+            if (
+                active
+                and self.supersedable_queued_input(active)
+                and self.queued_input_precedes_human(active, newer_at, newer_update_id)
+                and newer_at <= active.injected_at
+                and not self.native_queue_attached(active)
+            ):
+                dropped.append(self.queue_item_for_active(active))
+                self.superseded_queue_ids.add(active.queue_id)
+                self.active_turn = None
+
+        for candidate in superseded_candidates:
+            self.suggested_ledger(
+                candidate,
+                "superseded",
+                superseded_by_human=True,
+                supersede_reason=reason,
+            )
+        for item in dropped:
+            self.queue.append_status(
+                item,
+                "dropped",
+                superseded_by_human=True,
+                supersede_reason=reason,
+                newer_input_at=newer_at,
+            )
+        if dropped:
+            self.persist_state()
+            self.write_egress_sidecar()
+            log(
+                "QUEUE",
+                f"newer human input superseded stale queued count={len(dropped)} reason={reason}",
+            )
+        return len(dropped)
 
     def suggested_auto_disabled_locked(self) -> bool:
         return not self.suggested_loop_runtime_enabled or self.config.suggested_loop_kill_path.exists()
@@ -4764,18 +5059,27 @@ class Bridge:
         reason: str,
         allow_untracked_auto: bool = False,
     ) -> bool:
-        dropped = False
+        authorization_error = self.suggested_item_authorization_error(item)
+        kill_dropped = False
         with self.lock:
             pending_match = any(existing.queue_id == item.queue_id for existing in self.pending)
             active_match = bool(self.active_turn and self.active_turn.queue_id == item.queue_id)
-            if item.auto_origin and not (pending_match or active_match or allow_untracked_auto):
+            if item.queue_id in self.superseded_queue_ids:
+                return False
+            if authorization_error:
+                self.pending = [
+                    existing for existing in self.pending if existing.queue_id != item.queue_id
+                ]
+                if active_match:
+                    self.active_turn = None
+            elif item.auto_origin and not (pending_match or active_match or allow_untracked_auto):
                 # A concurrent kill already removed this optimistic item.
                 return False
-            if item.auto_origin and self.suggested_auto_disabled_locked():
+            elif item.auto_origin and self.suggested_auto_disabled_locked():
                 self.pending = [existing for existing in self.pending if existing.queue_id != item.queue_id]
                 if active_match:
                     self.active_turn = None
-                dropped = True
+                kill_dropped = True
             else:
                 # Hold the same bridge lock from the final kill/runtime recheck through
                 # native paste. Kill therefore either wins and drops before paste, or
@@ -4788,7 +5092,16 @@ class Bridge:
                     if pending_item.queue_id == item.queue_id:
                         pending_item.native_queue_attached = True
                         break
-        if dropped:
+        if authorization_error:
+            self.record_suggested_authorization_drop(
+                item,
+                guard=reason,
+                error=authorization_error,
+            )
+            self.persist_state()
+            self.write_egress_sidecar()
+            return False
+        if kill_dropped:
             self.queue.append_status(item, "dropped", suggested_loop_kill=True, drop_reason=reason)
             log("SUGGEST", f"pre-paste kill dropped auto-origin queue={item.queue_id}")
             self.persist_state()
@@ -4812,7 +5125,34 @@ class Bridge:
         if not candidate:
             self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text="만료된 요청입니다.")
             return True
-        if action == "kill":
+        callback_from = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        if not callback.get("id"):
+            callback_error = "callback_id_missing"
+        elif not callback_from.get("id"):
+            callback_error = "callback_actor_missing"
+        elif str(callback_from.get("id")) != str(self.config.chat_id):
+            callback_error = "callback_actor_mismatch"
+        elif str(message.get("message_id") or "") != str(candidate.control_message_id):
+            callback_error = "control_message_mismatch"
+        else:
+            callback_error = ""
+        if callback_error:
+            self.suggested_ledger(
+                candidate,
+                "callback_blocked",
+                human_confirmed=False,
+                callback_action=action,
+                block_reason=callback_error,
+            )
+            self.telegram.call(
+                "answerCallbackQuery",
+                callback_query_id=callback.get("id"),
+                text="확인 주체를 검증하지 못해 HOLD를 유지합니다.",
+            )
+            return True
+        if candidate.status == "superseded":
+            toast = "더 최신 입력이 있어 이전 추천은 실행하지 않았습니다."
+        elif action == "kill":
             with self.lock:
                 self.suggested_loop_runtime_enabled = False
                 for pending_candidate in self.suggested_candidates.values():
@@ -4834,9 +5174,11 @@ class Bridge:
             toast = "자동 진행을 취소했습니다."
         elif action == "confirm" and self.claim_suggested(candidate, "hold", "confirming"):
             if self.suggested_ledger(candidate, "confirmed_enqueued", human_confirmed=True):
-                self.enqueue_suggested_candidate(candidate, auto_origin=False)
-                candidate.status = "confirmed_enqueued"
-                toast = "확인되어 큐에 넣었습니다."
+                if self.enqueue_suggested_candidate(candidate, auto_origin=False):
+                    candidate.status = "confirmed_enqueued"
+                    toast = "확인되어 큐에 넣었습니다."
+                else:
+                    toast = "더 최신 입력이 있어 이전 추천은 실행하지 않았습니다."
             else:
                 candidate.status = "hold"
                 toast = "장부 기록 실패로 HOLD를 유지합니다."
@@ -4861,6 +5203,19 @@ class Bridge:
         for candidate in candidates:
             if candidate.status != "veto_pending" or now < candidate.deadline:
                 continue
+            if candidate.decision != "auto-ok":
+                candidate.status = "hold"
+                self.suggested_ledger(
+                    candidate,
+                    "auto_blocked",
+                    auto_origin=True,
+                    block_reason="decision_not_auto_ok",
+                )
+                self.edit_suggested_status(
+                    candidate,
+                    f"🛑 HOLD 유지 · {candidate.reason}\n{candidate.reply}",
+                )
+                continue
             if not self.claim_suggested(candidate, "veto_pending", "dispatching"):
                 continue
             cap_reason = self.suggested_loop_cap_reason(
@@ -4881,10 +5236,12 @@ class Bridge:
                 candidate.reason = "ledger_unavailable"
                 candidate.decision = "hold"
                 return False
-            self.enqueue_suggested_candidate(candidate, auto_origin=True)
-            candidate.status = "auto_enqueued"
-            self.edit_suggested_status(candidate, f"▶ 자동 큐 투입\n{candidate.reply}")
-            return True
+            if self.enqueue_suggested_candidate(candidate, auto_origin=True):
+                candidate.status = "auto_enqueued"
+                self.edit_suggested_status(candidate, f"▶ 자동 큐 투입\n{candidate.reply}")
+                return True
+            self.edit_suggested_status(candidate, f"⏭ 최신 입력으로 건너뜀\n{candidate.reply}")
+            return False
         return False
 
     def acquire_lock(self) -> None:
@@ -5151,10 +5508,9 @@ class Bridge:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
                     pulse_count += 1
-                    # F9 (T-260705-04) self-liveness: N pulse 마다 실제 응답 턴이 남았는지
-                    # 확인하고 없으면 자가소등 — stop_typing 호출을 놓친 어떤 경로가 남아도
-                    # 유령이 TYPING_MAX(기본 2h)까지 살지 못한다. background monitor 가
-                    # 세션 busy 를 유지해도 응답 턴 종료 뒤 typing 을 연장하지 않는다.
+                    # F9 (T-260705-04), T-260716-92: N pulse 마다 실제 응답 턴이
+                    # 남았는지 확인하고 유휴면 자가소등한다. passive background process는
+                    # 응답 턴으로 세지 않으며 probe 예외는 fail-open 한다.
                     if (
                         pulse_count >= TYPING_LIVENESS_GRACE_PULSES
                         and pulse_count % TYPING_LIVENESS_CHECK_EVERY == 0
@@ -5200,11 +5556,7 @@ class Bridge:
 
     def has_typing_tracked_work(self) -> bool:
         with self.lock:
-            return (
-                self.active_turn is not None
-                or bool(self.pending)
-                or bool(getattr(self, "ambient_response_active", False))
-            )
+            return self.active_turn is not None or bool(self.pending) or self.ambient_response_active
 
     def has_live_typing_work(self) -> bool:
         with self.lock:
@@ -6126,13 +6478,17 @@ class Bridge:
             log("INJECT", f"sidecar write failed; falling back to visible envelope: {exc}")
             return self.envelope_prompt(item)
 
-    def active_envelope_sidecar_consumed_record(self, active: ActiveTurn) -> dict[str, Any] | None:
-        expected_hash = prompt_sha256(self.sidecar_visible_prompt(self.queue_item_for_active(active)))
+    def envelope_sidecar_consumed_record(
+        self,
+        item: QueueItem | ActiveTurn,
+    ) -> dict[str, Any] | None:
+        queue_item = self.queue_item_for_active(item) if isinstance(item, ActiveTurn) else item
+        expected_hash = prompt_sha256(self.sidecar_visible_prompt(queue_item))
         latest: dict[str, Any] | None = None
         for record in read_envelope_sidecar_records(self.config.envelope_sidecar_path):
-            if str(record.get("queue_id") or "") != active.queue_id:
+            if str(record.get("queue_id") or "") != queue_item.queue_id:
                 continue
-            if str(record.get("nonce") or "") != active.nonce:
+            if str(record.get("nonce") or "") != queue_item.nonce:
                 continue
             latest = record
         if not latest or latest.get("status") != "consumed":
@@ -6141,6 +6497,9 @@ class Bridge:
         if seen_hash and seen_hash != expected_hash:
             return None
         return latest
+
+    def active_envelope_sidecar_consumed_record(self, active: ActiveTurn) -> dict[str, Any] | None:
+        return self.envelope_sidecar_consumed_record(active)
 
     @staticmethod
     def sidecar_consumed_at(record: dict[str, Any]) -> float:
@@ -6217,6 +6576,46 @@ class Bridge:
             log("JSONL", f"body-only sidecar user seen {active.nonce}")
         else:
             log("JSONL", f"body-only user seen without sidecar {active.nonce}")
+        return True
+
+    def mark_pending_sidecar_body_user_seen(self, record: dict[str, Any]) -> bool:
+        user_uuid = str(record.get("uuid") or "")
+        if not user_uuid:
+            return False
+        body = content_text((record.get("message") or {}).get("content"))
+        if not body:
+            return False
+        user_seen_at = record_timestamp_seconds(record) or time.time()
+        body_hash = prompt_sha256(body)
+        matched: QueueItem | None = None
+        with self.lock:
+            for item in self.pending:
+                if not item.busy_injected or item.user_uuid:
+                    continue
+                reference_at = max(item.received_at, item.native_queue_seen_at)
+                if user_seen_at + 2.0 < reference_at:
+                    continue
+                if body_hash != prompt_sha256(self.sidecar_visible_prompt(item)):
+                    continue
+                item.user_uuid = user_uuid
+                item.user_seen_at = user_seen_at
+                item.native_queue_attached = True
+                matched = item
+                break
+        if not matched:
+            return False
+        self.queue.append_status(
+            matched,
+            "enqueued",
+            busy_inject=True,
+            jsonl_seen=True,
+            body_only_pending=True,
+            user_uuid=user_uuid,
+            user_seen_at=user_seen_at,
+        )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log("JSONL", f"pending body-only user seen {matched.nonce}")
         return True
 
     def stale_prompt_notice(self, item: QueueItem, now: float | None = None) -> str:
@@ -6460,11 +6859,23 @@ class Bridge:
             threshold = 180.0
         if threshold <= 0:
             return
+        try:
+            batch_seconds = float(os.environ.get("CLB_QUEUE_STUCK_NOTICE_BATCH_SEC", "60"))
+        except ValueError:
+            batch_seconds = 60.0
         now = time.time()
         with self.lock:
-            pending_ids = {item.queue_id for item in self.pending}
+            pending_by_id = {item.queue_id: item for item in self.pending}
+            pending_ids = set(pending_by_id)
             # 큐를 떠난 항목 키는 정리해 set 무한 증가 방지 (재enqueue 는 dedup 이 막는다).
             self.stuck_alert_sent &= pending_ids
+            self.stuck_notice_batch = {
+                queue_id: pending_by_id[queue_id]
+                for queue_id in self.stuck_notice_batch
+                if queue_id in pending_by_id
+            }
+            if not self.stuck_notice_batch:
+                self.stuck_notice_batch_started_at = None
             stuck = [
                 item
                 for item in self.pending
@@ -6472,26 +6883,82 @@ class Bridge:
             ]
             for item in stuck:
                 self.stuck_alert_sent.add(item.queue_id)
-        for item in stuck:
+            if batch_seconds <= 0:
+                notices = [*self.stuck_notice_batch.values(), *stuck]
+                self.stuck_notice_batch.clear()
+                self.stuck_notice_batch_started_at = None
+                immediate = True
+            else:
+                if stuck and self.stuck_notice_batch_started_at is None:
+                    self.stuck_notice_batch_started_at = now
+                for item in stuck:
+                    self.stuck_notice_batch[item.queue_id] = item
+                should_flush = (
+                    self.stuck_notice_batch_started_at is not None
+                    and now - self.stuck_notice_batch_started_at >= batch_seconds
+                )
+                notices = list(self.stuck_notice_batch.values()) if should_flush else []
+                if should_flush:
+                    self.stuck_notice_batch.clear()
+                    self.stuck_notice_batch_started_at = None
+                immediate = False
+
+        if immediate:
+            for item in notices:
+                self.send_queue_stuck_notice([item], now)
+            return
+        busy_notices = [item for item in notices if item.busy_injected]
+        stuck_notices = [item for item in notices if not item.busy_injected]
+        if busy_notices:
+            self.send_queue_stuck_notice(busy_notices, now)
+        if stuck_notices:
+            self.send_queue_stuck_notice(stuck_notices, now)
+
+    def send_queue_stuck_notice(self, items: list[QueueItem], now: float) -> None:
+        if not items:
+            return
+        busy_injected = items[0].busy_injected
+        details: list[str] = []
+        for index, item in enumerate(items, start=1):
             age = int(now - item.received_at)
             preview = sanitize_text(item.text)[:40]
-            if item.busy_injected:
+            if busy_injected:
                 log("QUEUE", f"busy-injected pending wait age={age}s update={item.update_id}")
-                try:
-                    self.telegram.send(
-                        f"⏳ 대기 안내: 메시지는 이미 세션 입력큐에 실렸고, "
-                        f"진행 중인 턴이 끝나면 처리돼요 ({age}초째, “{preview}…”)."
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    log("QUEUE", f"busy-injected wait notice send failed: {exc}")
-                continue
-            log("QUEUE", f"stuck pending age={age}s update={item.update_id}")
-            try:
-                self.telegram.send(
+            else:
+                log("QUEUE", f"stuck pending age={age}s update={item.update_id}")
+            marker = chr(0x2460 + index - 1) if index <= 20 else f"{index}."
+            details.append(f"{marker}{age}초째 “{preview}…”")
+
+        if len(items) == 1:
+            age = int(now - items[0].received_at)
+            preview = sanitize_text(items[0].text)[:40]
+            if busy_injected:
+                message = (
+                    f"⏳ 대기 안내: 메시지는 이미 세션 입력큐에 실렸고, "
+                    f"진행 중인 턴이 끝나면 처리돼요 ({age}초째, “{preview}…”)."
+                )
+            else:
+                message = (
                     f"⚠️ 큐 정체: 받은 메시지가 {age}초째 노드에 주입되지 못하고 대기중이에요 "
                     f"(“{preview}…”). 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요."
                 )
-            except Exception as exc:  # noqa: BLE001
+        elif busy_injected:
+            message = (
+                f"⏳ 대기 안내: {len(items)}건이 세션 입력큐에서 턴 종료 대기 중이에요 — "
+                f"{' '.join(details)}"
+            )
+        else:
+            message = (
+                f"⚠️ 큐 정체: {len(items)}건이 노드에 주입되지 못하고 대기 중이에요 — "
+                f"{' '.join(details)}. 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요."
+            )
+
+        try:
+            self.telegram.send(message)
+        except Exception as exc:  # noqa: BLE001
+            if busy_injected:
+                log("QUEUE", f"busy-injected wait notice send failed: {exc}")
+            else:
                 log("QUEUE", f"stuck alert send failed: {exc}")
 
     def directive_retry_max(self) -> int:
@@ -6574,6 +7041,24 @@ class Bridge:
         self.queue.append_status(item, status, **extra)
 
         label = "전달 실패" if status == "failed" else "차단"
+        if self.latest_human_input_is_newer(item):
+            with self.lock:
+                self.superseded_queue_ids.add(item.queue_id)
+            self.queue.append_status(
+                item,
+                "dropped",
+                superseded_by_human=True,
+                supersede_reason="newer_human_before_terminal_retry",
+                newer_input_at=self.latest_human_input_at,
+            )
+            try:
+                self.telegram.send(
+                    f"ℹ️ 브릿지 {label}: 이후 도착한 최신 입력이 있어 이전 지시의 자동 재시도는 건너뛰었어요."
+                )
+            except Exception as exc:  # noqa: BLE001
+                log("QUEUE", f"terminal supersede notice failed: {exc}")
+            log("QUEUE", f"directive {status} superseded before retry queue={item.queue_id}")
+            return None
         if retry_count >= retry_max:
             try:
                 self.telegram.send(
@@ -6604,6 +7089,7 @@ class Bridge:
             voice_reply_path=item.voice_reply_path,
             busy_injected=False,
             auto_origin=item.auto_origin,
+            suggested_authorization=item.suggested_authorization,
             loop_iteration=item.loop_iteration,
             loop_started_at=item.loop_started_at,
             loop_cost_units=item.loop_cost_units,
@@ -6717,6 +7203,11 @@ class Bridge:
                 self.finish_media_retry(update, retry_key, media_retry_completion)
             log("QUEUE", f"skip duplicate update={update_id} queue={queue_id[:10]} status={existing_status or 'live'}")
             return
+        self.supersede_stale_queued_inputs(
+            sent_at if sent_at > 0 else item.received_at,
+            reason="telegram_human_input",
+            newer_update_id=update_id,
+        )
         self.queue.append_status(item, "received")
         # 정상 durable queue 가 fsync 된 뒤에만 media-retry 장부를 닫는다. 이 순서가
         # 다운로드 성공 직후 재기동 창에서도 update 를 최소 한 장부에 남긴다.
@@ -7202,13 +7693,23 @@ class Bridge:
         allow_untracked_auto: bool = False,
     ) -> bool:
         if not item.auto_origin:
-            replace_prompt = getattr(self.repl, "replace_prompt", None)
-            if callable(replace_prompt):
-                replace_prompt(prompt)
-            else:
-                for _ in range(self.config.composer_clear_retries):
-                    self.repl.clear_composer()
-                self.repl.paste_prompt(prompt)
+            def paste_action() -> None:
+                replace_prompt = getattr(self.repl, "replace_prompt", None)
+                if callable(replace_prompt):
+                    replace_prompt(prompt)
+                else:
+                    for _ in range(self.config.composer_clear_retries):
+                        self.repl.clear_composer()
+                    self.repl.paste_prompt(prompt)
+
+            if self.supersedable_queued_input(item):
+                return self.paste_with_suggested_kill_guard(
+                    item,
+                    paste_action,
+                    reason="idle_supersede_guard",
+                    allow_untracked_auto=allow_untracked_auto,
+                )
+            paste_action()
             return True
         composer_lock = getattr(self.repl, "composer_lock", None)
         clear_unlocked = getattr(self.repl, "_clear_composer_unlocked", None)
@@ -7317,6 +7818,7 @@ class Bridge:
                     user_seen_at=item.user_seen_at,
                     native_queue_seen_at=item.native_queue_seen_at,
                     auto_origin=item.auto_origin,
+                    suggested_authorization=item.suggested_authorization,
                     loop_iteration=item.loop_iteration,
                     loop_started_at=item.loop_started_at,
                     loop_cost_units=item.loop_cost_units,
@@ -7378,6 +7880,8 @@ class Bridge:
     def drain_queue(self) -> None:
         if not self.suggested_loop_runtime_enabled or self.config.suggested_loop_kill_path.exists():
             self.drop_pending_suggested_auto("drain_guard")
+        if self.drop_unauthorized_suggested_inputs("drain_authorization_guard"):
+            return
         if self.session_clear_pending():
             log("BUSY", "skip inject state=clearing")
             return
@@ -7397,9 +7901,10 @@ class Bridge:
                 and self.try_busy_inject()
             ):
                 return
-            # 세션이 busy 라 아직 inject 못 하는 구간에도 실제 응답/대기 턴은 입력중 유지.
-            # 응답 턴이 끝난 뒤 남은 passive background monitor 는 세션 busy 여도
-            # Telegram typing 을 재기동하지 않는다(T-260716-86).
+            # 세션이 busy 라 아직 inject 못 하는 구간에도 입력중 유지. 기존엔 inject 후에야
+            # begin_typing 이 떠서, 직전 턴/백그라운드 작업으로 busy 인 동안(보낸 직후·백그라운드
+            # 재진입·완료 정착) 사용자 폰엔 무표시였다(2026-06-27 사용자 "백그라운드 작업일 때도
+            # 타이핑"). active typing 루프(begin_typing)가 이미 돌면 중복 안 쏨.
             if self.has_typing_tracked_work():
                 self.ensure_typing()
             else:
@@ -7409,6 +7914,7 @@ class Bridge:
         self.feedback_survey_resume_pending = False
         promoted_busy_injected = False
         busy_inject_demoted = False
+        repaste_dedup_record: dict[str, Any] | None = None
         with self.lock:
             if self.active_turn or not self.pending:
                 return
@@ -7440,6 +7946,7 @@ class Bridge:
                     user_seen_at=item.user_seen_at,
                     native_queue_seen_at=item.native_queue_seen_at,
                     auto_origin=item.auto_origin,
+                    suggested_authorization=item.suggested_authorization,
                     loop_iteration=item.loop_iteration,
                     loop_started_at=item.loop_started_at,
                     loop_cost_units=item.loop_cost_units,
@@ -7461,10 +7968,23 @@ class Bridge:
                 # binding 이 깨진 순간이야말로 증거 관측이 불가능해 유실이 조용해진다.
                 # 트레이드오프: 진짜 native 큐잉됐는데 enqueue 레코드 tail 이 늦은 극단
                 # race 에선 중복 배달 가능 — 중복(가시적·경미)이 침묵 유실(치명)보다 낫다.
-                if item.busy_injected and not (
-                    item.native_queue_seen_at > 0
-                    or bool(item.user_uuid)
-                    or item.user_seen_at > 0
+                if item.busy_injected and not self.native_queue_observed(item):
+                    # T-260716-24: queue-operation evidence can race/miss while the
+                    # prompt sidecar has already been consumed for this exact
+                    # queue_id+nonce+body hash. Re-check that durable evidence at the
+                    # last possible point before re-paste. This preserves the older
+                    # no-evidence recovery path while preventing a known-delivered
+                    # nonce from being submitted twice.
+                    repaste_dedup_record = self.envelope_sidecar_consumed_record(item)
+                    if repaste_dedup_record:
+                        consumed_at = self.sidecar_consumed_at(repaste_dedup_record)
+                        item.native_queue_attached = True
+                        self.active_turn.native_queue_attached = True
+                        self.active_turn.sidecar_consumed_at = consumed_at
+                if (
+                    item.busy_injected
+                    and not self.native_queue_observed(item)
+                    and not repaste_dedup_record
                 ):
                     item.busy_injected = False
                     item.native_queue_attached = False
@@ -7472,6 +7992,20 @@ class Bridge:
                     self.active_turn.native_queue_attached = False
                     busy_inject_demoted = True
                 promoted_busy_injected = item.busy_injected
+        if repaste_dedup_record:
+            consumed_at = self.sidecar_consumed_at(repaste_dedup_record)
+            self.queue.append_status(
+                item,
+                "sidecar_consumed_seen",
+                busy_inject=True,
+                consumed_at=consumed_at,
+                repaste_nonce_dedup=True,
+            )
+            log(
+                "INJECT",
+                f"busy-inject re-paste dedup nonce={item.nonce} update={item.update_id} "
+                "evidence=sidecar-consumed",
+            )
         if busy_inject_demoted:
             log(
                 "INJECT",
@@ -7718,6 +8252,7 @@ class Bridge:
             self.enqueue_update(update)
 
     def check_injection_timeout(self) -> None:
+        self.drop_unauthorized_suggested_inputs("injection_timeout_authorization_guard")
         with self.lock:
             active = self.active_turn
         if not active or active.user_uuid:
@@ -7813,6 +8348,7 @@ class Bridge:
             user_seen_at=active.user_seen_at,
             native_queue_seen_at=active.native_queue_seen_at,
             auto_origin=active.auto_origin,
+            suggested_authorization=active.suggested_authorization,
             loop_iteration=active.loop_iteration,
             loop_started_at=active.loop_started_at,
             loop_cost_units=active.loop_cost_units,
@@ -7828,9 +8364,18 @@ class Bridge:
             return
 
         log("INJECT", f"nonce {active.nonce} not observed; composer clear/retry")
-        try:
+
+        def retry_paste_action() -> None:
             self.repl.clear_composer()
             self.repl.paste_prompt(self.prompt_for_item(item))
+
+        try:
+            if not self.paste_with_suggested_kill_guard(
+                item,
+                retry_paste_action,
+                reason="injection_retry_authorization_guard",
+            ):
+                return
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"retry failed: {exc}")
             with self.lock:
@@ -7935,6 +8480,7 @@ class Bridge:
             user_seen_at=active.user_seen_at,
             native_queue_seen_at=active.native_queue_seen_at,
             auto_origin=active.auto_origin,
+            suggested_authorization=active.suggested_authorization,
             loop_iteration=active.loop_iteration,
             loop_started_at=active.loop_started_at,
             loop_cost_units=active.loop_cost_units,
@@ -8031,12 +8577,33 @@ class Bridge:
         if not nonce:
             # Sidecar mode deliberately keeps the nonce out of the visible
             # prompt, so queue-operation content only contains the Telegram
-            # body. Correlate that fresh, exact body with the active turn.
+            # body. A busy-inject over active A leaves B in pending; correlate
+            # that exact body with evidence-free busy items before falling back
+            # to the active turn. Otherwise B is later demoted and re-pasted.
+            content_hash = prompt_sha256(content)
             with self.lock:
                 active = self.active_turn
-            if active and seen_at + 2.0 >= active.injected_at:
+                busy_candidates: list[QueueItem] = []
+                if (
+                    active
+                    and active.busy_injected
+                    and not self.native_queue_observed(active)
+                    and seen_at + 2.0 >= active.injected_at
+                ):
+                    busy_candidates.append(self.queue_item_for_active(active))
+                busy_candidates.extend(
+                    item
+                    for item in self.pending
+                    if item.busy_injected and not self.native_queue_observed(item)
+                )
+            for candidate in busy_candidates:
+                expected = self.sidecar_visible_prompt(candidate)
+                if content_hash == prompt_sha256(expected):
+                    nonce = candidate.nonce
+                    break
+            if not nonce and active and seen_at + 2.0 >= active.injected_at:
                 expected = self.sidecar_visible_prompt(self.queue_item_for_active(active))
-                if prompt_sha256(content) == prompt_sha256(expected):
+                if content_hash == prompt_sha256(expected):
                     nonce = active.nonce
         if not nonce:
             return False
@@ -8232,6 +8799,7 @@ class Bridge:
         copy_payload_messages = split_copy_payload_messages(delivered_answer)
         reply_to_message_id = active.message_id if active.message_id > 0 and active.source != "voice" else None
         self.outbox.mark_sending(key, active.send_attempts)
+        terminal_send_failure = False
         try:
             if copy_payload_messages:
                 sent_ids = []
@@ -8258,15 +8826,22 @@ class Bridge:
                         send_error = "copy-content bubble send failed"
                         break
                     sent_ids.extend(bubble_ids)
+        except MeshRouteRetiredError as exc:
+            send_error = str(exc)
+            terminal_send_failure = True
+            sent_ids = None
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
+            sent_ids = None
+        if sent_ids == []:
+            send_error = "telegram send returned no message ids"
             sent_ids = None
         item = self.queue_item_for_active(active)
         if sent_ids is None:
             self.outbox.forget(key)
             with self.lock:
                 attempts = active.send_attempts
-                maxed = attempts >= self.config.send_max_attempts
+                maxed = terminal_send_failure or attempts >= self.config.send_max_attempts
                 if self.active_turn is active and maxed:
                     active.send_in_progress = False
                     self.active_turn = None
@@ -8390,13 +8965,13 @@ class Bridge:
                 return
             if not nonce and self.mark_active_sidecar_body_user_seen(record):
                 return
-            # ⚙️ ambient flow mirror — node-originated incoming directive (다른 노드/오케가
-            # 주입한 트리거 프롬프트). 텔레그램 active turn 도 nonce 도 없는 user 레코드 =
-            # 노드발 지시. 결과("✅ 노드 결과")만 떠서 맥락이 끊기던 문제 보완으로 받은
-            # 지시를 1장 미러한다. 텔레그램-origin 은 clb- nonce 를 달고 들어오므로
-            # not nonce 로 배제(노드 디렉티브는 nonce 無). tool_result(도구결과)는
-            # content_text 가 ""라 자동 제외, sub-agent sidechain 은 isSidechain 가드로
-            # 제외. flow-mirror 토글 ON 한정.
+            if not nonce and self.mark_pending_sidecar_body_user_seen(record):
+                return
+            if not nonce and not record.get("isSidechain") and content_text(content):
+                self.supersede_stale_queued_inputs(
+                    record_timestamp_seconds(record) or time.time(),
+                    reason="direct_human_input",
+                )
             ambient_user_turn = (
                 not nonce
                 and not self.active_turn
@@ -8405,8 +8980,18 @@ class Bridge:
             )
             if ambient_user_turn:
                 self.begin_ambient_response()
-                if flow_mirror_enabled():
-                    self.mirror_ambient_directive(content)
+            # ⚙️ ambient flow mirror — node-originated incoming directive (다른 노드/오케가
+            # 주입한 트리거 프롬프트). 텔레그램 active turn 도 nonce 도 없는 user 레코드 =
+            # 노드발 지시. 결과("✅ 노드 결과")만 떠서 맥락이 끊기던 문제 보완으로 받은
+            # 지시를 1장 미러한다. 텔레그램-origin 은 clb- nonce 를 달고 들어오므로
+            # not nonce 로 배제(노드 디렉티브는 nonce 無). tool_result(도구결과)는
+            # content_text 가 ""라 자동 제외, sub-agent sidechain 은 isSidechain 가드로
+            # 제외. flow-mirror 토글 ON 한정.
+            if (
+                flow_mirror_enabled()
+                and ambient_user_turn
+            ):
+                self.mirror_ambient_directive(content)
             return
 
         if record_type != "assistant" or message.get("role") != "assistant":
@@ -8507,11 +9092,7 @@ class Bridge:
             return
         assistant_uuid = str(record.get("uuid") or "")
         usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-        usage_units = sum(
-            int(value) for key, value in usage.items()
-            if key.endswith("_tokens") and isinstance(value, (int, float)) and value > 0
-        )
-        active.loop_cost_units += usage_units or max(1, math.ceil(len(answer) / 4))
+        active.loop_cost_units += suggested_loop_usage_units(usage, answer)
         reasoning = active.accumulated_reasoning or content_thinking(content)
         active.pending_reasoning = sanitize_text(reasoning, limit=REASONING_MIRROR_LIMIT) or None
         self.send_active_answer(active, assistant_uuid, answer)

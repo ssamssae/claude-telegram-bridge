@@ -9,6 +9,35 @@ answer back to Telegram.
 The bridge is Claude-specific. It is not a general multi-AI bridge and it does
 not share runtime code with the Codex Telegram Bridge.
 
+## Features At A Glance
+
+Everything in the first table works out of the box. Everything in the second
+table is optional: each feature stays off (or on, where noted) until you flip
+one switch, and each links to a section that explains it in plain words.
+
+Always on, no configuration needed:
+
+| Feature | What it gives you |
+| --- | --- |
+| Phone control of a live session | Text your private bot; the message lands in your real Claude Code terminal |
+| Final-answer relay | Only Claude's finished answer comes back — no tool noise, no partial output |
+| One-chat lockdown | The bridge answers exactly one Telegram chat id: yours ([Safety Defaults](#safety-defaults)) |
+| Safe slash commands | `/context`, `/model` and a curated safe set, mirrored back to your phone ([Slash Commands](#slash-commands)) |
+| Setup wizard, doctor, uninstall | `setup` walks you through everything; `doctor` checks health; `uninstall` cleans up |
+| Update check with one-tap upgrade | On startup the bridge checks PyPI and offers an upgrade button in Telegram |
+
+Optional — flip one switch when you want more:
+
+| Feature | Default | Turn it on with | Details |
+| --- | --- | --- | --- |
+| Flow mirror — live card showing each tool step of the current turn | off | `CLB_FLOW_MIRROR=1` | [Optional Settings](#optional-settings) |
+| Suggested-reply bubble — copy-ready follow-up you can tap and send | off | `SUGGESTED_REPLY_BUBBLE=1` | [Optional Settings](#optional-settings) |
+| Suggested-reply auto-send loop — the bridge sends the follow-up for you, inside strict guardrails | off | `CLB_SUGGESTED_LOOP=1` | [Suggested-reply auto-send](#suggested-reply-auto-send-clb_suggested_loop) — read this first |
+| Silent auto-update (upgrade without the button) | off | `CLB_AUTO_UPDATE=1` | `config.example.env` |
+| Update check opt-out | check is on | `CLB_NO_UPDATE_CHECK=1` | `config.example.env` |
+| Native Windows ConPTY transport (experimental) | off | `claude-telegram-bridge setup --transport conpty` | [Quick Start](#quick-start-no-prior-bot-experience-needed) |
+| ~20 tuning knobs — retry policy, queue paths, session TTLs, watchdog hook | safe defaults | edit `bridge.env` | [Advanced settings](#advanced-settings) and `config.example.env` |
+
 ## Quick Start (No Prior Bot Experience Needed)
 
 In plain words: Claude Code runs on your computer, and this bridge lets you
@@ -528,6 +557,60 @@ Send `/ping` to the bot, then send a normal prompt.
   default; markers that declare a class attribute (for example
   `<추천답변 class="auto-ok">`) are always split so the marker text never
   leaks into the answer body.
+- `CLB_SUGGESTED_LOOP` - set `1` to let the bridge **send** the suggested reply
+  for you instead of only displaying it. Off by default, private chats only.
+  When a marker declares `class="auto-ok"` the bridge posts a cancel window and
+  then submits that reply as your next turn unless you tap Cancel. A
+  `class="hold"` marker, a missing class, or an unknown class waits for you to
+  tap the confirm button instead. Every candidate is appended to a JSONL
+  ledger; if that ledger cannot be written the candidate fails closed to HOLD.
+  Read "Suggested-reply auto-send" below before enabling.
+
+### Suggested-reply auto-send (`CLB_SUGGESTED_LOOP`)
+
+This is the only setting that lets the bridge act without you typing anything.
+It is off by default. With it on, an answer can start the next turn on its own,
+so read the guardrails before setting `CLB_SUGGESTED_LOOP=1`.
+
+**How a suggestion is classified**
+
+| Marker in the answer | What happens |
+| --- | --- |
+| `class="auto-ok"` | cancel window (default 20s), then auto-sent |
+| `class="hold"` | waits for your confirm tap |
+| no class / unknown class | waits (fails closed) |
+
+**Caps - tripping any one forces HOLD**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CLB_SUGGESTED_LOOP_VETO_SECONDS` | `20` | cancel window, clamped to 15-30 |
+| `CLB_SUGGESTED_LOOP_MAX_ITERATIONS` | `3` | consecutive auto-sends |
+| `CLB_SUGGESTED_LOOP_MAX_SECONDS` | `900` | wall-clock budget per loop |
+| `CLB_SUGGESTED_LOOP_MAX_COST_UNITS` | `100000` | rough output-size budget |
+
+**Content exclusions.** Even when an answer claims `auto-ok`, the bridge
+re-reads the suggestion text and forces HOLD when it looks like a main merge, an
+app-store submission, credentials/login/OTP, a payment, an external send
+(email/DM/publish), or physical-device control. Treat this as a second opinion
+on the model's own label, not as a replacement for reading the suggestion.
+
+> **Language caveat.** These exclusion patterns were written for a
+> Korean-language operator and match Korean phrasing far more thoroughly than
+> English. `payment` and `account_auth` match common English wording, and
+> `external_send` partially does, but `physical_device` is almost entirely
+> Korean - "turn on the air conditioner" will not trip it. If you operate the
+> bridge in English, treat the exclusion net as partial and rely on the caps and
+> the cancel window instead.
+
+**Turning it off**
+
+- Immediately, without a restart: `touch ~/.claude/state/claude-suggested-loop.off`
+  (path configurable with `CLB_SUGGESTED_LOOP_KILL`). The "off" button on any
+  suggestion card does the same thing.
+- Permanently: unset `CLB_SUGGESTED_LOOP` and restart the bridge.
+
+The loop never arms in group chats.
 
 ### Advanced settings
 
