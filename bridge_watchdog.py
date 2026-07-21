@@ -19,6 +19,7 @@ APP_NAME = "claude-telegram-bridge"
 SERVICE_NAME = f"{APP_NAME}.service"
 LAUNCHD_LABEL = "com.user.claude-telegram-bridge"
 RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
+StartProcess = Callable[[list[str]], None]
 NativeHostProbe = Callable[[], dict[str, object]]
 BridgeRunning = Callable[[RunCommand], bool]
 
@@ -32,6 +33,30 @@ def run_command(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     return subprocess.run(cmd, **kwargs)
+
+
+def start_detached(cmd: list[str]) -> None:
+    """Launch a long-running process without waiting for it to exit.
+
+    The bridge daemon runs indefinitely. Starting it through a blocking
+    ``subprocess.run(..., capture_output=True)`` makes the watchdog wait
+    forever for a process that never returns, which deadlocks the restart
+    path. Launch it detached and return immediately instead.
+    """
+    kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW
+            | subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        kwargs["start_new_session"] = True
+    subprocess.Popen(cmd, **kwargs)
 
 
 def status_text(proc: subprocess.CompletedProcess[str]) -> str:
@@ -125,6 +150,7 @@ def watch_windows(
     native_host_probe: NativeHostProbe,
     bridge_running: BridgeRunning,
     settle_seconds: float,
+    start_process: StartProcess = start_detached,
 ) -> int:
     host = native_host_probe()
     if host.get("ok") is not True:
@@ -134,13 +160,15 @@ def watch_windows(
     if bridge_running(run):
         write_status(status_file, "active", "windows-native-bridge")
         return 0
-    start = run(windows_bridge_start_command())
+    # Launch the long-running daemon detached. A blocking start here would wait
+    # for a process that never exits and deadlock the watchdog restart path.
+    start_process(windows_bridge_start_command())
     if settle_seconds > 0:
         time.sleep(settle_seconds)
-    if start.returncode == 0 and bridge_running(run):
+    if bridge_running(run):
         write_status(status_file, "recovered", "windows-native-bridge")
         return 0
-    write_status(status_file, "failed", status_text(start) or "windows-native-bridge:start-failed")
+    write_status(status_file, "failed", "windows-native-bridge:start-failed")
     return 1
 
 
@@ -155,6 +183,7 @@ def watch_once(
     native_host_probe: NativeHostProbe | None = None,
     bridge_running: BridgeRunning = windows_bridge_process_running,
     settle_seconds: float = 2.0,
+    start_process: StartProcess = start_detached,
 ) -> int:
     os_name = os_name or platform.system()
     status_file = status_file or default_status_file()
@@ -170,6 +199,7 @@ def watch_once(
             native_host_probe=native_host_probe or (lambda: probe_native_host(run)),
             bridge_running=bridge_running,
             settle_seconds=settle_seconds,
+            start_process=start_process,
         )
     write_status(status_file, "unsupported", os_name)
     return 0

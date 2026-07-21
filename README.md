@@ -9,6 +9,40 @@ answer back to Telegram.
 The bridge is Claude-specific. It is not a general multi-AI bridge and it does
 not share runtime code with the Codex Telegram Bridge.
 
+## 5-Minute Quick Start
+
+Already have Claude Code installed and logged in on your computer? You are three
+steps from controlling it from your phone. (Never made a Telegram bot before?
+The unhurried, click-by-click version is in
+[Quick Start](#quick-start-no-prior-bot-experience-needed) below — start there
+instead.)
+
+**1. Install the bridge** (Linux, macOS, or WSL on Windows):
+
+```bash
+pipx install claude-telegram-bridge
+```
+
+**2. Create your private bot and copy its token.** In Telegram, open a chat with
+[`@BotFather`](https://t.me/BotFather), send `/newbot`, pick any name, and copy
+the token it hands back — it looks like `1234567890:AbCd...`. Keep it private:
+paste it only into the setup prompt below, never into a chat or a public repo.
+
+**3. Run setup and say hello:**
+
+```bash
+claude-telegram-bridge setup
+```
+
+The wizard asks for that token, then tells you to send `/start` to your new bot
+from your own Telegram account — that one message teaches the bridge which chat
+is yours. It writes the config, installs the hook and watchdog, and sends a test
+message. Now text your bot: whatever you type lands in your live Claude Code
+session, and Claude's finished answer comes back to your phone.
+
+That is the whole happy path. Everything below is reference — the full guided
+walkthrough, what each feature does, optional switches, and manual setup.
+
 ## Features At A Glance
 
 Everything in the first table works out of the box. Everything in the second
@@ -428,6 +462,35 @@ Installed copies also get
 the startup version check with a one-tap Telegram update button. Running from
 a clone works too: use `python3 claude_telegram_bridge.py` in place of the
 installed command.
+
+### Native Windows ConPTY autostart (survives logout)
+
+On native Windows the ConPTY transport can run as a headless operational stack so
+the bridge keeps working after a WSL/Ubuntu logout, independent of any tmux
+session. `scripts/windows/install-claude-conpty-autostart.ps1` registers three
+hidden Scheduled Tasks at logon:
+
+- `powershell-claude-conpty-host` — the owned ConPTY host (`python -m
+  claude_repl_host_windows`) that launches Claude and owns its terminal for the
+  session's lifetime.
+- `powershell-claude-conpty-bridge` — waits for the host, then runs the bridge
+  (`python -m claude_telegram_bridge`) with `CLB_REPL_TRANSPORT=conpty` pinned to
+  the host's descriptor.
+- `powershell-claude-conpty-watchdog` — the shared recovery watchdog, restarts a
+  stale bridge (orphan child purge first) without touching the host session.
+
+```powershell
+# from PowerShell (needs the conpty transport and a configured token)
+powershell -ExecutionPolicy Bypass -File install-claude-conpty-autostart.ps1 -Mode Install -Start
+powershell -ExecutionPolicy Bypass -File install-claude-conpty-autostart.ps1   # Check
+```
+
+Because the host runs hidden, two visible surfaces are provided:
+`claude-conpty-view.ps1` is a read-only live view of the conversation, and
+`claude-conpty-client.ps1` is an interactive attach client that both shows the
+live session and forwards local keyboard input into it — the Windows equivalent
+of `tmux attach` (open and close it without ending the session). Manual restart
+steps are in `runbooks/claude-conpty-bridge-restart.md`.
 
 ## Minimal Manual Setup
 

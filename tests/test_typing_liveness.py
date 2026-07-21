@@ -1,3 +1,13 @@
+"""T-260720-033: typing-liveness 신세대 test (공개 배포본 정본).
+
+공개 repo의 구세대 test_typing_liveness.py를 대체한다. 구세대 test는 Bridge를
+__new__로 만들고 속성을 수동 세팅하는데, 신세대 drain_queue가 service_exhaust_parked_items
+(T-260718-046 exhausted-park)를 거치며 self.exhaust_parked를 참조한다. 구세대 test는 그
+속성을 세팅하지 않아 신 코드에서 AttributeError로 죽었다(세대 불일치). 이 정본은 동일 계약을
+검증하되 신세대 인스턴스 상태(exhaust_parked)를 함께 갖춘다.
+
+export가 dist/tests로 내보낼 때 브릿지 파일명만 언더스코어로 재작성한다(로드 경로 표준화).
+"""
 import importlib.util
 import sys
 import threading
@@ -62,6 +72,9 @@ class TypingLivenessTest(unittest.TestCase):
         bridge.try_busy_inject = mock.Mock(return_value=False)
         bridge.ensure_typing = mock.Mock()
         bridge.stop_typing = mock.Mock()
+        # 신세대 상태: exhausted-park 서비스 경로(T-260718-046)가 drain_queue에서 참조.
+        bridge.exhaust_parked = []
+        bridge.last_nonidle_seen_at = 0.0
 
         bridge.drain_queue()
 
