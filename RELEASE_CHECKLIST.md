@@ -60,6 +60,13 @@ PY
 PYTHONPATH=dist/claude-telegram-bridge python3 -m claude_repl_host_windows --self-test
 ```
 
+   The public `tests/` directory is governed by `PUBLIC_TESTS.manifest`
+   (packaging/claude-telegram-bridge) — the single source of truth for which
+   test files ship. `scripts/tests/test_claude_bridge_oss_export.sh` asserts the
+   exported tests/ equals the manifest exactly and runs the full suite via
+   `unittest discover`, exactly as the public CI. Every public test is
+   export-produced; never hand-edit a test in the public repo (T-260721-003).
+
 5. Re-read README billing language. It must say billing classification is
 unverified and must not claim subscription safety.
 

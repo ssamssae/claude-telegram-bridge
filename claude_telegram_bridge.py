@@ -1986,6 +1986,33 @@ def flow_card_steps(text: str) -> tuple[list[str], str]:
     return rendered, current
 
 
+# ⚙️ flow 카드 종료 표기 (T-260721-022) — 턴이 끝나면 카드 footer 를 종료 상태로
+# 갈아끼운다. 미지 status 를 '완료'로 뭉개면 진행중 고아와 똑같은 거짓 표기가 되므로
+# 매핑에 없는 값은 원문을 그대로 노출한다.
+# ambient_* 는 노드발(자율/디렉티브) 카드 종료 라벨 (T-260721-024).
+FLOW_DONE_LABELS = {
+    "sent": "완료",
+    "answered": "완료",
+    "ambient_final": "완료",
+    "ambient_reset": "중단",
+}
+
+
+def flow_done_label(status: str) -> str:
+    return FLOW_DONE_LABELS.get(status) or f"종료 · {status or 'unknown'}"
+
+
+def format_flow_elapsed(seconds: float) -> str:
+    total = int(max(0.0, float(seconds)))
+    if total < 60:
+        return f"{total}초"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}분 {secs}초" if secs else f"{minutes}분"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}시간 {minutes}분" if minutes else f"{hours}시간"
+
+
 def format_flow_mirror(
     text: str,
     *,
@@ -1994,6 +2021,8 @@ def format_flow_mirror(
     context: str = "",
     now: datetime | None = None,
     autonomous: bool = False,
+    done_label: str = "",
+    elapsed_text: str = "",
 ) -> str:
     lines, current = flow_card_steps(text)
     if not lines:
@@ -2005,8 +2034,11 @@ def format_flow_mirror(
     node_emoji = emoji or mapped_emoji or default_emoji
     timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
     header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
-    state = "노드 자율 진행중" if autonomous else "진행중"
-    footer = f"→ {state} · 현재: {current}"
+    if done_label:
+        footer = f"→ {done_label} · 소요 {elapsed_text}" if elapsed_text else f"→ {done_label}"
+    else:
+        state = "노드 자율 진행중" if autonomous else "진행중"
+        footer = f"→ {state} · 현재: {current}"
     available = max(1, FLOW_MIRROR_LIMIT - len(header) - len(footer) - 4)
     while len(lines) > 1 and len("\n".join(lines)) > available:
         lines.pop(0)
@@ -2023,6 +2055,8 @@ def format_ambient_flow(
     emoji: str = "",
     context: str = "",
     now: datetime | None = None,
+    done_label: str = "",
+    elapsed_text: str = "",
 ) -> str:
     return format_flow_mirror(
         text,
@@ -2031,6 +2065,8 @@ def format_ambient_flow(
         context=context,
         now=now,
         autonomous=True,
+        done_label=done_label,
+        elapsed_text=elapsed_text,
     )
 
 
@@ -3271,6 +3307,7 @@ class ActiveTurn:
     pending_reasoning: str | None = None  # transient: 🧠 mirror text for this turn (not persisted)
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
     flow_message_id: int = 0  # persisted across restart (anti-fragmentation): telegram message id of this turn's ⚙️ flow card (edit-in-place)
+    flow_closed: bool = False  # transient: 종료 카드 edit 멱등 가드 (T-260722-008)
     flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
     sent_at: float = 0.0  # T-260705-67: 사용자 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
     source: str = ""
@@ -3943,8 +3980,19 @@ def transcripts_from_process_fds(pids: set[int]) -> set[Path]:
                 target = os.readlink(fd)
             except OSError:
                 continue
-            if "/.claude/projects/" in target and target.endswith(".jsonl"):
-                candidates.add(Path(target).resolve())
+            if "/.claude/projects/" not in target or not target.endswith(".jsonl"):
+                continue
+            # T-260722-037/038: 서브에이전트 트랜스크립트는 세션 후보가 아니다.
+            #   서브에이전트가 도는 동안 그 jsonl 의 fd 가 열려 있어 후보로 잡히면
+            #   브릿지가 메인 세션 대신 그 파일에 바인딩되고, 턴 완료 증거(user/
+            #   assistant 레코드)는 메인 jsonl 에만 쌓이므로 active_turn 이 정상
+            #   경로로 안 풀려 busy_state()=generating 이 고착 → 인바운드 주입 전면
+            #   정지(2026-07-22 실측 902초, 해제는 900s 안전망뿐).
+            #   우선순위 부여가 아니라 제외를 택한 이유: 우선순위로는 subagent 가
+            #   유일 후보일 때 여전히 그걸 물게 되는데 그 상태가 바로 이 웨지다.
+            if "/subagents/" in target:
+                continue
+            candidates.add(Path(target).resolve())
     return candidates
 
 
@@ -4737,6 +4785,8 @@ class Bridge:
         # Ephemeral (not persisted): on restart ambient starts fresh. Flag-gated OFF.
         self.ambient_flow_body: str = ""
         self.ambient_flow_message_id: int = 0
+        # ⚙️ ambient 카드 종료 표기용 시작 시각 (T-260721-024). 0 = 소요시간 미표기.
+        self.ambient_flow_started_at: float = 0.0
         # ⚙️ ambient flow mirror — 노드발 작업 최종답변 미러 dedup(같은 결론 재미러 방지).
         self.ambient_final_last_key: str = ""
         # ⚙️ ambient flow mirror — 받은지시 카드를 결과 카드의 앵커로 재사용 (T-260630-48):
@@ -4823,19 +4873,25 @@ class Bridge:
             candidate.status = claimed
             return True
 
-    def register_suggested_reply(self, active: ActiveTurn, parsed: SuggestedReply, answer: str) -> None:
+    def register_suggested_reply(self, active: ActiveTurn | None, parsed: SuggestedReply, answer: str, *, force_hold: bool = False) -> None:
         if not self.suggested_loop_runtime_enabled or not is_private_chat_id(self.config.chat_id) or self.config.suggested_loop_kill_path.exists() or not parsed.reply:
             return
         decision = classify_suggested_reply(parsed)
         now = time.time()
-        iteration = active.loop_iteration + 1
-        started_at = active.loop_started_at or now
-        cost_units = active.loop_cost_units or max(1, math.ceil(len(answer) / 4))
+        # T-260720-026: active=None 은 비표준 마감경로(ambient-final·stale-release)에서 온 노드/
+        # 디렉티브발 턴 — suggested-loop iteration 체인 밖이라 기본값으로 처리한다.
+        iteration = (active.loop_iteration + 1) if active else 1
+        started_at = (active.loop_started_at or now) if active else now
+        cost_units = active.loop_cost_units if (active and active.loop_cost_units) else max(1, math.ceil(len(answer) / 4))
         cap_reason = self.suggested_loop_cap_reason(
             iteration=iteration, started_at=started_at, cost_units=cost_units
         )
         if cap_reason:
             decision = SuggestedDecision("hold", cap_reason)
+        # T-260720-026: 사람이 시작하지 않은 ambient/노드발 마감의 추천답변은 hold 로 고정한다
+        # (카드는 띄우되 사용자 확인 필수) — 노드발 턴이 auto-fire 로 후속을 자가 트리거하는 위험 차단.
+        if force_hold:
+            decision = SuggestedDecision("hold", "ambient_origin")
         status = "veto_pending" if decision.decision == "auto-ok" else "hold"
         candidate = SuggestedLoopCandidate(
             candidate_id=secrets.token_hex(6),
@@ -6052,6 +6108,10 @@ class Bridge:
             self.active_turn = None
         self.flush_reasoning_mirror(active)  # ⚠️ 제거 금지 (DO NOT REMOVE) — release 전 🧠 reasoning 보장 (T-260701-63)
         self.stop_typing()
+        # T-260722-008: 이 경로가 실측상 턴 종료의 주 경로다(outbox_sent 회수). 여기서 안 닫으면
+        # 뒤따르는 finish_active_turn 이 'skip stale finish' 로 조기 return 해 카드가 영영
+        # '진행중' 으로 굳는다. close_flow_card 는 flow_closed 로 멱등이라 이중 edit 은 없다.
+        self.close_flow_card(active, "sent")
         if completed_by_outbox and not completed_by_queue:
             self.queue.append_status(
                 item,
@@ -6084,6 +6144,9 @@ class Bridge:
             self.session_pos = 0
         self.flush_reasoning_mirror(active)  # ⚠️ 제거 금지 (DO NOT REMOVE) — release 전 🧠 reasoning 보장 (T-260701-63)
         self.stop_typing()
+        # T-260722-008: 세션 상실로 끊긴 턴도 카드를 닫는다. 다만 '완료' 로 뭉개지 않는다 —
+        # flow_done_label 이 미지 status 를 '종료 · <status>' 로 원문 노출하므로 사실대로 남는다.
+        self.close_flow_card(active, "session_lost")
         self.queue.append_status(item, "stale_released", release_reason="tmux_session_lost")
         self.mark_directive_terminal(item, "failed", error="tmux_session_lost")
         self.persist_state()
@@ -7351,7 +7414,11 @@ class Bridge:
                     fh.seek(start)
                     fh.readline()  # 부분 라인 스킵
                 for line in fh:
-                    if item.nonce not in line and '"user"' not in line:
+                    if (
+                        item.nonce not in line
+                        and '"user"' not in line
+                        and '"attachment"' not in line
+                    ):
                         continue
                     try:
                         record = json.loads(line)
@@ -7365,12 +7432,21 @@ class Bridge:
                     nonce = record_contains_nonce(record) or record_attachment_nonce(record)
                     if nonce == item.nonce:
                         return record
-                    if nonce or record_type != "user":
+                    if nonce:
+                        # 다른 논스를 실은 레코드 = 다른 메시지. 본문 해시 폴백 금지.
                         continue
-                    message = record.get("message") if isinstance(record.get("message"), dict) else {}
-                    if message.get("role") != "user":
-                        continue
-                    body = content_text(message.get("content"))
+                    # T-260719-058: sidecar 모드는 논스를 가시 프롬프트 밖으로 빼므로
+                    # busy-inject native 큐 attachment 로 mid-turn 착탄한 소비 레코드는
+                    # 논스가 없다. user 레코드뿐 아니라 attachment 레코드도 본문 해시로
+                    # 착탄 실증한다 (PR#895 는 논스 박힌 attachment 만 커버해 논스 부재
+                    # 변종을 놓쳤다 — 2026-07-19 15:15 msg_id 60262/queue cf93292c 중복 사고).
+                    if record_type == "user":
+                        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+                        if message.get("role") != "user":
+                            continue
+                        body = content_text(message.get("content"))
+                    else:
+                        body = attachment_text(record.get("attachment"))
                     if not body:
                         continue
                     # 주입 이전 timestamp 의 동일 본문(과거 중복 발화) 오매칭은 시각 가드로
@@ -8466,6 +8542,7 @@ class Bridge:
         promoted_busy_injected = False
         busy_inject_demoted = False
         repaste_dedup_record: dict[str, Any] | None = None
+        repaste_evidence = ""
         with self.lock:
             if self.active_turn or not self.pending:
                 return
@@ -8528,7 +8605,25 @@ class Bridge:
                     # nonce from being submitted twice.
                     repaste_dedup_record = self.envelope_sidecar_consumed_record(item)
                     if repaste_dedup_record:
-                        consumed_at = self.sidecar_consumed_at(repaste_dedup_record)
+                        repaste_evidence = "sidecar-consumed"
+                    else:
+                        # T-260722-001: envelope sidecar 는 논스 부재 착탄(sidecar 모드
+                        # busy-inject native 큐 attachment)을 못 잡는다 — 967(T-260719-058)
+                        # 이 terminal 재스캔에서 메운 것과 동종 갭. 재붙여넣기 직전 transcript
+                        # tail 을 직접 재스캔해 본문/attachment 해시 일치 착탄을 한 번 더 확인한다
+                        # (미검출 시 기존 강등→재-paste 복구 경로 그대로 유지).
+                        try:
+                            repaste_dedup_record = self.transcript_consumed_record_for_item(item)
+                        except Exception as exc:  # noqa: BLE001
+                            log("INJECT", f"re-paste transcript-rescan failed nonce={item.nonce}: {exc}")
+                            repaste_dedup_record = None
+                        if repaste_dedup_record:
+                            repaste_evidence = "transcript-rescan"
+                    if repaste_dedup_record:
+                        if repaste_evidence == "sidecar-consumed":
+                            consumed_at = self.sidecar_consumed_at(repaste_dedup_record)
+                        else:
+                            consumed_at = record_timestamp_seconds(repaste_dedup_record) or time.time()
                         item.native_queue_attached = True
                         self.active_turn.native_queue_attached = True
                         self.active_turn.sidecar_consumed_at = consumed_at
@@ -8555,7 +8650,7 @@ class Bridge:
             log(
                 "INJECT",
                 f"busy-inject re-paste dedup nonce={item.nonce} update={item.update_id} "
-                "evidence=sidecar-consumed",
+                f"evidence={repaste_evidence or 'sidecar-consumed'}",
             )
         if busy_inject_demoted:
             log(
@@ -9671,8 +9766,12 @@ class Bridge:
         # ⚙️ ambient flow mirror (v0.1.5) — incoming-message boundary reset: a new active
         # telegram turn closes the current ambient card so the next bout of
         # node-autonomous work starts a fresh card instead of growing the old one.
+        # T-260721-024: 경계에서 id 만 버리면 직전 카드가 '노드 자율 진행중' 으로 굳는다.
+        # 새 사람 턴이 끼어든 것이므로 '중단' 으로 마감하고 버린다.
+        self.close_ambient_flow_card("ambient_reset")
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
+        self.ambient_flow_started_at = 0.0
 
     def mirror_ambient_flow(self, content: Any) -> None:
         # ⚙️ ambient flow mirror (v0.1.5) — see call site in process_record. Non-fatal;
@@ -9696,6 +9795,7 @@ class Bridge:
                     )
                 )
                 self.ambient_flow_message_id = ids[0] if ids else 0
+                self.ambient_flow_started_at = time.time()  # 종료 카드 소요시간 기준 (T-260721-024)
                 log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient flow send failed (non-fatal): {exc}")
@@ -9715,6 +9815,33 @@ class Bridge:
                 log("SEND", f"edited ambient flow mid={self.ambient_flow_message_id}")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient flow edit failed (non-fatal): {exc}")
+
+    def close_ambient_flow_card(self, status: str) -> bool:
+        # ⚙️ ambient 카드 종료 edit (T-260721-024) — 노드발(자율/cron/디렉티브) 작업 카드가
+        # 끝나도 '→ 노드 자율 진행중 · 현재: …' 로 굳어 고아로 남던 회귀 차단. 텔레그램-origin
+        # 턴은 T-260722-022 의 close_flow_card 가 닫고, 이쪽은 그 자율 경로 형제다.
+        # 야간 autopilot 트래픽 대부분이 이 경로라 사용자 챗에 굳은 카드가 계속 쌓였다.
+        # 카드 부재면 조용히 skip, edit 실패·포맷 예외는 전부 non-fatal(미러 경로 무영향).
+        if not self.ambient_flow_message_id or not self.ambient_flow_body:
+            return False
+        try:
+            started = self.ambient_flow_started_at
+            body = format_ambient_flow(
+                self.ambient_flow_body,
+                node=self.config.node,
+                emoji=self.config.emoji,
+                context=self.ambient_directive_body,
+                done_label=flow_done_label(status),
+                elapsed_text=format_flow_elapsed(time.time() - started) if started else "",
+            )
+            if not body:
+                return False
+            self.telegram.edit(self.ambient_flow_message_id, body)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"ambient flow close failed (non-fatal): {exc}")
+            return False
+        log("SEND", f"closed ambient flow mid={self.ambient_flow_message_id} status={status}")
+        return True
 
     def mirror_ambient_directive(self, content: Any) -> None:
         # ⚙️ ambient flow mirror — node-originated work 의 받은 지시(트리거) 카드를 노드
@@ -9753,6 +9880,14 @@ class Bridge:
         # 유령이 됐다(2026-07-05 새벽 5노드 실측). suppress/dedupe/전송실패 분기 포함
         # 모든 종료 경로보다 앞에서 소등한다.
         self.stop_typing()
+        # T-260721-024: ⚙️ 카드 마감도 같은 이유로 여기 둔다 — 아래는 suppress/dedupe/전송실패로
+        # 조기 return 하는 분기가 여럿이라, 함수 끝에서 닫으면 그 경로들에서 카드가 '노드 자율
+        # 진행중' 으로 굳는다. bout 자체는 end_turn 으로 이미 끝났으므로 최종답변 미러 성패와
+        # 무관하게 여기서 닫는 게 맞다.
+        self.close_ambient_flow_card("ambient_final")
+        self.ambient_flow_body = ""
+        self.ambient_flow_message_id = 0
+        self.ambient_flow_started_at = 0.0
         # T-260719-078: 추천답변(<추천답변>) 마커는 FLOW_MIRROR_LIMIT truncation 전에
         # 분리한다. 자율/directive 턴의 최종답변이 1500자를 넘으면 sanitize_text 의
         # 절단이 꼬리의 마커를 잘라 parse_suggested_reply 가 실패, 추천답변 버블이 매
@@ -9877,9 +10012,16 @@ class Bridge:
                     getattr(self.config, "suggested_reply_confirmation_enabled", True),
                     "telegram" if surface == "aniki_dm" else "node",
                 )
+            # T-260720-026: ambient-final·stale-release 마감은 정상 send 경로(send_claimed_active_answer)
+            # 를 안 지나 register_suggested_reply 가 호출되지 않아 원장 등록+제어카드(hold/veto)가
+            # 유실됐다(2026-07-20 15:38·15:47 실사고 — 원장 엔트리 0). ambient_final_last_key dedup 뒤라
+            # distinct final 당 1회. active 없음 → None + force_hold(노드발 auto-fire 방지).
+            self.register_suggested_reply(None, parse_suggested_reply(cleaned_final), cleaned_final, force_hold=True)
         # 최종 답변 미러 후 flow 카드 bout 종료 -> 다음 노드 작업은 새 카드로.
+        # (카드 마감 edit 은 stop_typing 직후에서 이미 수행 — 조기 return 분기 커버, T-260721-024)
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
+        self.ambient_flow_started_at = 0.0
 
     def finish_active_turn(self, status: str, active: ActiveTurn) -> bool:
         with self.lock:
@@ -9893,11 +10035,46 @@ class Bridge:
                 return False
             self.active_turn = None
         self.stop_typing()
+        self.close_flow_card(active, status)
         self.queue.append_status(self.queue_item_for_active(active), status)
         self.release_batched_busy_pending(active, status)
         self.persist_state()
         self.write_egress_sidecar()
         self.drain_queue()
+        return True
+
+    def close_flow_card(self, active: ActiveTurn, status: str) -> bool:
+        # ⚙️ flow 카드 종료 edit (T-260721-022) — 턴이 끝나도 카드가 '진행중 · 현재: ▶ 실행'
+        # 으로 굳어 고아로 남던 회귀(2026-07-21 21:41 사용자 제보, 51분 잔류) 차단.
+        # 카드가 없으면(미러 OFF·도구 0회) 조용히 skip 하고, edit 실패도 non-fatal —
+        # 최종답변 발송 경로와 완전히 무관하다. 토글 상태가 아니라 카드 존재로 판정하는 건
+        # 턴 도중 토글이 꺼져도 이미 뜬 카드는 닫아야 하기 때문이다.
+        #
+        # T-260722-008: 턴 종료 경로가 둘이라 멱등 가드가 필요하다. 실측(2026-07-22 10:41)에서
+        # 주 경로는 finish_active_turn 이 아니라 release_completed_active_turn_if_recorded 였고,
+        # 그쪽이 active_turn 을 먼저 해제해 버려 finish_active_turn 은 'skip stale finish' 로
+        # 조기 return → 카드가 한 번도 안 닫혔다(재기동 후 'closed flow mirror' 0건). 양쪽에서
+        # 부르되 edit 은 1회만 나가야 한다.
+        if active.flow_closed or not active.flow_message_id or not active.flow_body:
+            return False
+        active.flow_closed = True
+        try:
+            started = active.injected_at or active.sent_at or 0.0
+            body = format_flow_mirror(
+                active.flow_body,
+                node=self.config.node,
+                emoji=self.config.emoji,
+                context=active.text,
+                done_label=flow_done_label(status),
+                elapsed_text=format_flow_elapsed(time.time() - started) if started else "",
+            )
+            if not body:
+                return False
+            self.telegram.edit(active.flow_message_id, body)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"flow mirror close failed (non-fatal): {exc}")
+            return False
+        log("SEND", f"closed flow mirror nonce={active.nonce} mid={active.flow_message_id} status={status}")
         return True
 
     def quarantine_line(self, line: bytes, error: str, start: int, end: int) -> None:
