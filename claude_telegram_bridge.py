@@ -44,6 +44,11 @@ from typing import Any, Callable, Protocol, runtime_checkable
 
 
 
+try:
+    import mesh_approval  # noqa: E402 - 승인 대기함 레지스트리 (renderer spec §7)
+except ModuleNotFoundError:  # Standalone/OSS bridge builds omit internal automation modules.
+    mesh_approval = None  # type: ignore[assignment]
+
 
 HOME = Path.home()
 KST = timezone(timedelta(hours=9), "KST")
@@ -53,7 +58,16 @@ NATIVE_WINDOWS_DAEMON_ERROR = (
     "Native Windows tmux mode is unsupported — run the default transport inside WSL, "
     "or explicitly configure CLB_REPL_TRANSPORT=conpty for the experimental owned host."
 )
-NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916"}
+NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916",
+                    # 2026-07-25 신 이모지 세트 (구 세트는 전환창 동안 계속 인식)
+                    "\U0001f989", "\U0001f30b", "\U000026a1", "\U00002696", "\U0001fabd", "\U0001f531",
+                    # T-260725-035: variation selector(U+FE0F) 붙은 형태도 수용.
+                    #   일부 노드의 방출값은 U+2696 U+FE0F 인데 위엔 U+2696 만 있어
+                    #   strip/멱등 판정이 빗나가 그 노드 메시지에 이모지가 이중 접두된다.
+                    #   U+1F5A5 U+FE0F 도 같은 이유로 구 세트 대칭 보강. 집합 판정이라 추가는 무해.
+                    #   ※ 주석에 이모지 글리프를 직접 쓰지 않는다 — 공개 export 어휘 게이트가
+                    #     노드 이모지를 금지어로 보므로 코드포인트 표기로 남긴다 (T-260729-023).
+                    "\U00002696\U0000fe0f", "\U0001f5a5\U0000fe0f"}
 
 
 def current_hostname() -> str:
@@ -106,6 +120,27 @@ SUGGESTED_LOOP_CALLBACK = "clb-suggest"
 # 선택지 목록: env CLB_MODEL_CHOICES(콤마) 우선. 아래 fallback 은 모델 id 가 아니라 CLI alias 토큰
 # (하드코딩 최소화 — 새 모델은 env 로 주입, 현재 모델 표시는 settings SoT 에서 동적).
 DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
+# /effort 도 같은 프리즈 계열이다 (T-260726-034, 사용자 지적 2026-07-26 10:58).
+#   CLI 실측: 인터랙티브 변형은 type="local-jsx" requires={"ink": True} 라 ink 픽커를
+#   띄운다 → tmux TUI 를 점유하고 폰에는 아무것도 안 뜬다(= 무응답으로 보이는 증상).
+#   인자형은 type="local" supportsNonInteractive=True → 인자로 주면 픽커 없이 적용된다.
+#   그래서 /model 과 똑같이 "인터셉트해서 inline keyboard 로 고르고, 적용은 인자형" 을 쓴다.
+EFFORT_SLASH_COMMAND = "/effort"
+EFFORT_CALLBACK = "clb-effort"
+# 선택지: env CLB_EFFORT_CHOICES(콤마) 우선. fallback 은 CLI 설명표의 5종.
+#   유효 레벨은 모델별로 다르고(CLI 내부 V1e(model)) ultracode 는 dynamic-workflows
+#   게이트라, 목록 밖 값은 '!' escape 원문 주입으로 남긴다 (하드코딩 최소화 — /model 동형).
+DEFAULT_EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+# 선택형 슬래시 표 — 인터셉트 대상과 처리기. 새 선택형 명령은 여기 한 줄로 얹는다.
+SELECTABLE_SLASH_HANDLERS = {
+    MODEL_SLASH_COMMAND: "handle_model_command",
+    EFFORT_SLASH_COMMAND: "handle_effort_command",
+}
+# 콜백 prefix → 적용 메서드. 위조 callback_data 는 각 적용부의 allowlist 가 막는다.
+SELECTABLE_SLASH_CALLBACKS = {
+    MODEL_CALLBACK: "apply_model_choice",
+    EFFORT_CALLBACK: "apply_effort_choice",
+}
 # 프리즈 가드 밖 원문 강제 주입 escape hatch: 메시지 맨 앞 '!' 1자 (예: !/theme).
 # T-260710-80 이후 일반 슬래시는 기본 통과라 주로 /model 인터셉트·캡처미러 우회용.
 SLASH_ESCAPE_PREFIX = "!"
@@ -116,6 +151,10 @@ SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
 # clear_composer() 의 Escape 가 그 턴을 끊지 않도록. 사용자는 턴 종료 후 다시 누르면 된다.
 MODEL_BUSY_DEFER_TEXT = (
     "⏳ 지금 진행 중인 턴이 있어 모델 전환을 미뤘어요 (진행 중 턴을 끊지 않아요).\n"
+    "턴이 끝난 뒤 다시 선택해 주세요."
+)
+EFFORT_BUSY_DEFER_TEXT = (
+    "⏳ 지금 진행 중인 턴이 있어 사고강도 전환을 미뤘어요 (진행 중 턴을 끊지 않아요).\n"
     "턴이 끝난 뒤 다시 선택해 주세요."
 )
 NATIVE_PANE_DEFER_TEXT = (
@@ -166,6 +205,23 @@ TYPING_LIVENESS_GRACE_PULSES = 5
 TYPING_LIVENESS_CHECK_EVERY = 5
 FLOW_MIRROR_ENV = "CLB_FLOW_MIRROR"
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
+# ⚙️ flow mirror 침묵구간 하트비트 (T-260727-076) — 카드는 도구 이벤트가 있을 때만 렌더된다.
+# 워커가 도구 하나를 오래 도는 구간엔 이벤트가 없어 카드가 정지하고, 그 정지는 죽은 턴과
+# 화면상 완전히 같다(실측 2026-07-27 침묵창 3분19초·6분23초, 같은 구간 mesh-ledger 는 정상).
+# 보조 신호도 이미 끊긴다 — EYE_ACTIVITY_MAX_EDITS×EYE_ACTIVITY_EDIT_MIN_SECONDS ≈ 2분 후
+# 활동 표시기가 스스로 종료돼, 2분 넘는 침묵엔 살아있음 신호가 구조적으로 0 이다.
+#
+# 주기 45초 = 텔레그램 편집 레이트리밋 대비 카드당 ~1.3회/분(충분히 보수적) + 화면상
+# 최대 체감 정지 45초. 편집 폭주가 429 를 부르면 카드 자체가 죽으므로 상한·백오프 필수.
+FLOW_HEARTBEAT_SECONDS = 45.0
+# ⚠️ 상한이 이 기능의 안전핀이다. 하트비트가 무한이면 **죽은 턴이 영원히 살아있어 보이는**
+# 정반대 사고가 된다 — 원 증상보다 이쪽이 더 위험하다. 상한을 넘기면 갱신을 멈추고
+# 카드를 얼린다(= 종전 동작). 얼어붙은 카드는 정직한 신호이고, 죽음의 '판정'은 별도 축
+# (T-260727-052 턴 사망 감시)이 맡는다. 40틱 × 45초 ≈ 30분.
+FLOW_HEARTBEAT_MAX_TICKS = 40
+# 연속 실패(429·네트워크) 누적 시 이 턴에서 하트비트를 포기한다. 본류(최종답변 발송)와
+# 무관하게 non-fatal — 현행 flow mirror 예외처리와 동일 계약.
+FLOW_HEARTBEAT_MAX_FAILURES = 3
 ENVELOPE_SIDECAR_FLAG = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.on")).expanduser()
 ENVELOPE_SIDECAR_OFF_FLAG = Path(
     os.environ.get("CLB_ENVELOPE_SIDECAR_OFF_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.off")
@@ -291,6 +347,8 @@ class SuggestedReply:
     reply: str
     declared_class: str
     matched: bool = False
+    # T-260726-079: 깨진 마커에서 복원된 건인지. classify 가 이걸 보고 hold 로 강등한다.
+    salvaged: bool = False
 
 
 @dataclass(frozen=True)
@@ -307,6 +365,66 @@ SUGGESTED_REPLY_CLASS_RE = re.compile(
 # T-260719-029: 닫는태그 오염 변종('</parameter>추천답변>' 류) 관대 절사 — 청크 내부 '>'
 # 허용 + 연쇄 청크 절사. 앵커는 '</' 라서 본문 중간의 '<'·'>' 는 건드리지 않는다.
 SUGGESTED_REPLY_CLOSE_RE = re.compile(r"(?:\s*<\s*/[^<\r\n]*>)+\s*$")
+# ⚠️ 제거 금지 (DO NOT REMOVE) — T-260726-079 깨진 마커 방어.
+#   마지막 한 줄만 보던 파서가 실패하면 무성 반환이라, 마커가 쪼개지거나 닫는 태그가
+#   어긋난 순간 버블·버튼이 사라지면서 raw 태그가 사용자 화면에 그대로 노출됐다(로그 0줄).
+#   아래 셋이 그 실패 경로의 입구다 — 꼬리 몇 줄까지 볼지 / 마커 흔적 판정 / 들여쓰기 허용 open.
+# ⚠️ 제거 금지 (DO NOT REMOVE) — T-260726-088 닫는태그 앵커 갭.
+#   위 CLOSE_RE 는 `$` 앵커라 **줄 끝** 닫는 태그만 벗긴다. 닫는 태그 뒤에 문장이 더 붙으면
+#   (`…</추천답변> 그리고 덧붙임`) 아무것도 안 벗겨지는데 open 매치는 성공하므로,
+#   raw 태그가 박힌 문장이 salvage 경로도 안 타고 **그대로 자동발사**됐다(T-260726-085 적출).
+#   판별은 "CLOSE_RE 로 꼬리를 벗긴 뒤에도 닫는 태그가 남는가" 로 한다 — 줄 끝으로 이어지는
+#   닫는 태그 '런'(T-260719-029 오염 변종 관용)은 CLOSE_RE 가 이미 먹었으므로 여기 안 걸린다.
+SUGGESTED_REPLY_CLOSE_ANYWHERE_RE = re.compile(r"<\s*/[^<\r\n]*>")
+SUGGESTED_REPLY_SALVAGE_TAIL_LINES = 4
+SUGGESTED_REPLY_HINT_RE = re.compile(r"<\s*/?\s*추천답변")
+SUGGESTED_REPLY_OPEN_ANYWHERE_RE = re.compile(r"^\s*<추천답변(?P<attrs>(?:\s+[^>\r\n]*)?)>")
+SUGGESTED_REPLY_BROKEN_LOG_KEY = "suggested_reply_marker_broken"
+# T-260728-095: 사고 미러 전용 중화용. 마커는 콘텐츠가 아니라 제어토큰이라
+#   미러에 raw 로 나가면 사용자 화면에 태그가 그대로 찍히고, 정작 버블은 최종답변
+#   쪽 마커로만 만들어지므로 '버블이 안 왔다'로 오인된다.
+#   TAG_RE = 완전한 태그(열기·닫기·공백 변종). 안의 문구는 사고 내용이라 남긴다.
+#   TAIL_RE = 초안이 잘려 닫는 '>' 가 없는 파편 — 줄 끝까지 걷어낸다.
+#   반드시 TAG_RE 부터다: TAIL_RE 를 먼저 물리면 `<추천답변 …>초안</추천답변>` 한 줄에서
+#   초안 본문까지 통째로 먹는다.
+# ⚠️ 제거 금지 (DO NOT REMOVE) — T-260729-012 도구 태그 누출 방어.
+#   실측: assistant 최종답변의 마커 **안쪽**에 도구 호출 태그 조각이 섞여 나온다
+#   (작업 노드 트랜스크립트 실표본 12건, 2026-07-25~07-29. 예: '…착수해줘</parameter>').
+#   4노드 중 3노드에서 관측 = 노드 특이성이 아니라 생성 측 공통 패턴이다.
+#   위 CLOSE_RE·CLOSE_ANYWHERE_RE 는 **닫는 태그(`</…>`)** 만 앵커로 잡는다. 그래서
+#   여는 조각(`<parameter name="x">`)이나 '>' 가 없는 잘린 파편(`<invoke name=`)은
+#   전부 빠져나가 사용자 폰에 raw 로 찍힌다.
+#   ★블랙리스트(태그 이름 열거)를 쓰지 않는다 — 새 태그 모양마다 뚫린다.
+#   화이트리스트로 뒤집되 문자 집합을 통째로 열거하지 않는다: 추천답변은 한 줄 자연어이고
+#   꺾쇠 '<' '>' 는 정상 문구에 등장할 이유가 없다. 즉 "꺾쇠 없음" 이 곧 화이트리스트다 —
+#   한국어·이모지·문장부호·URL 은 그대로 통과하므로 오탐으로 검출기가 꺼질 위험이 없다.
+#   (오탐이 나면 다음 사람이 검출기를 끈다 — 그게 이 방어의 진짜 실패 모드다.)
+SUGGESTED_REPLY_ANGLE_RE = re.compile(r"[<>]")
+
+
+def _sanitize_suggested_inner(reply: str) -> tuple:
+    """마커 내부 문구에서 꺾쇠 이후를 잘라낸다. 반환 = (정제문구, 오염여부).
+
+    오염이면 호출부가 salvaged=True 로 hold 강등한다 — 잘못 발사하느니 잘못 hold 한다
+    (T-260726-088 과 같은 판단축).
+    """
+    if not reply or not SUGGESTED_REPLY_ANGLE_RE.search(reply):
+        return reply, False
+    return SUGGESTED_REPLY_ANGLE_RE.split(reply, maxsplit=1)[0].strip(), True
+
+
+SUGGESTED_REPLY_MARKER_TAG_RE = re.compile(r"<\s*/?\s*추천답변(?:\s[^>\r\n]*)?\s*>")
+SUGGESTED_REPLY_MARKER_TAIL_RE = re.compile(r"<\s*/?\s*추천답변[^\r\n]*")
+# T-260728-100: 사고 미러 볼드 평문화. 미러는 parse_mode 없이 sendMessage 로 나가므로
+#   (이 브릿지의 TelegramClient 는 mono 용 `entities` pre 말고는 parse_mode 를 쓰지 않는다)
+#   `**볼드**` 가 별표째 글자로 보인다. 파스모드를 켜는 대신 벗기는 이유 = 사고 원문은
+#   마크다운 특수문자가 빽빽해 이스케이프 하나만 새도 400 이 나고, 그러면 send() 가 None 을
+#   돌려주고 호출부는 'non-fatal' 로 삼켜 미러가 통째로 사라진다. 표시 흠 하나 고치려고
+#   미러 유실(T-260701-63 이 막아둔 바로 그것)을 사는 교환이라 안 한다.
+#   ⚠️ 홑별표는 건드리지 않는다 — 글롭(test_mesh_*·*.sh)·곱셈에 흔해 짝지어 지우면
+#   사이의 본문을 통째로 먹는다. 짝별표도 마크다운 규칙(여는 뒤·닫는 앞이 비공백)을
+#   그대로 요구해 `**args 와 **kwargs` 같은 비강조 별표를 남긴다.
+MIRROR_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
 SUGGESTED_EXCLUSIONS = (
     ("main_merge", re.compile(r"(?:\bmain\b|메인).{0,24}(?:\bmerge\b|머지|병합|합치|합쳐|반영)|(?:\bmerge\b|머지|병합|합치|합쳐|반영).{0,24}(?:\bmain\b|메인)", re.I)),
     ("store_submit", re.compile(r"(?:app\s*store|play\s*(?:store|console)|스토어).{0,30}(?:submit|review|제출|심사|등록|업로드|올려)|(?:submit|제출|등록|업로드|올려).{0,30}(?:app\s*store|play\s*(?:store|console)|스토어)", re.I)),
@@ -325,25 +443,121 @@ SUGGESTED_AUTH_AUTO_OK = "auto_ok_veto_elapsed"
 SUGGESTED_AUTH_HUMAN_CONFIRMED = "human_confirmed"
 
 
+def _suggested_declared_class(attrs: str) -> str:
+    class_match = SUGGESTED_REPLY_CLASS_RE.search(attrs)
+    if not class_match:
+        return ""
+    return (
+        (class_match.group("quoted") or class_match.group("bare") or "")
+    ).strip().lower()
+
+
+def _salvage_suggested_reply(original: str, lines: list) -> SuggestedReply:
+    """마지막 줄 매치가 실패했을 때의 2차 경로 (T-260726-079).
+
+    실사고(2026-07-26 17:25): 마커가 두 줄로 쪼개지고 닫는 태그가 `</parameter>` 로
+    어긋난 채 도착해, 마지막 줄이 `</추천답변>` 이라 open 매치가 실패했다. 종전 코드는
+    그 실패를 무성 반환으로 처리해서 ①버블·버튼 0 ②마커 원문이 본문에 섞여 화면 노출
+    ③로그 0 이 한꺼번에 났다. 여기서 세 가지를 모두 닫는다 — 파편 제거·경고·복원.
+
+    복원분은 salvaged=True 로 표시하고 classify_suggested_reply 가 hold 로 강등한다.
+    구조가 깨진 출력에서 자동발사까지 이어주지는 않는다(조이는 방향, class 계약 완화 아님).
+    """
+    tail_start = max(0, len(lines) - SUGGESTED_REPLY_SALVAGE_TAIL_LINES)
+    hint_idx = [
+        i for i in range(tail_start, len(lines))
+        if SUGGESTED_REPLY_HINT_RE.search(lines[i])
+    ]
+    if not hint_idx:
+        # 마커 흔적 자체가 없다 = 그냥 마커 없는 답변. 종전과 동일하게 조용히 통과.
+        return SuggestedReply(original, "", "")
+
+    open_idx = next(
+        (i for i in hint_idx if SUGGESTED_REPLY_OPEN_ANYWHERE_RE.match(lines[i])),
+        None,
+    )
+    cut = open_idx if open_idx is not None else hint_idx[0]
+    body = "\n".join(lines[:cut]).rstrip()
+
+    if open_idx is None:
+        log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} unsalvageable "
+                       f"(여는 태그 없음) tail={lines[cut:]!r}")
+        return SuggestedReply(body, "", "", False)
+
+    open_match = SUGGESTED_REPLY_OPEN_ANYWHERE_RE.match(lines[open_idx])
+    chunks = [lines[open_idx][open_match.end():]] + lines[open_idx + 1:]
+    joined = " ".join(chunk.strip() for chunk in chunks if chunk.strip())
+    # ⚠️ 마커 블록은 '닫는 태그로 끝나야' 한다. 이 조건이 없으면 마커 뒤에 본문이 더 있는
+    #   경우(renderer fixture suggested_reply_non_tail_marker_is_ignored)까지 마커로 오인해
+    #   **진짜 본문을 추천답변 문구로 삼켜버린다**. 꼬리가 닫는 태그로 끝나지 않으면 마커가
+    #   아니라 본문 속 인용으로 보고 종전대로 무시한다(파편 제거도 하지 않는다).
+    if not SUGGESTED_REPLY_CLOSE_RE.search(joined):
+        return SuggestedReply(original, "", "")
+    reply = SUGGESTED_REPLY_CLOSE_RE.sub("", joined).strip()
+    reply, tool_tainted = _sanitize_suggested_inner(reply)
+    if tool_tainted:
+        log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} tool-tag (salvage 경로) 절사")
+    if not reply:
+        log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} unsalvageable "
+                       f"(문구 없음) tail={lines[open_idx:]!r}")
+        return SuggestedReply(body, "", "", False)
+
+    log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} salvaged lines={len(lines) - open_idx} "
+                   f"class={_suggested_declared_class(open_match.group('attrs')) or '(none)'} "
+                   f"→ hold 강등")
+    return SuggestedReply(
+        body,
+        reply,
+        _suggested_declared_class(open_match.group("attrs")),
+        True,
+        True,
+    )
+
+
 def parse_suggested_reply(text: str) -> SuggestedReply:
     original = text or ""
     lines = original.rstrip("\r\n").splitlines()
+    # T-260726-079: 마커 뒤 공백만 있는 줄이 남으면 마지막 줄 매치가 통째로 빗나간다.
+    #   구조 파손이 아니라 꼬리 공백이므로 정상 경로에서 흡수한다(강등 대상 아님).
+    while lines and not lines[-1].strip():
+        lines.pop()
     if not lines:
         return SuggestedReply(original, "", "")
     marker = lines[-1]
     open_match = SUGGESTED_REPLY_OPEN_RE.match(marker)
     if not open_match:
-        return SuggestedReply(original, "", "")
-    class_match = SUGGESTED_REPLY_CLASS_RE.search(open_match.group("attrs"))
-    reply = SUGGESTED_REPLY_CLOSE_RE.sub("", marker[open_match.end() :]).strip()
+        return _salvage_suggested_reply(original, lines)
+    body = "\n".join(lines[:-1]).rstrip()
+    tail = marker[open_match.end() :]
+    stripped = SUGGESTED_REPLY_CLOSE_RE.sub("", tail)
+    if SUGGESTED_REPLY_CLOSE_ANYWHERE_RE.search(stripped):
+        # T-260726-088: 닫는 태그가 줄 끝이 아니라 문장 중간에 있다 = 어디까지가 문구이고
+        # 어디부터가 군더더기인지 단정할 수 없다. 이 경로는 사람 입력 0으로 자동발사되므로
+        # 잘못 발사하느니 잘못 hold 하는 쪽을 택한다 — 첫 닫는 태그 앞까지만 문구로 살리고
+        # salvaged 로 표시해 classify 가 hold 로 강등하게 한다.
+        reply = SUGGESTED_REPLY_CLOSE_ANYWHERE_RE.split(stripped, maxsplit=1)[0].strip()
+        declared = _suggested_declared_class(open_match.group("attrs"))
+        if not reply:
+            log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} unsalvageable "
+                           f"(닫는태그 앞 문구 없음) tail={tail!r}")
+            return SuggestedReply(body, "", "", False)
+        log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} inline-close "
+                       f"class={declared or '(none)'} → hold 강등")
+        return SuggestedReply(body, reply, declared, True, True)
+    # T-260729-012: 닫는 태그가 아닌 도구 태그 조각(여는 조각·잘린 파편)은 위 두 관문을
+    # 전부 통과한다. 정상 경로의 마지막에서 꺾쇠를 잡아 hold 로 강등한다.
+    clean, tool_tainted = _sanitize_suggested_inner(stripped.strip())
+    if tool_tainted:
+        declared = _suggested_declared_class(open_match.group("attrs"))
+        log("SUGGEST", f"{SUGGESTED_REPLY_BROKEN_LOG_KEY} tool-tag "
+                       f"class={declared or '(none)'} → hold 강등 raw={stripped.strip()!r}")
+        if not clean:
+            return SuggestedReply(body, "", "", False)
+        return SuggestedReply(body, clean, declared, True, True)
     return SuggestedReply(
-        "\n".join(lines[:-1]).rstrip(),
-        reply,
-        (
-            (class_match.group("quoted") or class_match.group("bare") or "")
-            if class_match
-            else ""
-        ).strip().lower(),
+        body,
+        stripped.strip(),
+        _suggested_declared_class(open_match.group("attrs")),
         True,
     )
 
@@ -351,6 +565,11 @@ def parse_suggested_reply(text: str) -> SuggestedReply:
 def classify_suggested_reply(candidate: SuggestedReply) -> SuggestedDecision:
     if not candidate.reply or candidate.declared_class not in {"auto-ok", "hold"}:
         return SuggestedDecision("hold", "class_missing_or_invalid")
+    # T-260726-079: 깨진 마커에서 복원한 건은 문구를 되살리되 자동발사까지 이어주지 않는다.
+    #   구조가 어긋난 출력은 class 선언도 신뢰 근거가 약하다 — 종전엔 아무것도 안 나오던
+    #   경로라 회귀가 아니라 순수 개선이고, 방향도 완화가 아니라 조임이다.
+    if candidate.salvaged:
+        return SuggestedDecision("hold", "salvaged_broken_marker")
     for reason, pattern in SUGGESTED_EXCLUSIONS:
         if pattern.search(candidate.reply):
             return SuggestedDecision("hold", reason)
@@ -413,6 +632,51 @@ def suggested_reply_confirmation(
         if isinstance(message_id, int) and message_id > 0:
             return {"message_id": message_id, "emoji": SUGGESTED_REPLY_CONFIRMATION_EMOJI}
     return None
+
+
+APPROVAL_CALLBACK_PREFIX = "mesh-approval"
+APPROVAL_CALLBACK_ACTIONS = ("grant", "hold")
+# 방 식별은 chat_id 로만 한다 — 방 이름·아바타는 개명 대상이라 판정 근거가 될 수 없다
+# (renderer spec R-A4, T-260725-043 설계 ack).
+APPROVAL_TEAM_ROOM_CHAT_IDS = {"team1": -5069144185, "team2": -5128036399}
+
+
+def approval_grant_decision(
+    source: str,
+    payload: str,
+    pending: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """승인 대기함 카드의 승인 판정 (renderer spec R-A2/R-A3).
+
+    승인으로 인정되는 유일한 입력은 대기 중인 카드와 3자(prefix·task_id·request_id)가
+    모두 일치하는 inline 버튼 콜백이다. 방의 텍스트 답장·추천답변 auto-fire·리액션·
+    위조 callback_data 는 전부 무효다 — auto-fire 를 사람 승인으로 오인하던 경로를
+    봉쇄한다 (T-260725-039 정합).
+    """
+    result = {"valid": False, "granted": False, "action": None, "reason": ""}
+    if source != "callback":
+        result["reason"] = "not_button"
+        return result
+    parts = (payload or "").split("::")
+    if len(parts) != 4 or parts[0] != APPROVAL_CALLBACK_PREFIX:
+        result["reason"] = "prefix_or_shape_mismatch"
+        return result
+    _, task_id, request_id, action = parts
+    if action not in APPROVAL_CALLBACK_ACTIONS:
+        result["reason"] = "unknown_action"
+        return result
+    expected = pending or {}
+    if not expected.get("request_id") or request_id != expected.get("request_id"):
+        result["reason"] = "unknown_request"
+        return result
+    if task_id != expected.get("task_id"):
+        result["reason"] = "task_mismatch"
+        return result
+    result["valid"] = True
+    result["action"] = action
+    result["granted"] = action == "grant"
+    result["reason"] = "human_confirmed_button"
+    return result
 
 
 def apply_suggested_reply_confirmation(
@@ -596,6 +860,23 @@ def busy_inject_promote_idle_stale_seconds() -> float:
     return float_env("CLB_BUSY_INJECT_PROMOTE_IDLE_STALE_SECONDS", 60.0)
 
 
+def native_queue_wait_timeout_seconds() -> float:
+    """'native queue 에 있다'는 믿음을 유지하는 상한 (T-260726-053).
+
+    실사고(작업 노드 2026-07-26 11:02:27~12:4x): 추천루프 합성 항목이 native queue 에 붙은
+    것까지 관측된 뒤 세션 클리어로 큐가 비워졌다. 브릿지는 '큐에 있다'는 믿음과 '세션이
+    generating' 이라는 믿음을 동시에 들고, 영영 오지 않을 user record 를 1h40m 기다렸다 —
+    check_injection_timeout 의 native-queue 분기에 상한이 없고(무조건 return), stale
+    release 는 session_occupied 판정에 막혀(:7341 elif) 둘 다 탈출구가 아니었다.
+    그 사이 그 노드의 텔레그램 입력 경로가 통째로 정지했다(사용자 신규 메시지도 적체).
+
+    그래서 이 상한은 **세션 busy 판정과 무관하게** 절대시간으로 만료된다 — busy 믿음 자체가
+    굳는 것이 사고의 절반이라, 그 믿음에 다시 의존하면 같은 교착이 재현된다.
+    0 이하면 만료 없음(옛 동작) — 긴급 시 롤백 스위치.
+    """
+    return float_env("CLB_NATIVE_QUEUE_WAIT_TIMEOUT_SEC", 600.0)
+
+
 def busy_inject_media_enabled() -> bool:
     # T-260710-15: 미디어(이미지/보이스) 프롬프트의 busy-inject 참여 스위치 (기본 ON).
     # T-260708-22 가 미디어를 전면 제외해 긴 턴 중 첨부가 3~27분 pending 정체
@@ -662,6 +943,59 @@ def log(label: str, message: str) -> None:
     print(f"[{now_ts()}] {label:<6} {message}", flush=True)
 
 
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 미등록 chat 수신의 무기록 폐기 봉합 (T-260728-043, 2026-07-28).
+#   브릿지는 등록되지 않은 chat 의 update 를 로그 한 줄 없이 버렸다(enqueue_update 의 bare
+#   return). 소비된 update 는 offset 이 넘어가 재조회가 불가능하므로 **그 방의 chat_id 를
+#   사후에 알아낼 방법이 사라진다.**
+#   실사고: 사용자가 개발1팀·개발2팀 두 방에 발화했고 제어 노드 브릿지 로그에서
+#   update=200919974 는 4줄, 200919977 은 2줄인데 그 사이 200919975·200919976 은 0줄이었다.
+#   그 chat_id 2개를 못 건져서 TELEGRAM_CHAT_ID_TEAM1/2 주입(T-260725-064)이 막혔고,
+#   routes.yaml teams.status 가 seed 에 묶여 팀 단톡방 전체가 잠들어 있었다.
+#   같은 병의 발신측이 T-260728-035(어디에도 못 보내도 rc=0) 다 — 한쪽은 조용히 안 보내고
+#   한쪽은 조용히 버렸다.
+#
+#   ★식별 최소치만 뽑는다 — 본문·caption·미디어는 **절대 건드리지 않는다**(프라이버시).
+#   이 함수가 message 본문 키를 아예 읽지 않는 것이 그 보장이다.
+_UPDATE_CHAT_CARRIERS = (
+    "message",
+    "edited_message",
+    "channel_post",
+    "edited_channel_post",
+    "my_chat_member",
+    "chat_member",
+    "chat_join_request",
+)
+
+
+def unknown_chat_identity(update: dict[str, Any]) -> dict[str, str] | None:
+    """폐기되는 update 에서 chat 식별에 필요한 최소치만 뽑는다 (본문 미포함)."""
+    if not isinstance(update, dict):
+        return None
+    for carrier in _UPDATE_CHAT_CARRIERS:
+        payload = update.get(carrier)
+        if not isinstance(payload, dict):
+            continue
+        chat = payload.get("chat")
+        if not isinstance(chat, dict):
+            continue
+        chat_id = chat.get("id")
+        if chat_id in (None, ""):
+            continue
+        sender = payload.get("from") if isinstance(payload.get("from"), dict) else {}
+        # title 은 사람이 방을 알아보는 유일한 단서라 남기되, 로그 한 줄을 깨지 않게
+        # 개행 제거 + 길이 상한. 이름(first/last name)은 식별에 불필요해 뽑지 않는다.
+        title = str(chat.get("title") or "").replace("\n", " ").replace("\r", " ")[:80]
+        return {
+            "carrier": carrier,
+            "chat_id": str(chat_id),
+            "chat_type": str(chat.get("type") or "?"),
+            "chat_title": title,
+            "from_id": str(sender.get("id") or ""),
+            "from_username": str(sender.get("username") or ""),
+        }
+    return None
+
+
 def is_tmux_session_lost_error(error: object) -> bool:
     return "tmux session not found" in str(error).lower()
 
@@ -708,6 +1042,69 @@ def _self_update_version_tuple(text: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _self_update_marker_path() -> Path:
+    """Disk twin of the ``<PREFIX>_SELF_UPDATED`` env guard.
+
+    The env marker only survives ``os.execv``. Any restart from outside that
+    lineage — systemd ``Restart=always``, the watchdog, a manual restart —
+    clears it, so a bridge that cannot come up after an update re-runs the
+    updater on every restart and re-sends the success notice each time. The
+    units run ``RestartUSec=5s``, i.e. **12 chat messages a minute**
+    (T-260729-006: 사용자 폰에 1분여 13건). This file outlives the lineage.
+    """
+    root = os.environ.get(f"{SELF_UPDATE_PREFIX}_STATE_DIR") or "~/.claude/state"
+    return Path(root).expanduser() / f"{SELF_UPDATE_PACKAGE}-self-updated"
+
+
+def _self_update_marked_version() -> str | None:
+    """Return the version an earlier run already installed, else None. Never raises."""
+    try:
+        text = _self_update_marker_path().read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001 — missing/unreadable marker just means "no record"
+        return None
+    return text or None
+
+
+def _self_update_mark_installed(version: str) -> None:
+    """Persist ``version`` so a restart does not re-run the same update. Never raises."""
+    try:
+        path = _self_update_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{version}\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — updater safety must not hinge on this write
+        log("UPDATE", f"could not persist self-update marker: {exc}")
+
+
+def _self_update_notice_path() -> Path:
+    """The last failure notice already delivered to chat.
+
+    Repeat **failure** notices storm exactly like the repeat success notices did:
+    the updater re-runs on every restart, pip fails again, and another ❌ lands in
+    the chat every 5 seconds. Success is covered by the install marker above, but
+    a failure has to stay retryable — a transient pip/network error should still
+    resolve itself. So this silences the duplicate *message*, not the retry.
+    """
+    return _self_update_marker_path().with_name(f"{SELF_UPDATE_PACKAGE}-last-notice")
+
+
+def _self_update_notice_seen(key: str) -> bool:
+    """True when this exact notice was already delivered. Never raises."""
+    try:
+        return _self_update_notice_path().read_text(encoding="utf-8").strip() == key
+    except Exception:  # noqa: BLE001 — no record means "not sent yet"
+        return False
+
+
+def _self_update_record_notice(key: str) -> None:
+    """Remember the notice just delivered. Never raises."""
+    try:
+        path = _self_update_notice_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{key}\n", encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 — updater safety must not hinge on this write
+        log("UPDATE", f"could not persist self-update notice: {exc}")
+
+
 def _self_update_latest() -> str | None:
     try:
         req = urllib.request.Request(
@@ -725,8 +1122,9 @@ def _self_update_latest() -> str | None:
 
 def self_update_available() -> str | None:
     """Return the newer PyPI version string if an update should be offered, else None.
-    Returns None for opt-out, source checkouts, already-updated lineage, offline,
-    or when already current. Never raises."""
+    Returns None for opt-out, source checkouts, already-updated lineage (env marker
+    or the disk marker that survives restarts), offline, or when already current.
+    Never raises."""
     try:
         if bool_env(f"{SELF_UPDATE_PREFIX}_NO_UPDATE_CHECK", False):
             return None
@@ -742,6 +1140,15 @@ def self_update_available() -> str | None:
             return None
         if _self_update_version_tuple(latest) <= _self_update_version_tuple(current):
             return None
+        marked = _self_update_marked_version()
+        if marked and _self_update_version_tuple(latest) <= _self_update_version_tuple(marked):
+            # An earlier run already installed this version. If the installed-version
+            # probe still reports the old one, the install is not taking effect and
+            # retrying would loop — one notice per version, not one per restart.
+            # The chat button path calls perform_self_update() directly, so a human
+            # can still force a retry.
+            log("UPDATE", f"v{latest} already installed by an earlier run; skipping (disk guard)")
+            return None
         return latest
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"version check error: {exc}")
@@ -755,13 +1162,29 @@ class SelfUpdateResult:
     restart_requested: bool = False
 
 
-def _self_update_notify(notify: Callable[[str], object] | None, message: str) -> None:
+def _self_update_notify(
+    notify: Callable[[str], object] | None,
+    message: str,
+    *,
+    once_key: str | None = None,
+) -> None:
+    """Send ``message`` to chat. With ``once_key``, send it at most once per key.
+
+    Only the automatic path passes a key — a human pressing the update button
+    always gets an answer, even if it repeats.
+    """
     if notify is None:
+        return
+    if once_key is not None and _self_update_notice_seen(once_key):
+        log("UPDATE", f"duplicate notice suppressed ({once_key})")
         return
     try:
         notify(message)
     except Exception as exc:  # noqa: BLE001 — chat feedback cannot break updater safety
         log("UPDATE", f"chat feedback failed: {exc}")
+        return
+    if once_key is not None:
+        _self_update_record_notice(once_key)
 
 
 def _self_update_failure_result(
@@ -799,11 +1222,18 @@ def perform_self_update(
     *,
     notify: Callable[[str], object] | None = None,
     allow_break_system_packages: bool = False,
+    quiet_repeat: bool = False,
 ) -> SelfUpdateResult:
     """Upgrade to ``latest``, report the outcome, then re-exec on success.
 
     PEP 668 protection is only bypassed after the dedicated consent callback.
     Any install error leaves the running version untouched.
+
+    ``quiet_repeat`` drops a non-success notice that is identical to the last one
+    already sent. The automatic path sets it, because a restart loop would repeat
+    the same ❌ every few seconds (T-260729-006). A human pressing the update
+    button leaves it False and always gets an answer. The retry itself is never
+    suppressed — only the duplicate message.
     """
     log("UPDATE", f"upgrading {SELF_UPDATE_PACKAGE} -> {latest}")
     command = [sys.executable, "-m", "pip", "install", "--upgrade"]
@@ -828,7 +1258,11 @@ def perform_self_update(
                 allow_break_system_packages=allow_break_system_packages,
             )
             if result.status != "pep668_consent_required":
-                _self_update_notify(notify, result.message)
+                _self_update_notify(
+                    notify,
+                    result.message,
+                    once_key=f"{result.status}:{latest}" if quiet_repeat else None,
+                )
             return result
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update install error (staying put): {exc}")
@@ -836,10 +1270,13 @@ def perform_self_update(
             f"❌ v{latest} 업데이트 실패: pip 실행 오류. "
             f"수동: pipx install --force {SELF_UPDATE_PACKAGE}"
         )
-        _self_update_notify(notify, message)
+        _self_update_notify(
+            notify, message, once_key=f"failed:{latest}" if quiet_repeat else None
+        )
         return SelfUpdateResult("failed", message)
 
     os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
+    _self_update_mark_installed(latest)
     message = f"✅ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다."
     log("UPDATE", f"upgraded to {latest}; restarting")
     _self_update_notify(notify, message)
@@ -851,7 +1288,9 @@ def perform_self_update(
             f"⚠️ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공, 자동 재시작 실패. "
             "브릿지를 수동 재시작하면 신버전이 적용됩니다."
         )
-        _self_update_notify(notify, message)
+        _self_update_notify(
+            notify, message, once_key=f"restart_failed:{latest}" if quiet_repeat else None
+        )
         return SelfUpdateResult("installed_restart_failed", message)
     return SelfUpdateResult("updated", message, restart_requested=True)
 
@@ -1682,7 +2121,54 @@ def model_menu_aliases() -> list[str]:
 
 MODEL_STATUS_UNAVAILABLE = "(세션 상태줄에서 모델 확인 불가)"
 MODEL_STATUS_IGNORED_TERMS = {"claude", "default", "latest", "model"}
-MODEL_EFFORT_SUFFIX_RE = re.compile(r"\s+\((?:xhigh|high|medium|low)\)\s*$", re.IGNORECASE)
+# T-260726-034: 'max' 누락 보강 — 상태줄이 'Opus 5 (max)' 일 때 접미가 안 벗겨져
+# 모델명에 '(max)' 가 붙어 남던 기존 결함. effort 판독에도 같은 목록이 필요하다.
+MODEL_EFFORT_SUFFIX_RE = re.compile(r"\s+\((?:xhigh|high|medium|low|max)\)\s*$", re.IGNORECASE)
+# 상태줄 접미에서 현재 사고강도를 읽는다 (settings.json 에 안 남는 세션 전용 값이 있어
+# — CLI 실측: max 는 'this session only' — 착지 확인은 화면이 1차 근거다).
+SESSION_EFFORT_RE = re.compile(r"\((xhigh|high|medium|low|max)\)\s*$", re.IGNORECASE)
+
+
+def effort_menu_levels() -> list[str]:
+    raw = os.environ.get("CLB_EFFORT_CHOICES", "")
+    levels = [level.strip() for level in raw.split(",") if level.strip()]
+    return levels or list(DEFAULT_EFFORT_CHOICES)
+
+
+def effort_level_allowed(level: str) -> bool:
+    # ⚠️ 하드닝 (T-260703-23 동형): 위조 callback_data / 임의 인자가 `/effort <임의문자열>`
+    #   로 흘러드는 것을 차단. 목록 밖 값(ultracode·auto 등)은 '!' escape 원문 주입으로만.
+    return level in effort_menu_levels()
+
+
+def effort_level_rejection_text(level: str) -> str:
+    choices = " ".join(effort_menu_levels())
+    return (
+        f"⛔ 알 수 없는 사고강도: {level}\n"
+        f"가능한 값: {choices}\n"
+        f"그 밖의 값(ultracode·auto 등)을 그대로 적용하려면 앞에 {SLASH_ESCAPE_PREFIX} 를 붙여 "
+        f"원문 주입하세요 (예: {SLASH_ESCAPE_PREFIX}/effort auto)."
+    )
+
+
+def session_effort_from_screen(screen: str) -> str:
+    """상태줄 모델 구간의 접미 '(xhigh)' 에서 현재 사고강도를 읽는다 (없으면 "").
+
+    상태줄은 'Opus 5 (high) · 5h 1% · W 46%' 꼴이라 괄호가 줄 끝이 아니다 —
+    session_model_from_screen 과 같은 방식으로 '·'/'|' 로 먼저 잘라 첫 구간만 본다.
+    아무 괄호나 줍지 않도록 구간 끝 매치만 인정한다.
+    """
+    for raw_line in reversed((screen or "").splitlines()):
+        line = strip_ansi_control(raw_line).strip()
+        if not line:
+            continue
+        if "·" not in line and "|" not in line and not line.startswith("🤖"):
+            continue
+        head = re.split(r"\s+(?:·|\|)\s*", line, maxsplit=1)[0].strip()
+        match = SESSION_EFFORT_RE.search(head)
+        if match:
+            return match.group(1).lower()
+    return ""
 
 
 def model_alias_terms(alias: str) -> list[str]:
@@ -1821,7 +2307,15 @@ def content_thinking(content: Any) -> str:
 
 
 def format_reasoning_mirror(text: str) -> str:
-    body = text.strip()[:REASONING_MIRROR_LIMIT].strip()
+    # 자르기 前에 중화한다 — 뒤에 자르면 마커가 반쪽으로 잘려('<추천답변 class="au')
+    # 정규식이 못 잡고 같은 증상이 그대로 재발한다 (T-260728-095).
+    neutralized = SUGGESTED_REPLY_MARKER_TAG_RE.sub("", text)
+    neutralized = SUGGESTED_REPLY_MARKER_TAIL_RE.sub("", neutralized)
+    # 볼드도 같은 자리에서 평문화한다 — 미러는 parse_mode 없이 나가므로 별표가
+    # 글자로 보인다 (T-260728-100). 자르기보다 먼저인 이유도 마커와 같다:
+    # 뒤에 자르면 짝이 갈라져 '**잘린' 처럼 여는 별표만 남는다.
+    neutralized = MIRROR_BOLD_RE.sub(r"\1", neutralized)
+    body = neutralized.strip()[:REASONING_MIRROR_LIMIT].strip()
     return f"{REASONING_HEADER}\n{body}" if body else ""
 
 
@@ -2023,6 +2517,7 @@ def format_flow_mirror(
     autonomous: bool = False,
     done_label: str = "",
     elapsed_text: str = "",
+    mid_turn_count: int = 0,
 ) -> str:
     lines, current = flow_card_steps(text)
     if not lines:
@@ -2032,8 +2527,20 @@ def format_flow_mirror(
     label, mapped_emoji = node_label_emoji(node_token)
     label = label or node_token or "작업 노드"
     node_emoji = emoji or mapped_emoji or default_emoji
+    # ⚠️ 이 시각은 **매 렌더 시점**이다(edit 경로도 같은 함수를 타므로 = 마지막 갱신 시각).
+    # 라벨 없이 두면 텔레그램이 메시지에 붙이는 **발신 시각**(edit 해도 영구 고정)과 나란히
+    # 놓여, 읽는 사람이 고정된 쪽을 정본으로 읽고 이 숫자를 "시작 시각"으로 오해한다.
+    # 실사고 2026-07-27: 카드 헤더 11:40 / 텔레그램 스탬프 11:27 인 상태에서 사용자가
+    # "메시지 막힘" 으로 판단, 살아있는 카드를 죽은 것으로 읽는 데 16분이 걸렸다(T-260727-068).
+    # 한 단어로 두 시계의 역할을 갈라준다. 경과("N분 전")는 렌더 시점 기준 항상 0 이라 넣지 않는다.
     timestamp = (now or datetime.now(KST)).astimezone(KST).strftime("%H:%M")
-    header = f"{node_emoji} {label} · {flow_context_summary(context)} · {timestamp}"
+    # T-260728-065 B축: 턴 도중 지시가 더 들어왔으면 그 사실을 제목 **앞**에 박는다.
+    # 제목 요약(flow_context_summary)은 길이 상한에 잘리는데, 마커가 그 안에 있으면
+    # 긴 지시에서 통째로 먹혀 표시가 다시 침묵한다 — 그래서 상한 밖에 둔다.
+    title = flow_context_summary(context)
+    if mid_turn_count > 0:
+        title = f"이어받음+{mid_turn_count} · {title}"
+    header = f"{node_emoji} {label} · {title} · 갱신 {timestamp}"
     if done_label:
         footer = f"→ {done_label} · 소요 {elapsed_text}" if elapsed_text else f"→ {done_label}"
     else:
@@ -2639,8 +3146,14 @@ class TelegramClient:
         self.emoji = emoji
         self.chunk_size = chunk_size
 
-    def call(self, method: str, **params: Any) -> dict[str, Any] | None:
-        cutover_payload = mesh_cutover_call(method, params)
+    def call(self, method: str, *, bypass_mesh_cutover: bool = False, **params: Any) -> dict[str, Any] | None:
+        # bypass_mesh_cutover 는 §7 승인 카드 마감 전용 좁은 문이다 (T-260725-078).
+        # 카드 발신은 mesh-event-emit 이 발신 노드 봇 토큰으로 직접 Bot API 를 때리므로
+        # 같은 카드의 edit 도 같은 봇·같은 경로여야 한다. 버스로 보내면 이벤트가
+        # copy_content × mesh_group 으로 해석되고 renderer(mesh_send.render_base)가
+        # 통째로 억제해 발신 0 이 된다 — 2026-07-25 19:34·20:13 카드 미마감 실사고.
+        # 원장 기록은 아래 mesh_ledger_record 가 그대로 남긴다 (증거 가시성 유지).
+        cutover_payload = None if bypass_mesh_cutover else mesh_cutover_call(method, params)
         if cutover_payload is not None:
             return cutover_payload
         data = urllib.parse.urlencode(params).encode()
@@ -2962,6 +3475,51 @@ class TelegramClient:
         return bool(payload and payload.get("ok"))
 
 
+class NullTelegramClient(TelegramClient):
+    """텔레그램을 쓰지 않는 레인용 클라이언트 (T-260727-077 자비스 음성 전용 레인).
+
+    Bot API 를 한 번도 때리지 않는다. call/call_multipart 가 None 을 돌려주는데,
+    이건 상위 코드가 이미 다루는 '발신 실패' 경로와 같은 모양이라 새 분기가 필요 없다
+    (call 은 4xx·재시도 소진 때 None 을 돌려주고 호출부는 전부 그걸 감안해 짜여 있다).
+    get_updates 는 항상 빈 목록 — 폴링 자체를 안 하지만, 혹시 호출돼도 조용히 무해하다.
+
+    토큰을 안 들고 있으므로 다른 레인의 봇 토큰을 2중 폴링해 getUpdates 409 로
+    본 챗을 탈취하는 사고(원칙 12 가시성)가 구조적으로 불가능하다.
+    """
+
+    def __init__(self, emoji: str, chunk_size: int) -> None:
+        super().__init__("", "", emoji, chunk_size)
+
+    def call(self, method: str, *, bypass_mesh_cutover: bool = False, **params: Any) -> dict[str, Any] | None:
+        return None
+
+    def call_multipart(
+        self,
+        method: str,
+        fields: dict[str, str],
+        file_field: str,
+        file_path: Path,
+    ) -> dict[str, Any] | None:
+        return None
+
+    def get_updates(self, offset: int, timeout: int) -> list[dict[str, Any]]:
+        return []
+
+    # 발신 계열은 '조용히 성공' 으로 답한다. 이유: 상위 배달 경로는 send 가 None/[] 이면
+    # 발신 실패로 보고 큐 항목을 failed 로 닫는데, 그 분기는 write_voice_answer 앞에서 끊긴다
+    # — 즉 답을 만들어 놓고 음성 답변 파일을 못 써서 통째로 사라진다(2026-07-27 13:47 실측).
+    # 이 레인의 진짜 배달구는 텔레그램이 아니라 voice answer 파일이므로, 발신 단계는
+    # 통과시키고 배달 성공/실패 판정은 그 파일이 갖게 한다. message_id 0 = 실제 메시지 없음.
+    def send(self, text: str, reply_to_message_id: int | None = None, mono: bool = False) -> list[int] | None:
+        return [0]
+
+    def send_copy_content(self, text: str, code: bool = False) -> list[int] | None:
+        return [0]
+
+    def send_photo(self, path: Path, caption: str = "", reply_to_message_id: int | None = None) -> list[int] | None:
+        return [0]
+
+
 @dataclass(frozen=True)
 class SessionIdentity:
     path: Path
@@ -2989,6 +3547,78 @@ def cursor_offset_for_state(state: dict[str, Any] | None, identity: SessionIdent
     if offset < 0 or offset > identity.size:
         return None
     return offset
+
+
+# T-260727-006: 세션 회전(clear→새 트랜스크립트) 직후 되감기 상한.
+#   회전 순간 EOF 로 점프하면, 회전 직전에 이미 기록된 auto-resume 주입 프롬프트가 오프셋
+#   앞에 깔려 영영 미판독이 된다(실측: 레코드 511679 < watch 시작 554514, 42835 바이트 차이).
+#   폰에는 결과만 뜨고 "무엇을 시켰는지"가 안 보인다 = 헌법 원칙2(가시성) 구멍.
+#   되감되 두 겹으로 묶는다: ①시간창 — 회전 시각 기준 이 초 안에 기록된 레코드만.
+#   재개 파일에 실려 오는 옛 대화는 timestamp 가 옛날이라 자동으로 빠진다. ②바이트 상한 —
+#   시간창이 이상해도 전량 재판독(카드 폭주)이 불가능하게. 둘 중 먼저 걸리는 쪽이 이긴다.
+SESSION_ROTATION_LOOKBACK_SECONDS = 120.0
+SESSION_ROTATION_LOOKBACK_MAX_BYTES = 256 * 1024
+
+
+def _record_timestamp_epoch(raw: bytes) -> float | None:
+    """트랜스크립트 한 줄에서 timestamp 를 epoch 로. 못 읽으면 None (앵커로 안 씀)."""
+    try:
+        record = json.loads(raw.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    stamp = record.get("timestamp")
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    text = stamp.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def session_rotation_start_offset(
+    path: Path,
+    size: int,
+    now: float,
+    window_seconds: float = SESSION_ROTATION_LOOKBACK_SECONDS,
+    max_bytes: int = SESSION_ROTATION_LOOKBACK_MAX_BYTES,
+) -> int:
+    """회전 직후 읽기 시작 오프셋 = 시간창 안에 기록된 첫 레코드의 시작 바이트.
+
+    해당 레코드가 없으면 EOF(size) — 즉 종전 동작 그대로다(fail-safe: 못 찾으면 안 되감는다).
+    """
+    if size <= 0 or window_seconds <= 0:
+        return max(size, 0)
+    floor = max(0, size - max(max_bytes, 0))
+    try:
+        with path.open("rb") as handle:
+            if floor:
+                handle.seek(floor)
+                handle.readline()  # 상한 지점에서 잘린 첫 줄은 버린다
+            for _ in range(200000):  # 폭주 방지 하드 상한
+                offset = handle.tell()
+                if offset >= size:
+                    return size
+                raw = handle.readline()
+                if not raw:
+                    return size
+                if not raw.endswith(b"\n"):
+                    return size  # append 중인 마지막 줄 — 다음 poll 이 읽는다
+                stamp = _record_timestamp_epoch(raw)
+                if stamp is None:
+                    continue
+                if stamp >= now - window_seconds:
+                    return offset
+    except OSError:
+        return size
+    return size
 
 
 @dataclass(frozen=True)
@@ -3028,6 +3658,8 @@ class Config:
     transcript_stable_seconds: float
     latest_transcript_fallback_seconds: float
     composer_clear_retries: int
+    composer_occupancy_retries: int
+    composer_occupancy_interval: float
     injection_verify_timeout: float
     send_retry_seconds: float
     send_max_attempts: int
@@ -3046,13 +3678,28 @@ class Config:
     suggested_loop_max_iterations: int = 3
     suggested_loop_max_seconds: int = 900
     suggested_loop_max_cost_units: int = 100000
+    # T-260727-144: superseded 후보를 사람이 탭했을 때 되살릴 수 있는 최대 나이(초).
+    # 2시간 = 사용자가 자리를 비우는 일상 단위(식사·이동·외출)는 덮고, 취침 같은 장시간
+    # 공백(8시간+)은 일부러 안 덮는 지점 — 밤새 묵은 카드가 아침 탭 한 번으로 되살아나
+    # 옛 맥락을 새 세션에 밀어넣는 건 이 기능이 사려는 게 아니다. 초과분은 B 폴백(원문 재게시).
+    # ⚠️ 제어 노드 결재상 **잠정값**이다: confirm_after_superseded 표본 20건 이상 쌓이면
+    #    superseded_age_seconds 분포로 재판정한다. env 로 조정 가능하게 둔 이유가 그것이다.
+    suggested_revive_ttl_seconds: int = 7200
     suggested_loop_kill_path: Path = Path("~/.claude/state/claude-suggested-loop.off").expanduser()
     suggested_loop_ledger_path: Path = Path("~/.claude/state/claude-suggested-loop.jsonl").expanduser()
+    # T-260721-026: HOLD 후보 영속화 — 브릿지 재기동 뒤에도 '확인하고 실행' 이 살아 있게 한다.
+    suggested_loop_state_path: Path = Path("~/.claude/state/claude-suggested-loop-state.json").expanduser()
+    # 재수화 상한 — 이보다 오래된 HOLD 후보는 되살리지 않는다 (기본 24h).
+    suggested_loop_state_max_age_seconds: int = 86400
     transport_mode: str = "tmux"
     conpty_state_path: Path | None = None
     conpty_timeout_ms: int = 3000
     native_turn_stale_seconds: float = 120.0
     activity_eyes_enabled: bool = True
+    # 자비스 음성 전용 레인 (T-260727-077). voice_only 면 텔레그램 봇 없이 뜨고
+    # (토큰·chat_id 불요) voice 큐만 소비한다 — 폴링·발신 0.
+    voice_only: bool = False
+    voice_poll_interval: float = 1.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -3107,6 +3754,12 @@ class Config:
                 env("CLB_LATEST_TRANSCRIPT_FALLBACK_SECONDS", "1800") or "1800"
             ),
             composer_clear_retries=int_env("CLB_COMPOSER_CLEAR_RETRIES", 2, minimum=1),
+            # T-260722-009: 주입 직전 composer 점유 감지 → bounded 지연 재시도.
+            #   0 이면 감지·대기 없이 곧장 기존 경로(킬스위치).
+            composer_occupancy_retries=int_env("CLB_COMPOSER_OCCUPANCY_RETRIES", 3, minimum=0),
+            composer_occupancy_interval=float(
+                env("CLB_COMPOSER_OCCUPANCY_INTERVAL", "2") or "2"
+            ),
             injection_verify_timeout=float(env("CLB_INJECTION_VERIFY_TIMEOUT", "20") or "20"),
             send_retry_seconds=float(env("CLB_SEND_RETRY_SECONDS", "5") or "5"),
             send_max_attempts=int_env("CLB_SEND_MAX_ATTEMPTS", 3, minimum=1),
@@ -3135,10 +3788,17 @@ class Config:
             suggested_loop_max_iterations=int_env("CLB_SUGGESTED_LOOP_MAX_ITERATIONS", 3, minimum=1),
             suggested_loop_max_seconds=int_env("CLB_SUGGESTED_LOOP_MAX_SECONDS", 900, minimum=1),
             suggested_loop_max_cost_units=int_env("CLB_SUGGESTED_LOOP_MAX_COST_UNITS", 100000, minimum=1),
+            suggested_revive_ttl_seconds=int_env("CLB_SUGGESTED_REVIVE_TTL_SECONDS", 7200, minimum=0),
             suggested_loop_kill_path=Path(env(
                 "CLB_SUGGESTED_LOOP_KILL", "~/.claude/state/claude-suggested-loop.off") or "").expanduser(),
             suggested_loop_ledger_path=Path(env(
                 "CLB_SUGGESTED_LOOP_LEDGER", str(state_dir / f"{default_name}.suggested-loop.jsonl")) or "").expanduser(),
+            suggested_loop_state_path=Path(env(
+                "CLB_SUGGESTED_LOOP_STATE", str(state_dir / f"{default_name}.suggested-loop-state.json")) or "").expanduser(),
+            suggested_loop_state_max_age_seconds=int_env(
+                "CLB_SUGGESTED_LOOP_STATE_MAX_AGE_SEC", 86400, minimum=1),
+            voice_only=bool_env("CLB_VOICE_ONLY", False),
+            voice_poll_interval=float_env("CLB_VOICE_POLL_INTERVAL", 1.0, minimum=0.1),
             transport_mode=(env("CLB_REPL_TRANSPORT", "tmux") or "tmux").strip().lower(),
             conpty_state_path=Path(
                 env("CLB_CONPTY_STATE_PATH", str(state_dir / "native-repl-host.json")) or ""
@@ -3308,6 +3968,11 @@ class ActiveTurn:
     accumulated_reasoning: str = ""  # transient: thinking accrued across the turn's assistant messages
     flow_message_id: int = 0  # persisted across restart (anti-fragmentation): telegram message id of this turn's ⚙️ flow card (edit-in-place)
     flow_closed: bool = False  # transient: 종료 카드 edit 멱등 가드 (T-260722-008)
+    # transient (T-260727-076): 침묵구간 하트비트 상태. 재기동 시 승계하지 않는다 —
+    # 새 프로세스가 옛 턴의 틱 수를 물려받아 상한을 잘못 계산하는 것을 막는다.
+    flow_last_render_at: float = 0.0  # 마지막으로 이 카드를 send/edit 한 시각 (하트비트 기준점)
+    flow_heartbeat_ticks: int = 0  # 이 턴에서 하트비트가 실제로 갱신한 횟수 (상한 대비)
+    flow_heartbeat_failures: int = 0  # 연속 실패 수 (상한 도달 시 이 턴 하트비트 포기)
     flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
     sent_at: float = 0.0  # T-260705-67: 사용자 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
     source: str = ""
@@ -3321,6 +3986,14 @@ class ActiveTurn:
     loop_iteration: int = 0
     loop_started_at: float = 0.0
     loop_cost_units: int = 0
+    # T-260728-065 B축 — 이 턴이 도는 동안 **추가로** 주입된 지시.
+    # 카드 제목이 실제 작업과 어긋나는 것을 막는 데만 쓴다. 턴 소유권(text·nonce·회신
+    # 라우팅)은 건드리지 않는다 — busy-inject 가 active_turn 을 덮지 않는 이유가 그것이고,
+    # 덮으면 최종답변이 엉뚱한 메시지에 회신된다.
+    # flow_body 와 같이 **지속**시킨다: 본문은 재기동을 넘어 살아남는데 제목만 휘발하면
+    # 같은 결함이 조용히 되돌아온다.
+    mid_turn_count: int = 0
+    mid_turn_latest: str = ""
 
     def to_json(self) -> dict[str, Any]:
         payload = {
@@ -3346,6 +4019,9 @@ class ActiveTurn:
             "flow_body": self.flow_body,
             "source": self.source,
             "voice_reply_path": self.voice_reply_path,
+            # T-260728-065 B축 — 카드 제목 보정분. flow_body 와 같은 이유로 지속한다.
+            "mid_turn_count": self.mid_turn_count,
+            "mid_turn_latest": self.mid_turn_latest,
         }
         if self.busy_injected:
             payload["busy_injected"] = True
@@ -3410,7 +4086,46 @@ class ActiveTurn:
             loop_iteration=int(payload.get("loop_iteration") or 0),
             loop_started_at=float(payload.get("loop_started_at") or 0.0),
             loop_cost_units=int(payload.get("loop_cost_units") or 0),
+            mid_turn_count=int(payload.get("mid_turn_count") or 0),
+            mid_turn_latest=str(payload.get("mid_turn_latest") or ""),
         )
+
+
+# ── T-260728-065 B축: 카드 제목이 '지금 하는 작업' 을 가리키게 한다 ──────────────
+# 실사고: 카드 제목은 11:42 사용자 발화, 본문은 그 뒤 턴 도중 들어온 배차 작업이었다.
+# 근인은 앵커 대상이다 — 제목은 `active.text`(그 카드를 소유한 턴의 **최초** 프롬프트)이고,
+# busy-inject 는 턴 도중 도착분을 REPL 에 붙여넣기만 하고 active_turn 을 덮지 않는다
+# (덮으면 nonce·최종답변 라우팅이 깨진다). 그래서 작업만 옮겨가고 제목은 그대로 남는다.
+# 처방은 소유권을 옮기는 게 아니라 **카드가 그 사실을 스스로 드러내는 것**이다.
+def note_mid_turn_arrival(active: "ActiveTurn", text: str) -> None:
+    """턴이 도는 동안 새 지시가 주입됐음을 카드용으로만 기록한다."""
+    summary = " ".join((text or "").split())
+    if not summary:
+        # 빈 텍스트로 카운트만 올리면 제목이 사라진 채 마커만 남는다 — 더 나쁜 표시다.
+        return
+    active.mid_turn_count += 1
+    active.mid_turn_latest = summary
+
+
+def flow_card_context(active: "ActiveTurn") -> tuple[str, int]:
+    """카드 헤더에 쓸 (제목 원문, 턴 도중 추가 지시 수).
+
+    추가 지시가 있으면 **마지막 지시**를 제목으로 쓴다 — 본문이 그리는 작업이 그것이다.
+    없으면 종전과 완전히 같다(쌍둥이 렌더러 동일성 계약 T-260727-068 보존).
+    """
+    if active.mid_turn_count and active.mid_turn_latest:
+        return active.mid_turn_latest, active.mid_turn_count
+    return active.text, 0
+
+
+def flow_card_title_kwargs(active: "ActiveTurn") -> dict[str, Any]:
+    """렌더 호출부가 쓰는 제목 인자 묶음.
+
+    호출부 4곳이 각자 턴 프롬프트를 직접 넘기면 한 곳만 빠뜨려도 그 경로의 카드가
+    계속 어긋난다. 한 줄로 묶어 배선을 단일 지점에 둔다.
+    """
+    context, mid_turn_count = flow_card_context(active)
+    return {"context": context, "mid_turn_count": mid_turn_count}
 
 
 @dataclass
@@ -3426,6 +4141,10 @@ class SuggestedLoopCandidate:
     started_at: float
     cost_units: int
     control_message_id: int = 0
+    # T-260727-144: supersede 된 시각. 죽은 카드를 사람이 뒤늦게 탭했을 때 "얼마나 묵은
+    # 후보인가" 를 재는 유일한 입력이다 — 이 값이 없으면 나이 분포를 못 봐서 TTL 을 못 고친다.
+    # 스냅샷(suggested_state_payload)은 veto_pending/hold 만 담으므로 왕복 대상이 아니다.
+    superseded_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3458,6 +4177,50 @@ class ClaudeReplTransport(Protocol):
     def clear_composer(self, interrupt: bool = True) -> None: ...
 
     def paste_prompt(self, prompt: str, submit_key: str = "Enter") -> None: ...
+
+
+# composer-clear 프리미티브(T-260723-044) 소비 — /clear 주입 전 멀티라인 잔여를 비운다.
+# 줄단위 편집키(C-e/C-u/C-a/C-k)는 커서 있는 1줄만 지워 멀티라인 잔여 위 /clear 가 평문
+# 제출되던 병합배달을 냈다(설계 §1.3). 프리미티브의 정본 키 시퀀스를 --dry-run 으로 받아
+# 브릿지 자신의 tmux(-L socket) 경로로 보낸다.
+_COMPOSER_CLEAR_OLD_KEYS_INTERRUPT = ("Escape", "C-e", "C-u", "C-a", "C-k")
+_COMPOSER_CLEAR_OLD_KEYS_QUIET = ("C-e", "C-u", "C-a", "C-k")
+
+
+def _composer_clear_script_path() -> str:
+    return os.environ.get("CLB_COMPOSER_CLEAR_SCRIPT") or str(
+        Path(__file__).resolve().with_name("composer-clear.sh")
+    )
+
+
+def composer_clear_keys(interrupt: bool = True) -> tuple[str, ...]:
+    """composer-clear.sh --dry-run 으로 멀티라인 clear 키 시퀀스를 얻는다.
+
+    스크립트 부재/실패 시 옛 줄단위 키로 폴백한다 — clear 자체는 계속 일어나
+    리브니스를 보존한다(멀티라인은 못 비우지만 기존 동작으로 회귀할 뿐 악화 없음).
+    """
+    fallback = (
+        _COMPOSER_CLEAR_OLD_KEYS_INTERRUPT
+        if interrupt
+        else _COMPOSER_CLEAR_OLD_KEYS_QUIET
+    )
+    cmd = [_composer_clear_script_path(), "--pane", "_", "--dry-run"]
+    if interrupt:
+        cmd.append("--interrupt")
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+    if proc.returncode != 0:
+        return fallback
+    keys = tuple(proc.stdout.split())
+    return keys or fallback
 
 
 class TmuxClaudeTransport:
@@ -3630,10 +4393,12 @@ class TmuxClaudeTransport:
         # interrupt=False (busy-inject, T-260707-36): Escape 를 빼고 줄편집 키만 보낸다 —
         #   generating 중 composer 잔여만 비우고 진행 중 턴은 절대 끊지 않는다. C-e/C-u/C-a/C-k
         #   는 composer 줄 편집일 뿐이라 generating 을 인터럽트하지 않는다(codex 동형).
-        keys = ("Escape", "C-e", "C-u", "C-a", "C-k") if interrupt else ("C-e", "C-u", "C-a", "C-k")
-        for key in keys:
-            self.tmux("send-keys", "-t", self.resolve_pane_target(), key)
-            time.sleep(0.05)
+        # composer-clear 프리미티브(T-260723-044)의 정본 멀티라인 시퀀스를 소비한다.
+        # 옛 줄단위 키(커서 1줄만)로는 멀티라인 잔여 위 /clear 가 평문 제출됐다(§1.3).
+        # ~수백 키라 per-key sleep(0.05)*N 은 수초 블록 → 프리미티브와 동형으로 1회 batch
+        # 전송(프리미티브 자체도 단일 send-keys). batch 페이싱 적정성은 §5 L2 관측 대상.
+        keys = composer_clear_keys(interrupt)
+        self.tmux("send-keys", "-t", self.resolve_pane_target(), *keys)
 
     def clear_composer(self, interrupt: bool = True) -> None:
         with self.composer_lock():
@@ -4856,6 +5621,110 @@ class Bridge:
         except OSError as exc:
             log("SUGGEST", f"ledger unavailable; fail-safe HOLD: {exc}")
             return False
+        finally:
+            # 상태가 바뀔 때마다 활성 후보 스냅샷을 남긴다 (T-260721-026).
+            self.persist_suggested_candidates()
+
+    # --- HOLD 후보 영속화 (T-260721-026) ---------------------------------------
+    # 사고(2026-07-21 22:53~22:54): HOLD 카드가 뜬 59초 뒤 브릿지가 재기동했고, 사용자가
+    #   '확인하고 실행' 을 누르자 '만료된 요청입니다' 가 떴다. 후보가 in-memory dict 에만
+    #   살아서 프로세스 재기동 = 즉시 소멸이었다 (TTL 소거 코드는 원래 없다 — 만료의 정체가
+    #   시간이 아니라 재기동이었다). ledger 는 reply_sha256 만 담아 복원에 쓸 수 없다.
+    # 대책: 활성 후보(veto_pending/hold)를 state 파일에 스냅샷하고 기동 시 되살린다.
+    #   되살린 후보는 **무조건 hold** 로 강등한다 — 재기동 뒤 자동발사는 절대 하지 않는다.
+    def suggested_state_payload(self) -> list[dict[str, Any]]:
+        with self.lock:
+            candidates = list(self.suggested_candidates.values())
+        out: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate.status not in {"veto_pending", "hold"}:
+                continue
+            if not candidate.control_message_id:
+                continue
+            out.append({
+                "candidate_id": candidate.candidate_id,
+                "reply": candidate.reply,
+                "decision": candidate.decision,
+                "reason": candidate.reason,
+                "status": candidate.status,
+                "created_at": candidate.created_at,
+                "iteration": candidate.iteration,
+                "started_at": candidate.started_at,
+                "cost_units": candidate.cost_units,
+                "control_message_id": candidate.control_message_id,
+            })
+        return out
+
+    def persist_suggested_candidates(self) -> bool:
+        path = self.config.suggested_loop_state_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(self.suggested_state_payload(), ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+            return True
+        except OSError as exc:
+            log("SUGGEST", f"state persist failed (HOLD 복원 불가): {exc}")
+            return False
+
+    def rehydrate_suggested_candidates(self) -> int:
+        path = self.config.suggested_loop_state_path
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            log("SUGGEST", f"state read failed: {exc}")
+            return 0
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log("SUGGEST", f"state corrupt; ignored: {exc}")
+            return 0
+        if not isinstance(rows, list):
+            return 0
+        now = time.time()
+        max_age = max(1, int(self.config.suggested_loop_state_max_age_seconds))
+        restored = 0
+        dropped_stale = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate_id = str(row.get("candidate_id") or "")
+            reply = str(row.get("reply") or "")
+            try:
+                control_message_id = int(row.get("control_message_id") or 0)
+            except (TypeError, ValueError):
+                control_message_id = 0
+            if not candidate_id or not reply or control_message_id <= 0:
+                continue
+            try:
+                created_at = float(row.get("created_at") or 0.0)
+            except (TypeError, ValueError):
+                created_at = 0.0
+            if created_at <= 0 or now - created_at > max_age:
+                dropped_stale += 1
+                continue
+            candidate = SuggestedLoopCandidate(
+                candidate_id=candidate_id,
+                reply=reply,
+                decision=str(row.get("decision") or "hold"),
+                reason=str(row.get("reason") or "restored_after_restart"),
+                # 재수화 후보는 자동발사 대상에서 영구 제외 — 사람 확인만 받는다.
+                status="hold",
+                created_at=created_at,
+                deadline=now,
+                iteration=int(row.get("iteration") or 1),
+                started_at=float(row.get("started_at") or created_at),
+                cost_units=int(row.get("cost_units") or 0),
+                control_message_id=control_message_id,
+            )
+            with self.lock:
+                self.suggested_candidates[candidate.candidate_id] = candidate
+            restored += 1
+        if restored or dropped_stale:
+            log("SUGGEST", f"rehydrated hold candidates restored={restored} dropped_stale={dropped_stale}")
+        return restored
 
     def suggested_loop_cap_reason(self, *, iteration: int, started_at: float, cost_units: int) -> str:
         if iteration > self.config.suggested_loop_max_iterations:
@@ -4866,6 +5735,47 @@ class Bridge:
             return "cost_cap"
         return ""
 
+    def revive_superseded_candidate(
+        self, candidate: SuggestedLoopCandidate
+    ) -> SuggestedLoopCandidate | None:
+        """죽은 후보를 **새 후보로 재발행**한다 (T-260727-144 A안).
+
+        supersede 판정 로직 자체는 손대지 않는다 — 대신 사람이 탭한 이 순간을 created_at
+        으로 삼은 새 후보를 낸다. 탭이 곧 최신 사람 의사표시이므로 시각이 지금인 게 사실이고,
+        기존 스테일 판정(created_at <= latest_human_input_at)도 그대로 통과한다.
+
+        iteration·started_at·cost_units 는 원본 값을 그대로 승계한다 — 되살렸다고 루프
+        예산(원칙 11)이 리셋되면 안 된다. OR 박스 상한은 자동발사 전용이라 사람 확인
+        경로(기존 confirm 분기)와 동일하게 여기서도 검사하지 않는다.
+        """
+        now = time.time()
+        revived = SuggestedLoopCandidate(
+            candidate_id=secrets.token_hex(6),
+            reply=candidate.reply,
+            decision="hold",
+            reason="revived_after_superseded",
+            status="confirming",
+            created_at=now,
+            deadline=now,
+            iteration=candidate.iteration,
+            started_at=candidate.started_at,
+            cost_units=candidate.cost_units,
+            control_message_id=candidate.control_message_id,
+        )
+        with self.lock:
+            self.suggested_candidates[revived.candidate_id] = revived
+        return revived
+
+    def superseded_age_seconds(self, candidate: SuggestedLoopCandidate) -> float | None:
+        """supersede 시각 → 지금까지의 초. 시각을 모르면 None (0.0 으로 눕히지 않는다).
+
+        0.0 으로 폴백하면 "방금 죽은 후보" 와 "언제 죽었는지 모르는 후보" 가 같은 값이 돼,
+        나이 분포가 조용히 왜곡되고 TTL 판정이 최신인 척한다. 모르는 건 모른다고 남긴다.
+        """
+        if candidate.superseded_at <= 0:
+            return None
+        return round(max(0.0, time.time() - candidate.superseded_at), 3)
+
     def claim_suggested(self, candidate: SuggestedLoopCandidate, expected: str, claimed: str) -> bool:
         with self.lock:
             if candidate.status != expected:
@@ -4873,8 +5783,32 @@ class Bridge:
             candidate.status = claimed
             return True
 
+    def suggested_register_skip_reason(self, parsed: SuggestedReply) -> str:
+        """카드를 안 띄우는 이유를 이름으로 돌려준다(빈 문자열 = 띄운다).
+
+        게이트 조건 자체는 register_suggested_reply 의 옛 한 줄과 동일하다 — 판정을 바꾸지
+        않고 **이유를 말하게** 만드는 것이 목적이다 (T-260726-047).
+        """
+        if not parsed.reply:
+            return "no_reply"
+        if not self.suggested_loop_runtime_enabled:
+            return "loop_disabled"          # CLB_SUGGESTED_LOOP 미주입/0
+        if not is_private_chat_id(self.config.chat_id):
+            return "not_private_chat"
+        if self.config.suggested_loop_kill_path.exists():
+            return "kill_switch"
+        return ""
+
     def register_suggested_reply(self, active: ActiveTurn | None, parsed: SuggestedReply, answer: str, *, force_hold: bool = False) -> None:
-        if not self.suggested_loop_runtime_enabled or not is_private_chat_id(self.config.chat_id) or self.config.suggested_loop_kill_path.exists() or not parsed.reply:
+        skip_reason = self.suggested_register_skip_reason(parsed)
+        if skip_reason:
+            # ⚠️ 침묵 금지 (T-260726-047) — 이 return 이 로그 0줄이라, 제어 노드 plist 재렌더에서
+            # CLB_SUGGESTED_LOOP 이 유실되자 hold 버튼 카드가 통째로 사라진 것을 사용자 눈이
+            # 먼저 잡았다(2026-07-26 12:36 실물 지적). 버블·👀 는 loop 와 무관해 살아 있어
+            # "문구는 오는데 카드만 없는" 상태가 로그 어디에도 안 남았다. 카드로 만들 추천답변이
+            # 실제로 있는 턴만 1줄 남긴다 — 추천답변 없는 턴(no_reply)은 잡음이라 침묵 유지.
+            if parsed.reply:
+                log("SUGGEST", f"card skipped reason={skip_reason}")
             return
         decision = classify_suggested_reply(parsed)
         now = time.time()
@@ -4942,6 +5876,10 @@ class Bridge:
         if not candidate.control_message_id:
             candidate.status = "surface_failed"
             self.suggested_ledger(candidate, "surface_failed", error="missing_message_id")
+            return
+        # control_message_id 는 카드 전송 후에야 정해진다. 생성 시점 스냅샷에는 없으므로
+        # 여기서 한 번 더 저장해야 재기동 후 버튼 검증(message_id 대조)이 성립한다 (T-260721-026).
+        self.persist_suggested_candidates()
 
     def edit_suggested_status(self, candidate: SuggestedLoopCandidate, text: str) -> None:
         if candidate.control_message_id:
@@ -4962,6 +5900,7 @@ class Bridge:
             if candidate.created_at <= self.latest_human_input_at:
                 candidate.status = "superseded"
                 candidate.reason = "newer_human_input"
+                candidate.superseded_at = time.time()
                 superseded = True
             else:
                 superseded = False
@@ -5179,6 +6118,7 @@ class Bridge:
                 ):
                     candidate.status = "superseded"
                     candidate.reason = "newer_human_input"
+                    candidate.superseded_at = time.time()
                     superseded_candidates.append(candidate)
 
             remaining: list[QueueItem] = []
@@ -5350,6 +6290,135 @@ class Bridge:
         return True
 
 
+    def enqueue_approval_prompt(self, action: str, task_id: str, request_id: str) -> bool:
+        """판정 성립을 사용자 발화형 프롬프트로 자기 세션에 1회 주입 (T-260725-072).
+
+        기존 추천답변 확인버튼과 같은 레일(QueueItem → queue → pending)을 쓴다. 버튼 콜백은
+        이미 인증된 사용자 액션이므로 human_confirmed 마커가 정당하다. 신규 주입 채널을
+        만들지 않으므로 busy-inject·큐 규칙은 기존 동작 그대로다.
+        """
+        if mesh_approval is None:
+            return False
+        item = QueueItem(
+            queue_id=f"approval:{request_id}",
+            update_id=-int(hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:12], 16),
+            message_id=0,
+            text=mesh_approval.button_prompt(action, task_id, request_id),
+            nonce=bridge_nonce(),
+            received_at=time.time(),
+            source="approval_button",
+            auto_origin=False,
+            suggested_authorization=SUGGESTED_AUTH_HUMAN_CONFIRMED,
+        )
+        self.queue.append_status(item, "received")
+        self.queue.append_status(item, "enqueued")
+        with self.lock:
+            self.pending.append(item)
+        return True
+
+    def handle_mesh_approval_callback(self, callback: dict[str, Any]) -> bool:
+        """승인 대기함 카드 버튼 (renderer spec §7 R-A2~R-A5, T-260725-066).
+
+        승인은 이 경로 하나로만 성립한다 — 판정은 approval_grant_decision, 성립의 정의는
+        mesh_approval.decide 의 내구 레코드다. 기록 실패 시 승인 불성립(fail-closed).
+        """
+        data = str(callback.get("data") or "")
+        if not data.startswith(f"{APPROVAL_CALLBACK_PREFIX}::"):
+            return False
+        callback_query_id = str(callback.get("id") or "")
+
+        def answer(text: str) -> None:
+            if callback_query_id:
+                self.telegram.call(
+                    "answerCallbackQuery",
+                    callback_query_id=callback_query_id,
+                    text=text,
+                )
+
+        if mesh_approval is None:
+            answer("승인 접수 경로를 사용할 수 없습니다.")
+            return True
+
+        message = callback.get("message") if isinstance(callback.get("message"), dict) else {}
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        sender = callback.get("from") if isinstance(callback.get("from"), dict) else {}
+        chat_id = str(chat.get("id") or "")
+        # R-A4: 방 판정은 chat_id 로만 — 방 개명·아바타 교체와 무관해야 한다.
+        if chat_id not in {str(value) for value in APPROVAL_TEAM_ROOM_CHAT_IDS.values()}:
+            answer(mesh_approval.TOAST_DENIED)
+            return True
+        allowed_user = str(self.config.ack_veto_allowed_user_id or "")
+        if not allowed_user or str(sender.get("id") or "") != allowed_user:
+            answer(mesh_approval.TOAST_DENIED)
+            return True
+
+        parts = data.split("::")
+        request_id = parts[2] if len(parts) == 4 else ""
+        # 멱등: 판정 시 pending 이 consumed 로 이동하므로 decided 확인이 pending 조회보다 앞서야
+        # 재누름이 '만료'로 오답하지 않는다 (directive D).
+        if mesh_approval.load_decided(request_id) is not None:
+            answer(mesh_approval.TOAST_ALREADY)
+            return True
+        pending = mesh_approval.load_pending(request_id) if request_id else None
+        decision = approval_grant_decision("callback", data, pending)
+        if not decision["valid"]:
+            answer(mesh_approval.TOAST_UNKNOWN)
+            return True
+
+        try:
+            result = mesh_approval.decide(
+                request_id=request_id,
+                task_id=str((pending or {}).get("task_id") or parts[1]),
+                action=str(decision["action"]),
+                actor_user_id=sender.get("id"),
+                callback_id=callback_query_id,
+                chat_id=chat_id,
+                message_id=message.get("message_id"),
+                decided_at=datetime.now(KST).isoformat(timespec="seconds"),
+            )
+        except Exception as exc:  # noqa: BLE001 - 내구 기록 실패는 fail-closed.
+            log("APPROVAL", f"durable record failed: {type(exc).__name__}")
+            answer(mesh_approval.TOAST_FAILED)
+            return True
+
+        answer(result["toast"])
+        if result["status"] == "decided":
+            # T-260725-072: 판정 성립 1회에만 발화형 통지를 주입한다.
+            # already/unknown/denied/fail-closed 경로는 여기 도달하지 않으므로 주입도 없다.
+            self.enqueue_approval_prompt(
+                str(decision["action"]),
+                str((pending or {}).get("task_id") or parts[1]),
+                request_id,
+            )
+            # 카드 마감 표시는 best-effort — 진실은 decided 레코드다 (ack_veto 관례 동형).
+            # 경로는 카드 발신과 동일한 직접 Bot API 여야 한다 (T-260725-078: 버스 경유 시
+            # renderer 가 copy_content × mesh_group 으로 억제해 버튼이 그대로 남았다).
+            try:
+                closed = self.telegram.call(
+                    "editMessageText",
+                    bypass_mesh_cutover=True,
+                    chat_id=chat_id,
+                    message_id=message.get("message_id"),
+                    text=mesh_approval.closed_card(
+                        str(message.get("text") or ""),
+                        str(decision["action"]),
+                        datetime.now(KST).strftime("%H:%M"),
+                    ),
+                    reply_markup=json.dumps({"inline_keyboard": []}, ensure_ascii=False),
+                )
+            except Exception as exc:  # noqa: BLE001 - 표시 실패가 성립을 되돌리지 않는다.
+                log("APPROVAL", f"card close edit failed: {type(exc).__name__}")
+            else:
+                # call() 은 Telegram API 오류에 예외 대신 None 을 돌려준다 — 반환값을 봐야
+                # 실패가 로그에 남는다 (제어 노드 'card close edit failed' 조회가 빈 출력이던 이유).
+                if not (isinstance(closed, dict) and closed.get("ok")):
+                    log(
+                        "APPROVAL",
+                        "card close edit failed: no ok receipt "
+                        f"chat={chat_id} mid={message.get('message_id')}",
+                    )
+        return True
+
     def handle_suggested_callback(self, callback: dict[str, Any]) -> bool:
         data = str(callback.get("data") or "")
         if not data.startswith(f"{SUGGESTED_LOOP_CALLBACK}::"):
@@ -5391,7 +6460,54 @@ class Bridge:
             )
             return True
         if candidate.status == "superseded":
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — 죽은 후보를 사람이 탭한 사건 계측 + 되살림
+            #   (T-260727-144, 제어 노드 결재 2026-07-28: A+TTL 채택 · C 기각).
+            #   여기는 원래 토스트만 돌려주고 기록도 실행도 0 이었다 — 사람 확인(=최신 의사)이
+            #   supersede 판정보다 뒤에 오면 항상 졌다. supersede 사유가 10일치 전건 사람
+            #   입력(direct 182 · telegram 92, 자동 만료 0)이라, 후보를 죽인 것도 사람이고
+            #   옛 카드를 다시 탭한 것도 사람이다 — 같은 종류의 신호를 한쪽만 무시할 이유가 없다.
+            #   계측은 어느 분기로 가든 남긴다(초과분 비율이 TTL 타당성 판정 입력).
+            age = self.superseded_age_seconds(candidate)
+            ttl = self.config.suggested_revive_ttl_seconds
+            outcome = "non_confirm_action"
             toast = "더 최신 입력이 있어 이전 추천은 실행하지 않았습니다."
+            if action == "confirm":
+                revived = (
+                    self.revive_superseded_candidate(candidate)
+                    if age is not None and age <= ttl
+                    else None
+                )
+                if revived is not None and self.enqueue_suggested_candidate(revived, auto_origin=False):
+                    revived.status = "confirmed_enqueued"
+                    self.suggested_ledger(
+                        revived,
+                        "confirmed_enqueued",
+                        human_confirmed=True,
+                        revived_from=candidate.candidate_id,
+                        superseded_age_seconds=age,
+                    )
+                    outcome = "revived_enqueued"
+                    toast = "확인되어 큐에 넣었습니다 — 이전 추천을 되살렸습니다."
+                else:
+                    # B 폴백: 원문을 장식 없이 단독 메시지로 재게시해 사람이 읽고 복붙하게 한다.
+                    #   TTL 초과분까지 자동으로 되살리는 건 옛 맥락을 새 세션에 밀어넣는
+                    #   일이라, 그 구간만 사람 판단으로 되돌린다.
+                    outcome = "ttl_exceeded" if (age is None or age > ttl) else "revive_failed"
+                    self.telegram.call(
+                        "sendMessage",
+                        chat_id=self.config.chat_id,
+                        text=candidate.reply,
+                    )
+                    toast = "더 최신 입력이 있어 자동 실행은 하지 않았습니다 — 원문을 아래에 다시 올렸습니다."
+            self.suggested_ledger(
+                candidate,
+                "confirm_after_superseded",
+                human_confirmed=True,
+                callback_action=action,
+                superseded_age_seconds=age,
+                revive_outcome=outcome,
+                revive_ttl_seconds=ttl,
+            )
         elif action in {"reject", "kill"} and (
             self.claim_suggested(candidate, "hold", "rejected")
             or self.claim_suggested(candidate, "veto_pending", "rejected")
@@ -5554,7 +6670,7 @@ class Bridge:
             payload.update({"dev": identity.dev, "ino": identity.ino, "session_path": str(identity.path)})
         write_json_atomic(self.config.state_path, payload)
 
-    def load_state_for_identity(self, identity: SessionIdentity) -> None:
+    def load_state_for_identity(self, identity: SessionIdentity, rotated: bool = False) -> None:
         state = read_json(self.config.state_path)
         # T-260709-50 M9: offset 기본값을 고르기 전에 active_turn 을 먼저 복원해야 한다.
         # 옛 순서는 self.active_turn=None 을 보고 start_at_end 로 건너뛴 뒤 active 를
@@ -5586,10 +6702,20 @@ class Bridge:
                     loaded_active = candidate
         self.active_turn = loaded_active
         cursor = cursor_offset_for_state(state, identity)
-        if cursor is None:
-            self.session_pos = 0 if self.active_turn else (identity.size if self.config.start_at_end else 0)
-        else:
+        if cursor is not None:
             self.session_pos = cursor
+        elif self.active_turn or not self.config.start_at_end:
+            self.session_pos = 0
+        elif rotated:
+            # T-260727-006: 프로세스가 살아 있는 채로 새 트랜스크립트에 갈아탄 경우 = 세션 회전.
+            # 회전 직전에 기록된 주입 프롬프트를 놓치지 않도록 시간창만큼만 되감는다.
+            # 브릿지 재기동(첫 바인딩)은 이 갈래로 안 온다 — CLB_START_AT_END 의 기존 의미
+            # ("재기동 시 과거 미발송") 보존.
+            self.session_pos = session_rotation_start_offset(
+                identity.path, identity.size, time.time()
+            )
+        else:
+            self.session_pos = identity.size
         parent_items = (state or {}).get("parent_map")
         if isinstance(parent_items, list):
             self.parent_map = {
@@ -5665,7 +6791,10 @@ class Bridge:
                 log("SESSION", f"waiting for transcript {binding.transcript_path}")
             else:
                 self.session_identity = identity
-                self.load_state_for_identity(identity)
+                # previous 가 있으면 = 이 프로세스가 살아 있는 채로 갈아탄 것 = 세션 회전.
+                # previous 가 None 이면 = 프로세스 첫 바인딩 = 재기동. 둘을 갈라야
+                # 회전 유실(T-260727-006)만 고치고 재기동 시 과거 폭주는 안 생긴다.
+                self.load_state_for_identity(identity, rotated=previous is not None)
                 log("SESSION", f"watching {binding.transcript_path} offset={self.session_pos}")
             self.persist_state()
             self.write_egress_sidecar()
@@ -6154,6 +7283,57 @@ class Bridge:
         if hasattr(self.repl, "invalidate_target_cache"):
             self.repl.invalidate_target_cache()
         log("TURN", f"released active_turn queue={active.queue_id[:10]}: tmux session lost ({detail})")
+        return True
+
+    def native_queue_wait_expired(self, active: ActiveTurn) -> bool:
+        """'큐에 있다' 대기가 상한을 넘겼는가 (T-260726-053).
+
+        기준시각은 큐 부착 관측(native_queue_seen_at)과 주입시각 중 나중 것이다. user
+        record·sidecar 소비 도장이 하나라도 찍혀 있으면 배달이 성사된 것이라 만료 대상이
+        아니다 — 그건 '롱턴 대기' 이지 '큐 소실' 이 아니다.
+        """
+        if active.user_uuid or active.user_seen_at > 0 or active.sidecar_consumed_at > 0:
+            return False
+        timeout = native_queue_wait_timeout_seconds()
+        if timeout <= 0:
+            return False
+        # ⚠️ 기준시각은 injected_at 이 아니라 native_queue_seen_at 이다 (T-260726-053).
+        # check_injection_timeout 의 '이전 턴이 도는 중' 가드가 매 사이클 injected_at 을
+        # 현재시각으로 되감기 때문에, injected_at 을 섞으면 상한이 영원히 도달하지 않는다.
+        # (수리 중 픽스처가 실제로 이 함정을 잡아냈다 — busy 믿음이 굳은 사고 재현에서
+        # 만료가 한 번도 발동하지 않았다.)
+        if active.native_queue_seen_at <= 0:
+            return False
+        return (time.time() - active.native_queue_seen_at) >= timeout
+
+    def release_active_turn_due_to_native_queue_loss(self, active: ActiveTurn) -> bool:
+        """큐 소실로 굳은 턴을 재큐 없이 해제해 입력 경로를 되살린다 (T-260726-053).
+
+        release_stale_active_turn_if_idle 의 '배달 확인됨' 분기와 같은 계약이다 — 슬롯만
+        풀고 stale_released 로 종착시켜 재주입(=이중집행)을 만들지 않는다. 다른 점은
+        **세션 busy 판정을 묻지 않는다**는 것 하나다. 사고 당시 busy 믿음이 굳어 있었고,
+        그걸 조건으로 두는 순간 이 경로도 같이 막힌다.
+        """
+        item = self.queue_item_for_active(active)
+        waited = int(max(time.time() - max(active.native_queue_seen_at, active.injected_at), 0))
+        with self.lock:
+            if self.active_turn is not active:
+                return False
+            self.active_turn = None
+        self.stop_typing()
+        self.queue.append_status(
+            item,
+            "stale_released",
+            age_seconds=waited,
+            release_reason="native_queue_wait_timeout",
+        )
+        self.persist_state()
+        self.write_egress_sidecar()
+        log(
+            "STALE",
+            f"released active_turn queue={active.queue_id[:10]} waited={waited}s "
+            f"reason=native_queue_wait_timeout (queue item vanished; input path restored)",
+        )
         return True
 
     def active_turn_age_seconds(self, active: ActiveTurn) -> float:
@@ -7740,15 +8920,109 @@ class Bridge:
         log("QUEUE", f"directive {status} requeued queue={item.queue_id} retry={next_retry}/{retry_max}")
         return retry_item
 
+    # T-260728-043 — 미등록 chat 대장. 폐기는 종전대로 하되 식별 한 줄은 남긴다.
+    #   로그 폭주 금지가 불변 조건이라(그룹방은 사람들이 계속 떠든다) chat 단위 쿨다운을
+    #   두고, 사용자 폰 표면화는 chat 당 **평생 1회**로 durable 하게 잠근다(재기동 무관).
+    #   대장 파일이 죽어도 조용히 넘어가지 않는다 — 실패를 로그로 드러내고, 메모리 dedup 으로
+    #   폭주만은 막는다(기록 없는 폐기로 되돌아가지 않는 것이 이 티켓의 요구다).
+    UNKNOWN_CHAT_STATE_NAME = "clb-unknown-chats.json"
+
+    def _unknown_chat_state_path(self) -> Path:
+        return self.config.state_dir / self.UNKNOWN_CHAT_STATE_NAME
+
+    def _load_unknown_chats(self) -> dict[str, Any]:
+        cached = getattr(self, "_unknown_chats", None)
+        if cached is not None:
+            return cached
+        data: dict[str, Any] = {}
+        path = self._unknown_chat_state_path()
+        try:
+            if path.exists():
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"unknown chat 대장 읽기 실패 path={path} err={exc}")
+        self._unknown_chats = data
+        return data
+
+    def _save_unknown_chats(self, data: dict[str, Any]) -> None:
+        path = self._unknown_chat_state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            if not getattr(self, "_unknown_chat_state_warned", False):
+                self._unknown_chat_state_warned = True
+                log("QUEUE", f"unknown chat 대장 쓰기 실패 — 표면화 dedup 이 재기동을 못 넘긴다 path={path} err={exc}")
+
+    def note_unknown_chat(self, update: dict[str, Any], reason: str) -> None:
+        ident = unknown_chat_identity(update)
+        if not ident:
+            return
+        chat_id = ident["chat_id"]
+        # 등록된 chat 은 이 대장의 대상이 아니다 — DM 경로는 전혀 건드리지 않는다.
+        if chat_id == str(self.config.chat_id):
+            return
+        try:
+            cooldown = float(os.environ.get("CLB_UNKNOWN_CHAT_LOG_COOLDOWN", "3600"))
+        except ValueError:
+            cooldown = 3600.0
+        now = time.time()
+        state = self._load_unknown_chats()
+        entry = state.get(chat_id) if isinstance(state.get(chat_id), dict) else {}
+        seen = int(entry.get("count") or 0) + 1
+        last_logged = float(entry.get("last_logged") or 0.0)
+        should_log = last_logged <= 0.0 or (now - last_logged) >= cooldown
+        should_notify = not entry.get("notified") and str(
+            os.environ.get("CLB_UNKNOWN_CHAT_NOTIFY", "1")
+        ).strip() not in {"0", "false", "no"}
+
+        if should_log:
+            who = ident["from_id"]
+            if ident["from_username"]:
+                who = f"{who}@{ident['from_username']}"
+            log(
+                "QUEUE",
+                f"unknown chat drop reason={reason} update={update.get('update_id')} "
+                f"carrier={ident['carrier']} chat_id={chat_id} type={ident['chat_type']} "
+                f"title={ident['chat_title']!r} from={who} seen={seen}",
+            )
+
+        if should_notify:
+            title = f" ({ident['chat_title']})" if ident["chat_title"] else ""
+            try:
+                self.telegram.send(
+                    f"등록되지 않은 방에서 메시지를 받아 버렸습니다 — chat_id={chat_id} "
+                    f"[{ident['chat_type']}]{title}. 이 방을 쓰려면 chat_id 를 등록해 주세요."
+                )
+            except Exception as exc:  # noqa: BLE001
+                log("QUEUE", f"unknown chat 표면화 실패 chat_id={chat_id} err={exc}")
+
+        state[chat_id] = {
+            "first_seen": entry.get("first_seen") or now,
+            "last_seen": now,
+            "last_logged": now if should_log else last_logged,
+            "count": seen,
+            "notified": bool(entry.get("notified")) or should_notify,
+            "chat_type": ident["chat_type"],
+            "chat_title": ident["chat_title"],
+        }
+        self._save_unknown_chats(state)
+
     def enqueue_update(self, update: dict[str, Any]) -> None:
         if "edited_message" in update:
             log("QUEUE", f"ignore edited_message update={update.get('update_id')}")
             return
         message = update.get("message") or update.get("edited_message")
         if not isinstance(message, dict):
+            # message 없는 update(my_chat_member 등)도 기록 없이 사라지던 자리다.
+            # 봇이 방에 초대되는 순간이 바로 chat_id 를 배울 기회라 같은 계약을 적용한다.
+            self.note_unknown_chat(update, "no_message")
             return
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         if str(chat.get("id")) != self.config.chat_id:
+            self.note_unknown_chat(update, "chat_not_registered")
             return
         has_location = isinstance(message.get("location"), dict) or isinstance(message.get("venue"), dict)
         if has_location and not location_prompt_enabled():
@@ -7764,7 +9038,9 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             caption = message.get("caption")
             caption_text = caption.strip() if isinstance(caption, str) else ""
-            detail = str(exc).replace(self.token, "<redacted-token>")
+            # 빈 토큰(voice-only 레인, T-260727-077)에 replace 를 걸면 파이썬이 글자
+            # 사이마다 치환문을 끼워 넣어 메시지를 망친다 ("ab".replace("", "X") == "XaXbX").
+            detail = str(exc).replace(self.token, "<redacted-token>") if self.token else str(exc)
             if caption_text:
                 self.media_retry.pop(retry_key, None)
                 media_retry_completion = "media_retry_caption_fallback"
@@ -8018,7 +9294,16 @@ class Bridge:
 
     def stage_and_submit_model_choice(self, alias: str) -> bool:
         """Land a model command in the tmux composer before allowing Enter."""
-        prompt = f"/model {alias}"
+        return self.stage_and_submit_slash_choice(MODEL_SLASH_COMMAND, alias)
+
+    def stage_and_submit_slash_choice(self, command: str, value: str) -> bool:
+        """Land `<command> <value>` in the tmux composer before allowing Enter.
+
+        T-260726-034: /model 전용이던 것을 커맨드 인자로 일반화했다. 검증된
+        staging·모달회피·재시도는 그대로 공유하고 프롬프트 문자열만 달라진다
+        (/model 경로는 위 얇은 래퍼라 동작 무변경).
+        """
+        prompt = f"{command} {value}"
         lock = getattr(self.repl, "composer_lock", None)
         clear = getattr(self.repl, "_clear_composer_unlocked", None)
         stage = getattr(self.repl, "_stage_prompt_unlocked", None)
@@ -8035,7 +9320,7 @@ class Bridge:
                 modal = model_interstitial(screen)
                 if modal:
                     if escape_used:
-                        log("INJECT", f"/model stage blocked by persistent {modal}")
+                        log("INJECT", f"{command} stage blocked by persistent {modal}")
                         return False
                     submit("Escape")
                     escape_used = True
@@ -8053,7 +9338,7 @@ class Bridge:
                         break
                     residual = composer_residual_text(screen)
                 if residual or model_interstitial(screen):
-                    log("INJECT", f"/model composer clear not verified attempt={attempt}")
+                    log("INJECT", f"{command} composer clear not verified attempt={attempt}")
                     continue
 
                 stage(prompt)
@@ -8065,16 +9350,19 @@ class Bridge:
                     if not escape_used:
                         submit("Escape")
                         escape_used = True
-                    log("INJECT", f"/model stage diverted to {modal} attempt={attempt}")
+                    log("INJECT", f"{command} stage diverted to {modal} attempt={attempt}")
                     continue
                 if composer_residual_text(screen) == prompt:
                     submit("Enter")
                     return True
-                log("INJECT", f"/model composer landing not observed attempt={attempt}")
+                log("INJECT", f"{command} composer landing not observed attempt={attempt}")
         return False
 
     def submit_model_alias(self, alias: str) -> None:
-        prompt = f"/model {alias}"
+        self.submit_slash_arg(MODEL_SLASH_COMMAND, alias)
+
+    def submit_slash_arg(self, command: str, value: str) -> None:
+        prompt = f"{command} {value}"
         replace_prompt = getattr(self.repl, "replace_prompt", None)
         if callable(replace_prompt):
             replace_prompt(prompt)
@@ -8213,6 +9501,141 @@ class Bridge:
         self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
         log("INJECT", f"/model menu sent update={item.update_id}")
 
+    # ── /effort (T-260726-034) ────────────────────────────────────────────
+    # /model 과 같은 프리즈 계열이라 같은 뼈대를 쓴다. 다른 건 두 가지뿐:
+    #   ① 선택지 목록(effort_menu_levels)  ② 착지 확인 근거.
+    # 착지 확인이 다른 이유: 사고강도는 settings.json 에 안 남는 세션 전용 값이 있고
+    # (CLI 실측 'this session only'), switch-model 확인 모달도 없다. 그래서 상태줄
+    # 접미 '(xhigh)' 를 1차 근거로 본다. 확인이 안 돼도 주입 자체는 성공일 수 있어
+    # '확인 실패' 로만 알리고 거짓 성공은 만들지 않는다.
+    def current_session_effort(self) -> str:
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            return ""
+        return session_effort_from_screen(screen)
+
+    def wait_for_session_effort(self, level: str) -> tuple[bool, str]:
+        settle = max(0.0, float(os.environ.get("CLB_EFFORT_SETTLE_SEC", "1.0")))
+        timeout = max(0.0, float(os.environ.get("CLB_EFFORT_VERIFY_TIMEOUT_SEC", "6.0")))
+        poll = max(0.05, float(os.environ.get("CLB_EFFORT_VERIFY_POLL_SEC", "0.2")))
+        if settle:
+            time.sleep(settle)
+        deadline = time.monotonic() + timeout
+        current = ""
+        while True:
+            current = self.current_session_effort()
+            if current and current.lower() == level.lower():
+                return True, current
+            if time.monotonic() >= deadline:
+                return False, current
+            time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def effort_apply_notice(level: str, confirmed: bool, current: str, selected: bool = False) -> str:
+        label = current or "(세션 상태줄에서 확인 불가)"
+        if confirmed:
+            action = "사고강도 선택 적용" if selected else "사고강도 적용"
+            return f"✅ {action}: {level}\n현재 세션 사고강도: {label}"
+        return (
+            f"⚠️ 사고강도 전환 확인 실패: {level}\n"
+            f"현재 세션 사고강도: {label}\n"
+            f"(주입은 나갔을 수 있어요 — 상태줄로 확인해 주세요)"
+        )
+
+    def handle_effort_command(self, item: "QueueItem") -> None:
+        if not repl_supports_pane_features(self.repl):
+            self.defer_native_pane_command(item, EFFORT_SLASH_COMMAND)
+            return
+        text = sanitize_text(item.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) > 1:
+            level = parts[1].strip()
+            if not effort_level_allowed(level):
+                self.telegram.send(effort_level_rejection_text(level))
+                self.queue.append_status(item, "blocked", slash_command=EFFORT_SLASH_COMMAND)
+                log("INJECT", f"/effort arg rejected (not allowlisted): {level!r} update={item.update_id}")
+                return
+            try:
+                self.submit_slash_arg(EFFORT_SLASH_COMMAND, level)
+            except Exception as exc:  # noqa: BLE001
+                log("INJECT", f"/effort arg apply failed: {exc}")
+                self.queue.append_status(item, "failed", error=str(exc))
+                self.telegram.send(f"claude bridge /effort 적용 실패: {exc}")
+                return
+            confirmed, current = self.wait_for_session_effort(level)
+            self.telegram.send(self.effort_apply_notice(level, confirmed, current))
+            self.queue.append_status(
+                item,
+                "injected",
+                slash_command=EFFORT_SLASH_COMMAND,
+                **self.terminal_retry_status_extra(item),
+            )
+            self.queue.append_status(item, "sent", slash_command=EFFORT_SLASH_COMMAND)
+            result = "confirmed" if confirmed else "unconfirmed"
+            log("INJECT", f"/effort arg={level} {result} effort={current or 'unknown'} update={item.update_id}")
+            return
+        current = self.current_session_effort()
+        current_label = current or "(세션 상태줄에서 확인 불가)"
+        buttons = [
+            [
+                {
+                    "text": ("✅ " if current and level.lower() == current.lower() else "") + level,
+                    "callback_data": f"{EFFORT_CALLBACK}::{level}",
+                }
+            ]
+            for level in effort_menu_levels()
+        ]
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        self.telegram.call(
+            "sendMessage",
+            chat_id=self.config.chat_id,
+            text=prefix(
+                f"현재 세션 사고강도: {current_label}\n"
+                f"바꿀 사고강도를 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"
+            ),
+            reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+        )
+        self.queue.append_status(item, "sent", slash_command=EFFORT_SLASH_COMMAND)
+        log("INJECT", f"/effort menu sent update={item.update_id}")
+
+    def apply_effort_choice(self, level: str, menu_message_id: int | None = None) -> None:
+        # 하드닝은 /model 콜백과 동형 — ① allowlist ② idle 게이트(busy 면 턴을 끊지 않는다).
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        if not repl_supports_pane_features(self.repl):
+            self._emit_model_notice(prefix(NATIVE_PANE_DEFER_TEXT), menu_message_id)
+            return
+        if not effort_level_allowed(level):
+            self._emit_model_notice(prefix(effort_level_rejection_text(level)), menu_message_id)
+            log("INJECT", f"/effort choice rejected (not allowlisted): {level!r}")
+            return
+        state = self.busy_state()
+        if state != "idle":
+            self._emit_model_notice(prefix(EFFORT_BUSY_DEFER_TEXT), menu_message_id)
+            log("INJECT", f"/effort choice deferred (busy state={state}): {level}")
+            return
+        try:
+            submitted = self.stage_and_submit_slash_choice(EFFORT_SLASH_COMMAND, level)
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/effort choice apply failed: {exc}")
+            self._emit_model_notice(prefix(f"⚠️ 사고강도 전환 주입 실패: {level}"), menu_message_id)
+            return
+        if not submitted:
+            current = self.current_session_effort()
+            self._emit_model_notice(
+                prefix(self.effort_apply_notice(level, False, current, selected=True)),
+                menu_message_id,
+            )
+            log("INJECT", f"/effort choice={level} failed reason=composer_not_landed")
+            return
+        confirmed, current = self.wait_for_session_effort(level)
+        self._emit_model_notice(
+            prefix(self.effort_apply_notice(level, confirmed, current, selected=True)),
+            menu_message_id,
+        )
+        result = "applied" if confirmed else "unverified"
+        log("INJECT", f"/effort choice={level} {result} effort={current or 'unknown'}")
+
     def _emit_model_notice(self, text: str, menu_message_id: int | None) -> None:
         # 메뉴 메시지가 있으면 그 자리를 edit(적용/거부/대기 확인), 없으면 새 메시지로 회신.
         if menu_message_id is not None:
@@ -8291,6 +9714,48 @@ class Bridge:
                 log("LIFECYCLE", f"watchdog spawn failed after {command_token}: {exc}")
 
         threading.Thread(target=_heal, daemon=True).start()
+
+    def wait_composer_unoccupied(self) -> bool:
+        """주입 직전 composer 점유를 bounded 재시도로 기다린다 (T-260722-009).
+
+        반환 True = 비었음(즉시 주입) / False = N 소진. False 여도 호출부는 그대로
+        진행한다 — N 소진 시 기존 clear 폴백이 받아내는 것이 설계다(리브니스 보존,
+        제어 노드 판정 2026-07-23 05:5x). 폴백 경로는 건드리지 않는다.
+
+        ⚠️ 제거 금지 (DO NOT REMOVE) — 지연 사유는 오직 '사람이 타이핑해 둔 잔여'다.
+          '모델이 턴을 처리 중'인 것 자체는 지연 사유가 아니다. 그 주입은 TUI native
+          큐에 enqueue 되어 병합되지 않으며, 그걸 점유로 오판하면 긴 턴 동안 배차가
+          굶는다(사용자 확정 2026-07-23 03:0x "굶어죽는 것만 확실히 막아줘 — 생각
+          중일 땐 그냥 넣는 걸로", 설계문서 2026-07-23-composer-occupancy-detection §3.0).
+          그래서 판정은 busy 여부가 아니라 composer_residual_text() 하나만 본다.
+
+        ⚠️ 반드시 composer_lock 밖에서 호출한다. 락을 쥔 채 sleep 하면 대기 시간만큼
+          다른 writer(사용자 텔레그램 수신 포함)를 통째로 막아 리브니스가 무너진다.
+        """
+        retries = self.config.composer_occupancy_retries
+        if retries <= 0:
+            return True
+        interval = max(0.0, self.config.composer_occupancy_interval)
+        for attempt in range(retries + 1):
+            try:
+                screen = self.repl.capture_pane(80)
+            except Exception:  # noqa: BLE001
+                # 화면을 못 읽으면 점유를 단정할 수 없다 — 막지 않고 통과시킨다.
+                # (판정 불가를 점유로 치면 관측 공백이 기아로 번진다.)
+                return True
+            if not composer_residual_text(screen):
+                if attempt:
+                    log("INJECT", f"composer occupancy cleared after {attempt} retry(s)")
+                return True
+            if attempt >= retries:
+                break
+            log(
+                "INJECT",
+                f"composer occupied — delay retry {attempt + 1}/{retries} in {interval}s",
+            )
+            time.sleep(interval)
+        log("INJECT", f"composer still occupied after {retries} retries — falling back to clear")
+        return False
 
     def busy_inject_guarded_clear(self) -> None:
         # T-260707-36 안전 가드: 주입 전 capture-pane 으로 composer 잔여 텍스트 확인 →
@@ -8448,11 +9913,20 @@ class Bridge:
                     loop_cost_units=item.loop_cost_units,
                 )
                 self.reset_ambient_flow()
+            elif self.active_turn is not None:
+                # T-260728-065 B축 — 소유권은 그대로 두고 **카드용 기록만** 남긴다.
+                # 여기가 실사고 지점이다: 모델은 B 를 하기 시작하는데 카드 제목은 A 에
+                # 고정돼 있어서, 사용자 폰에는 "지시 A 를 걸고 작업 B 를 그리는" 화면이 떴다.
+                note_mid_turn_arrival(self.active_turn, item.text)
             # else: A 가 진행 중 — active_turn(A) 를 덮지 않는다. B 는 pending 에 남아
             # busy_injected 로 표시된 채 A 완료 후 idle drain 에서 승계된다.
         self.persist_state()
         self.write_egress_sidecar()
         prompt = self.prompt_for_item(item)
+        # T-260722-009: 주입 직전 점유 감지 → bounded 지연 재시도. 반드시 락 획득 '전'에
+        # 둔다(락을 쥔 채 대기하면 그 시간만큼 다른 writer 를 막는다). 반환값으로 분기하지
+        # 않는 것이 의도다 — N 소진이면 아래 기존 clear 폴백이 그대로 받아낸다.
+        self.wait_composer_unoccupied()
         try:
             # codex clear_and_paste_prompt 미러: composer_lock 을 1회 잡고 clear+paste 를
             # 원자적으로(단일쓰기) 수행 — 진행 중 slash 핸들러/idle 주입과의 경합 차단.
@@ -8693,9 +10167,12 @@ class Bridge:
                     self.persist_state()
                     self.write_egress_sidecar()
                     return
-                # /model = 인터셉트 (원문 주입 시 선택창 프리즈 — T-260703-17 실사고).
-                if command_token == MODEL_SLASH_COMMAND:
-                    self.handle_model_command(item)
+                # 선택형 슬래시 = 인터셉트 (원문 주입 시 선택창이 세션을 점유 — T-260703-17
+                # 실사고). T-260726-034: /model 단독 분기를 표로 일반화하고 /effort 를 얹었다
+                # (같은 실패계열인데 /effort 만 보호 밖에 있어 폰에 아무것도 안 떴다).
+                handler_name = SELECTABLE_SLASH_HANDLERS.get(command_token)
+                if handler_name:
+                    getattr(self, handler_name)(item)
                     self.persist_state()
                     self.write_egress_sidecar()
                     return
@@ -8913,6 +10390,14 @@ class Bridge:
         if time.time() - active.injected_at < self.config.injection_verify_timeout:
             return
 
+        # T-260726-053: 큐 소실 교착 탈출은 아래 두 early-return 보다 **먼저** 본다.
+        # 바로 다음 가드가 매 사이클 injected_at 을 현재시각으로 되감고, 그 아래
+        # native-queue 분기는 무조건 return 이라, 뒤에 두면 상한에 영영 도달하지 않는다.
+        # 작업 노드 실사고(2026-07-26 11:02~12:4x)가 정확히 그 조합으로 1h40m 굳었다.
+        if not active.busy_injected and self.native_queue_wait_expired(active):
+            if self.release_active_turn_due_to_native_queue_loss(active):
+                return
+
         # An idle-path inject can race a prior Claude turn whose pane/transcript
         # briefly looked idle. While that prior turn is still active, text in the
         # composer is a queued draft: pressing Enter again or clear/pasting it can
@@ -8928,6 +10413,8 @@ class Bridge:
         # submit confirmation, so a visible queued composer line must not be
         # retried or failed while it waits for the preceding turn to finish.
         if not active.busy_injected and active.native_queue_seen_at > 0:
+            # 상한 판정은 위(세션 busy 가드 앞)에서 이미 끝났다 — 여기 도달했다는 건
+            # 아직 만료 전이라는 뜻이라 옛 동작(대기) 그대로다 (T-260726-053).
             log("INJECT", f"nonce {active.nonce} confirmed in native queue; awaiting user record")
             return
 
@@ -9721,10 +11208,13 @@ class Bridge:
                                     active.flow_body,
                                     node=self.config.node,
                                     emoji=self.config.emoji,
-                                    context=active.text,
+                                    **flow_card_title_kwargs(active),
                                 )
                             )
                             active.flow_message_id = ids[0] if ids else 0
+                            # T-260727-076: 하트비트 기준점. 도구 이벤트가 낸 렌더도 '갱신'
+                            # 이므로, 다음 하트비트는 여기서부터 45초를 센다.
+                            active.flow_last_render_at = time.time()
                             log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                         except Exception as exc:  # noqa: BLE001
                             log("SEND", f"flow mirror send failed (non-fatal): {exc}")
@@ -9738,9 +11228,10 @@ class Bridge:
                                     active.flow_body,
                                     node=self.config.node,
                                     emoji=self.config.emoji,
-                                    context=active.text,
+                                    **flow_card_title_kwargs(active),
                                 ),
                             )
+                            active.flow_last_render_at = time.time()  # T-260727-076 하트비트 기준점
                             log("SEND", f"edited flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                         except Exception as exc:  # noqa: BLE001
                             log("SEND", f"flow mirror edit failed (non-fatal): {exc}")
@@ -10043,6 +11534,74 @@ class Bridge:
         self.drain_queue()
         return True
 
+    def maybe_heartbeat_flow_card(self, now: float | None = None) -> bool:
+        """침묵 구간에서 ⚙️ 카드를 주기 재렌더해 '갱신' 시각을 전진시킨다 (T-260727-076).
+
+        T-260727-068 이 붙인 갱신 라벨은 "언제 멎었는지"를 읽게 해줄 뿐 "지금 살아있는지"를
+        말해주지 못한다 — 두 조각이 다르다. 이 메서드가 뒤쪽을 채운다.
+
+        ⚠️ 정지 보장이 이 기능의 본체다. 하트비트는 **독립 타이머를 갖지 않고** 활성 턴 상태에서
+        파생된다 — active_turn 이 없거나 flow_closed 면 그 순간 멎는다. close_flow_card 가 보는
+        바로 그 필드를 보므로 턴 종료를 놓칠 수 없고, 구조적으로 턴보다 오래 살 수 없다.
+        같은 이유로 jsonl_loop(카드를 렌더하는 바로 그 스레드)에서만 불린다 — 별도 스레드였다면
+        flow_body/flow_message_id 를 두고 본 렌더 경로와 경합했을 것이다.
+
+        반환: 실제로 갱신 edit 을 냈으면 True.
+        """
+        if not flow_mirror_enabled():
+            return False
+        active = self.active_turn
+        # 정지 조건 — 턴 없음 / 카드 없음(미러 OFF·도구 0회) / 이미 닫힘.
+        if not active or active.flow_closed:
+            return False
+        if not active.flow_message_id or not active.flow_body:
+            return False
+        if active.flow_heartbeat_failures >= FLOW_HEARTBEAT_MAX_FAILURES:
+            return False
+        if active.flow_heartbeat_ticks >= FLOW_HEARTBEAT_MAX_TICKS:
+            # 상한 도달 — 갱신을 멈추고 카드를 얼린다(종전 동작). 위 상수 주석 참조.
+            return False
+        now = time.time() if now is None else now
+        last = active.flow_last_render_at or active.injected_at or active.sent_at or 0.0
+        if not last or (now - last) < FLOW_HEARTBEAT_SECONDS:
+            return False
+        # 본문은 그대로 두고 같은 카드를 다시 낸다 — format_flow_mirror 의 헤더 시각이
+        # 매 렌더 재계산이라, 본문이 같아도 '갱신' 이 전진한다(T-260727-068 계약).
+        nonce = active.nonce
+        try:
+            body = format_flow_mirror(
+                active.flow_body,
+                node=self.config.node,
+                emoji=self.config.emoji,
+                **flow_card_title_kwargs(active),
+            )
+            if not body:
+                return False
+            # edit 직전 재확인 — 렌더를 준비하는 사이에 턴이 닫혔거나 교체됐을 수 있다.
+            current = self.active_turn
+            if not current or current.nonce != nonce or current.flow_closed:
+                return False
+            self.telegram.edit(active.flow_message_id, body)
+        except Exception as exc:  # noqa: BLE001
+            active.flow_heartbeat_failures += 1
+            log(
+                "SEND",
+                f"flow heartbeat edit failed (non-fatal) nonce={nonce} "
+                f"fail={active.flow_heartbeat_failures}/{FLOW_HEARTBEAT_MAX_FAILURES}: {exc}",
+            )
+            # 실패해도 기준점을 전진시킨다 — 안 그러면 매 tick 마다 재시도해 429 를 키운다.
+            active.flow_last_render_at = now
+            return False
+        active.flow_heartbeat_failures = 0
+        active.flow_heartbeat_ticks += 1
+        active.flow_last_render_at = now
+        log(
+            "SEND",
+            f"flow heartbeat nonce={nonce} mid={active.flow_message_id} "
+            f"tick={active.flow_heartbeat_ticks}/{FLOW_HEARTBEAT_MAX_TICKS}",
+        )
+        return True
+
     def close_flow_card(self, active: ActiveTurn, status: str) -> bool:
         # ⚙️ flow 카드 종료 edit (T-260721-022) — 턴이 끝나도 카드가 '진행중 · 현재: ▶ 실행'
         # 으로 굳어 고아로 남던 회귀(2026-07-21 21:41 사용자 제보, 51분 잔류) 차단.
@@ -10064,7 +11623,7 @@ class Bridge:
                 active.flow_body,
                 node=self.config.node,
                 emoji=self.config.emoji,
-                context=active.text,
+                **flow_card_title_kwargs(active),
                 done_label=flow_done_label(status),
                 elapsed_text=format_flow_elapsed(time.time() - started) if started else "",
             )
@@ -10098,13 +11657,18 @@ class Bridge:
                 if not path.exists():
                     self.retry_pending_send()
                     self.write_egress_sidecar()
+                    self.maybe_heartbeat_flow_card()
                     self.stop_event.wait(0.5)
                     continue
                 with path.open("rb") as handle:
                     handle.seek(self.session_pos)
                     data = handle.read()
                 if not data:
+                    # ⚙️ T-260727-076 — 여기가 정확히 '침묵 구간'이다: 트랜스크립트에 새 줄이
+                    # 없다 = 도구 이벤트가 없다 = 종전엔 카드가 정지하던 지점. 자체 시간
+                    # 상한을 들고 있으므로 이 0.5초 tick 마다 불려도 실제 edit 은 45초에 1회다.
                     self.retry_pending_send()
+                    self.maybe_heartbeat_flow_card()
                     self.stop_event.wait(0.5)
                     continue
                 cursor = self.session_pos
@@ -10197,8 +11761,13 @@ class Bridge:
         if not latest:
             return
         if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
-            result = perform_self_update(latest, notify=self.telegram.send)
+            # 자동 경로만 중복 알림을 죽인다 — 버튼(사람)은 늘 답을 받는다.
+            result = perform_self_update(latest, notify=self.telegram.send, quiet_repeat=True)
             if result.status == "pep668_consent_required":
+                # ⚠️ 동의 버튼은 중복 억제 대상이 아니다. 이건 알림이 아니라 **행동 수단**이라,
+                #    한 번 띄운 뒤 침묵하면 사람이 누를 문이 사라져 업데이트가 영구히 막힌다
+                #    (T-260729-006 에서 한 번 막았다가 되돌림 — 계약 테스트가 잡아냈다:
+                #     test_auto_update_pep668_result_offers_consent_in_chat).
                 self.send_self_update_break_consent(latest, result.message)
             return
         current = _self_update_installed_version() or "?"
@@ -10213,6 +11782,27 @@ class Bridge:
     def service_external_queue_once(self) -> None:
         self.load_pending_queue()
         self.drain_queue()
+
+    def voice_loop(self) -> None:
+        """텔레그램 없이 voice 큐만 도는 루프 (T-260727-077 자비스 전용 레인).
+
+        telegram_loop 의 폴링·콜백·토큰소유권 검증을 통째로 뺀 형태다. 외부 프로세스
+        (jarvis 웨이크 → --enqueue-voice)가 큐 파일에 append 한 항목을
+        service_external_queue_once(load_pending_queue + drain_queue)가 집어간다 —
+        텔레그램 레인이 매 폴링 끝에 부르던 바로 그 경로라 새 인입 로직이 없다.
+
+        suggested_loop(자문자답)는 부르지 않는다 — 음성 레인이 스스로 말을 걸면
+        사용자가 안 시킨 발화가 스피커로 나간다.
+        """
+        self.record_poll_heartbeat(force=True)
+        while not self.stop_event.is_set():
+            self.service_external_queue_once()
+            self.check_injection_timeout()
+            self.check_usage_limit_zombie()
+            self.check_queue_stuck_alert()
+            self.check_busy_stuck_rebind()
+            self.record_poll_heartbeat()
+            self.stop_event.wait(self.config.voice_poll_interval)
 
     def telegram_loop(self) -> None:
         offset_raw = read_text(self.config.offset_file)
@@ -10245,15 +11835,20 @@ class Bridge:
                         continue
                     if self.handle_suggested_callback(cb):
                         continue
-                    if data.startswith(f"{MODEL_CALLBACK}::"):
-                        # /model inline keyboard 선택 → 비대화형 인자형 적용 (T-260702-14)
+                    if self.handle_mesh_approval_callback(cb):
+                        continue
+                    # 선택형 슬래시 inline keyboard 선택 → 비대화형 인자형 적용
+                    # (T-260702-14 /model, T-260726-034 /effort 를 표로 합류).
+                    cb_prefix = data.split("::", 1)[0] if "::" in data else ""
+                    apply_name = SELECTABLE_SLASH_CALLBACKS.get(cb_prefix)
+                    if apply_name:
                         cb_chat = (cb.get("message") or {}).get("chat") or {}
                         if str(cb_chat.get("id")) == str(self.config.chat_id):
                             # 토스트는 결과(적용/거부/대기) 확정 전에 뜨므로 중립 문구 — 실제 결과는
-                            # apply_model_choice 가 메뉴 메시지를 edit 해서 durable 하게 알린다 (T-260703-23).
+                            # 적용부가 메뉴 메시지를 edit 해서 durable 하게 알린다 (T-260703-23).
                             self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text="확인 중…")
                             menu_message_id = (cb.get("message") or {}).get("message_id")
-                            self.apply_model_choice(data.split("::", 1)[1], menu_message_id=menu_message_id)
+                            getattr(self, apply_name)(data.split("::", 1)[1], menu_message_id=menu_message_id)
                     continue
                 self.enqueue_update(update)
                 offset = update_id + 1
@@ -10280,7 +11875,10 @@ class Bridge:
         for thread in threads:
             thread.start()
         try:
-            self.telegram_loop()
+            if self.config.voice_only:
+                self.voice_loop()
+            else:
+                self.telegram_loop()
         finally:
             self.stop_event.set()
             self.stop_typing()
@@ -10384,6 +11982,11 @@ def health_check_main() -> int:
 
 
 def validate_startup_config(config: "Config") -> None:
+    if config.voice_only:
+        # voice-only 레인(T-260727-077)은 텔레그램을 안 탄다 — chat_id 는 의미가 없고
+        # 봇 토큰도 없다. 아래 검증은 '텔레그램 레인인데 채팅이 없다' 를 잡는 게 목적이라
+        # 여기선 건너뛴다. 대신 이 레인의 유일한 출구는 voice answer 파일이다.
+        return
     # T-260702-42: 공개 export 의 chat_id 기본값은 "" — 검증 없이 기동하면 어떤
     # 채팅도 매칭 못 하는 데몬이 조용히 떠서 영원히 폴링한다 (silent fail).
     chat = str(config.chat_id or "").strip()
@@ -10423,14 +12026,16 @@ def main() -> int:
         if config.transport_mode == "tmux" and fcntl is None:
             raise RuntimeError("POSIX file locking is unavailable; cannot start Claude Telegram Bridge.")
         validate_startup_config(config)
-        token = load_token(config.token_file)
         repl = build_repl_transport(config)
-        bridge = Bridge(
-            config,
-            TelegramClient(token, config.chat_id, config.emoji, config.telegram_chunk),
-            repl,
-            token,
-        )
+        if config.voice_only:
+            # T-260727-077: 봇 없는 레인. 토큰을 안 읽는다 —
+            # 다른 레인 토큰을 빌려 쓰면 그 봇의 getUpdates 를 뺏어(409) 본 챗이 죽는다.
+            token = ""
+            telegram: TelegramClient = NullTelegramClient(config.emoji, config.telegram_chunk)
+        else:
+            token = load_token(config.token_file)
+            telegram = TelegramClient(token, config.chat_id, config.emoji, config.telegram_chunk)
+        bridge = Bridge(config, telegram, repl, token)
     except Exception as exc:  # noqa: BLE001
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
@@ -10452,6 +12057,9 @@ def main() -> int:
             else f"node={config.node} chat={config.chat_id} transport=tmux tmux={config.tmux_socket}/{config.tmux_session}"
         ),
     )
+    # T-260721-026: 재기동 전에 떠 있던 HOLD 카드의 '확인하고 실행' 을 되살린다.
+    #   (되살린 후보는 hold 로 강등돼 사람 확인 없이는 절대 발사되지 않는다)
+    bridge.rehydrate_suggested_candidates()
     try:
         bridge.run()
     except Exception as exc:  # noqa: BLE001
