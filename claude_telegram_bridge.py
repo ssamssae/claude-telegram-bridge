@@ -701,16 +701,71 @@ def apply_suggested_reply_confirmation(
         log("SEND", "suggested reply confirmation failed (non-fatal)")
 
 
-EYE_ACTIVITY_DIRECTIONS = ("↖", "↗", "↘", "↙")
-EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
-EYE_ACTIVITY_MAX_EDITS = 40
+# T-260730-062 — 사용자 직접 지시 2026-07-30 15:1x·16:1x KST 「이 카드에서 눈깔 앞에
+# 이모지 제거」/「눈깔 아직도 나온다」. 카드 자체는 남긴다(00:15 요청 T-260730-002 를
+# 되돌리지 않는다) — 없애는 것은 ★표시 문자뿐이다.
+#
+# ★왜 그냥 지우지 않고 접미사로 바꿨나 = 이 회전자는 애니메이션이 전제다. 프레임에서
+# 이모지·화살표만 빼면 4프레임이 ★전부 같은 문자열이 되고, 텔레그램 editMessageText 는
+# 본문이 직전과 동일하면 400(message is not modified)을 낸다. 그러면 위 루프의
+# `if not edit_activity(...)` 가 회전을 죽이고(:826 로그) 카드가 첫 프레임에서 얼어붙는다 —
+# 얼어붙은 카드는 죽은 작업과 화면상 같아서 T-260730-002 가 고치려던 결함이 되살아난다.
+# 그래서 이모지 대신 ★텍스트만으로 프레임을 다르게 만든다. 가운뎃점(U+00B7)은 이모지가
+# 아니라 문장부호다.
+#
+# 불변식 = 인접 프레임이 항상 다르다(순환 포함: 마지막 → 처음). 여기에 항목을 더하거나
+# 순서를 바꿀 때 이 성질이 깨지면 위 400 경로가 그대로 재발한다 —
+# test_eye_activity_frames_have_no_emoji_and_never_repeat 가 그것을 지킨다.
+EYE_ACTIVITY_SUFFIXES = ("", "·", "··", "···")
+# 한 바퀴 = 이 대기 상수 + 편집 1회 왕복시간. 왕복은 상수를 깎아도 안 줄어드는 고정비다
+# (편집마다 mesh-send.sh 서브프로세스를 새로 띄워 routes·env 를 다시 읽고 HTTPS 왕복).
+# 실측 1.387 / 1.329 / 1.316 초 (mesh-send.sh 라이브 편집 3회, T-260729-052).
+# 지속시간 계산과 테스트 불변식이 이 고정비를 빼먹으면 모형이 관측과 어긋난다 —
+# 1.5 를 "절반이니 2배" 로 읽었다가 실제로는 1.33배였던 것이 그 사고다.
+EYE_ACTIVITY_EDIT_ROUNDTRIP_SECONDS = 1.33
+# 회전 간격. 1.5 -> 0.67 (사용자 GO 2026-07-29 18:08 KST 제어 노드 DM 인용:
+# "카드 회전은 0.67초로 내리고 버티는 시간 줄어드는 건 그냥 감수할게", T-260729-052).
+# 0.67 + 1.33 = 2.0초/바퀴 = 원 요청인 4.00초 대비 정확히 2배. 1.5 로는 3.00초(1.33배)에
+# 그친다는 것이 라이브 자연대조로 확정됐다 (화살표 카드 326장, 4프레임 sha256 역산 분리).
+# 레이트리밋 근거 = 같은 재집계에서 화살표 성공 편집 9,778건 중 실패 2건(0.02%)이고
+# 429 는 mesh-ledger 27일(07-02~07-29) 전체에서 0건. 분당 30회로 텔레그램 사설챗
+# 권고(초당 1회 = 분당 60회) 안이다. 더 낮추려면 429 재측정이 선행이다.
+EYE_ACTIVITY_EDIT_MIN_SECONDS = 0.67
+# 상한은 이번 범위 밖 — 사용자가 상한 인상 없이 지속시간 단축을 명시 수용했다
+# (243초 -> 160초 = 80 x 2.0). 예산 소진이지 조기 종료가 아니다.
+EYE_ACTIVITY_MAX_EDITS = 80
+# ── 지속 국면 (T-260730-002, 사용자 직접 지시 2026-07-30 00:15 KST) ──────────────
+# 빠른 국면이 예산을 다 쓰면 종전에는 회전이 그 자리에서 얼어붙었다. 얼어붙은 화살표는
+# 죽은 작업과 화면상 완전히 같아서, 사용자 시점에선 "오래 걸리는 중" 과 "멈춤" 이 구별되지
+# 않았다. 이 결함은 위 :220-221 주석이 이미 자백하고 있었다("2분 넘는 침묵엔 살아있음
+# 신호가 구조적으로 0"). 그래서 예산 뒤에 느린 지속 국면을 붙인다 — 켜짐/꺼짐이 아니라
+# **갱신되는** 표시여야 멈춘 것과 구별된다는 것이 이 요청의 핵심이다.
+#
+# 45초 = FLOW_HEARTBEAT_SECONDS 승계다. 여기서 새 숫자를 발명하지 않는다 — 그 값은 카드당
+# ~1.3회/분이라 편집 레이트리밋 대비 충분히 보수적이라고 이미 판정돼 라이브에 있다
+# (T-260727-076). 빠른 국면(분당 30회)의 1/22 이라 지속 국면이 레이트 축을 새로 열지 않는다.
+EYE_ACTIVITY_SUSTAIN_SECONDS = 45.0
+# ⚠️ 상한이 이 기능의 안전핀이다. 지속이 무한이면 **죽은 턴이 영원히 살아 보이는** 정반대
+# 사고가 되고, 그건 원 증상보다 나쁘다 (FLOW_HEARTBEAT_MAX_TICKS 주석과 같은 논지).
+# 40틱 x 45초 = 30분. 상한을 넘기면 갱신을 멈추고 카드를 얼린다 — 얼어붙은 카드는 정직하다.
+EYE_ACTIVITY_SUSTAIN_MAX_TICKS = 40
+# 일반(비추천) 턴은 이 시간이 지난 뒤에야 카드를 띄운다. 짧은 턴까지 카드를 만들면 표시가
+# 상시가 되어 정보량이 0 이 된다 — "도는 중" 이 의미를 가지려면 안 도는 동안엔 없어야 한다.
+#
+# 60초를 고른 근거: 그 아래 구간은 typing 인디케이터가 이미 덮는다(4초마다 재발사되는
+# 라이브 신호다). 카드가 추가로 값을 갖는 지점은 typing 만으로 불안해지는 구간이고, 그건
+# 분 단위다. 20초로 잡으면 보통 턴 대부분에 카드가 떠서 "긴 턴" 이라는 의미 자체가 없어진다.
+# 동시에 빠른 국면이 얼어붙는 160초보다는 충분히 앞이라 지속 국면 검증에도 늦지 않다.
+# ★이 값은 사용자 취향으로 조정 가능한 유일한 손잡이다 — 카드가 너무 잦거나 너무 늦으면
+#   여기만 바꾼다(픽스처는 정확한 값이 아니라 하한을 단언하므로 조정에 안 깨진다).
+EYE_ACTIVITY_LONGTURN_DELAY_SECONDS = 60.0
 
 
 def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
     if not enabled or surface != "aniki_dm":
         return []
     clean_label = " ".join((label or "응답 처리 중").split())[:80] or "응답 처리 중"
-    return [f"👀{direction} {clean_label}" for direction in EYE_ACTIVITY_DIRECTIONS]
+    return [f"{clean_label}{suffix}" for suffix in EYE_ACTIVITY_SUFFIXES]
 
 
 def start_eye_activity_loop(
@@ -718,6 +773,8 @@ def start_eye_activity_loop(
     stop_event: threading.Event,
     frames: list[str],
     reply_to_message_id: int = 0,
+    is_alive: Any = None,
+    initial_delay_seconds: float = 0.0,
 ) -> threading.Thread | None:
     send_activity = getattr(telegram, "send_activity_indicator", None)
     edit_activity = getattr(telegram, "edit_activity_indicator", None)
@@ -727,6 +784,10 @@ def start_eye_activity_loop(
 
     def loop() -> None:
         if stop_event.is_set():
+            return
+        # 지연 안에 턴이 끝나면 카드를 아예 만들지 않는다. 짧은 턴에도 카드가 뜨면 표시가
+        # 상시가 되어 "도는 중" 이라는 정보가 사라진다 (T-260730-002).
+        if initial_delay_seconds > 0 and stop_event.wait(initial_delay_seconds):
             return
         try:
             message_id = send_activity(frames[0], reply_to_message_id or None)
@@ -744,12 +805,44 @@ def start_eye_activity_loop(
                     break
                 try:
                     if not edit_activity(message_id, frames[frame_index % len(frames)]):
+                        # 조용한 죽음 방지 (T-260729-052). 이 break 는 로그가 없어서
+                        # 회전이 멈춰도 브릿지 로그엔 흔적이 0이었고 원장에만 남았다.
+                        # 사유는 edit_activity_indicator 가, 어디까지 돌았는지는 여기가 남긴다.
+                        log("ACTIVITY", f"eyes rotation stopped: edit rejected after {edits} edits")
                         break
                 except Exception as exc:  # noqa: BLE001
                     log("ACTIVITY", f"eyes edit skipped: {exc}")
                     break
                 edits += 1
                 frame_index += 1
+            else:
+                # 예산 소진 = 일이 아직 안 끝났다는 뜻이다. 여기서 얼리면 죽은 작업과
+                # 구별이 안 되므로, 레이트에 안전한 느린 국면으로 넘겨 계속 갱신한다.
+                # (break 로 빠진 경우 — 턴 종료·편집 거절·예외 — 는 여기 오지 않는다.)
+                ticks = 0
+                while ticks < EYE_ACTIVITY_SUSTAIN_MAX_TICKS:
+                    if stop_event.wait(EYE_ACTIVITY_SUSTAIN_SECONDS):
+                        break
+                    if is_alive is not None:
+                        try:
+                            still_working = bool(is_alive())
+                        except Exception:  # noqa: BLE001
+                            # probe 실패는 소등 사유가 아니다 — 기존 typing 루프 계약과 동일한
+                            # fail-open. 긴 턴을 오탐으로 꺼버리는 쪽이 더 나쁘다.
+                            still_working = True
+                        if not still_working:
+                            # ★거짓 생존 신호 차단. 죽었는데 계속 돌면 지금보다 나쁘다.
+                            log("ACTIVITY", f"eyes sustain stopped: no live work after {ticks} sustain ticks")
+                            break
+                    try:
+                        if not edit_activity(message_id, frames[frame_index % len(frames)]):
+                            log("ACTIVITY", f"eyes sustain stopped: edit rejected after {ticks} sustain ticks")
+                            break
+                    except Exception as exc:  # noqa: BLE001
+                        log("ACTIVITY", f"eyes sustain skipped: {exc}")
+                        break
+                    ticks += 1
+                    frame_index += 1
             if not stop_event.is_set():
                 stop_event.wait()
         finally:
@@ -2232,14 +2325,83 @@ def model_alias_rejection_text(alias: str) -> str:
     )
 
 
-def model_interstitial(screen: str) -> str:
-    """Return the blocking model-menu TUI surface visible in a pane capture."""
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 확인창 **선언 테이블** (T-260801-112).
+#   종전엔 이 판정이 `model_interstitial` 이라는 이름으로 switch_model·rewind 2종만
+#   하드코딩하고 있었고, `/effort` 의 확인창(`Change effort level?`)은 아예 몰랐다.
+#   실사고 2026-08-01 21:32: 사용자가 폰에서 /effort max 를 보냈으나 터미널에 확인창이
+#   떠 있었고, 브릿지는 그것을 못 보고 「사고강도 전환 확인 실패 … 상태줄로 확인해 주세요」만
+#   돌려줬다. 폰에는 무엇이 왜 막혔는지 0. 사용자가 폰에서 「1」을 눌러도 프롬프트가 아니라
+#   새 메시지로 들어갔다. ⇒ 세션 무증상 정지 (헌법 원칙1 손0·원칙2 가시성 정면 위반).
+#
+#   ★새 확인창은 코드가 아니라 **이 테이블에 한 줄**로 추가한다. 그래야 다음 확인창에서
+#   같은 사고가 안 난다. 테이블 누락은 픽스처가 RED 로 잡는다
+#   (scripts/tests/test_bridge_interstitial_table.sh).
+#
+#   형식: (판정이름, (화면에 **전부** 있어야 하는 소문자 토큰들))
+# ⚠️ 타입 어노테이션을 일부러 안 붙였다 — 제어 노드 브릿지는 Python 3.9.6 이고, 모듈 레벨
+#   어노테이션은 런타임에 평가된다. 문법 하나로 브릿지가 안 뜨면 그 사실을 알릴 채널이
+#   그 프로세스 자신이라 폰이 조용히 먹통이 된다 (T-260801-112).
+INTERSTITIAL_PATTERNS = (
+    ("switch_model", ("switch model?", "yes", "no")),
+    ("rewind", ("rewind", "restore the code")),
+    ("switch_effort", ("change effort level?", "yes", "no")),
+)
+
+
+def pane_interstitial(screen: str) -> str:
+    """Return the blocking confirm/menu TUI surface visible in a pane capture."""
     normalized = strip_ansi_control(screen or "").lower()
-    if "switch model?" in normalized and "yes" in normalized and "no" in normalized:
-        return "switch_model"
-    if "rewind" in normalized and "restore the code" in normalized:
-        return "rewind"
+    for name, tokens in INTERSTITIAL_PATTERNS:
+        if all(token in normalized for token in tokens):
+            return name
     return ""
+
+
+def interstitial_excerpt(screen: str, max_lines: int = 10) -> str:
+    """확인창이 보이는 구간만 잘라낸다 — pane 전체를 폰에 쏟지 않는다."""
+    kind = pane_interstitial(screen)
+    if not kind:
+        return ""
+    anchor = ""
+    for name, tokens in INTERSTITIAL_PATTERNS:
+        if name == kind and tokens:
+            anchor = tokens[0]
+            break
+    lines = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+    start = 0
+    for idx, line in enumerate(lines):
+        if anchor and anchor in line.lower():
+            start = idx
+            break
+    window = [line for line in lines[start : start + max_lines] if line.strip()]
+    return "\n".join(window).strip()
+
+
+def interstitial_mirror_text(command: str, screen: str) -> str:
+    """확인창 내용을 폰으로 미러하는 문구. 무엇을 묻는지와 선택지를 같이 보낸다."""
+    excerpt = interstitial_excerpt(screen)
+    body = excerpt or "(확인창은 감지했으나 화면 발췌에 실패했어요)"
+    return (
+        f"⛔ {command} 이 터미널 확인창에서 멈춰 있어요\n"
+        f"터미널이 이렇게 묻고 있어요:\n\n{body}\n\n"
+        "여기서 숫자를 보내도 이 확인창에는 안 닿아요 (새 메시지로 들어가요). "
+        "지금은 터미널에서 직접 골라 주세요."
+    )
+
+
+def interstitial_blocked_text(command: str, arg: str = "") -> str:
+    """(d) 타임아웃 통지 문구 — 무엇이 막혔는지와 무엇을 해야 하는지를 담는다.
+
+    ⚠️ 이 통지는 **브릿지 자신의 발신 경로**로 나간다. 외부 헬퍼 스크립트를 부르지 않는다.
+       ① 그 헬퍼는 공개 export 에 실리지 않아 dangling 참조가 되고(공개본이 깨진다),
+       ② 그 헬퍼는 발신 실패에도 rc=0 이라 성공 판정에 쓸 수 없다(T-260728-020 미해소).
+       브릿지 발신 경로는 이미 이 명령의 회신을 나르고 있으므로 목적지도 같다.
+    """
+    label = "{} {}".format(command, arg).strip()
+    return (
+        "⛔ {} 이 터미널 확인창에서 막혀 시간이 초과됐어요.\n"
+        "폰에서는 그 확인창에 답할 수 없어요 — 터미널에서 직접 확인해 주세요."
+    ).format(label)
 
 
 def escape_unsafe_slash(text: str) -> str:
@@ -3301,7 +3463,14 @@ class TelegramClient:
             message_id=message_id,
             text=text,
         )
-        return bool(payload and payload.get("ok"))
+        if payload and payload.get("ok"):
+            return True
+        # 회전이 왜 죽었는지(429 인지 아닌지)를 남긴다 (T-260729-052). call() 은 직송
+        # 4xx 만 TGERR 로 남기고, 버스 경유 실패는 payload.description 에만 들어 있어
+        # 여기서 안 찍으면 원장을 파야 알 수 있었다.
+        detail = (payload or {}).get("description") or "no payload"
+        log("ACTIVITY", f"eyes edit failed: {detail}")
+        return False
 
     def delete_activity_indicator(self, message_id: int) -> bool:
         payload = self.call(
@@ -5187,12 +5356,28 @@ class DurableQueue:
         self.path = path
         self.max_events = max_events
         self.lock = threading.Lock()
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 폐기 무음 차단 (T-260801-035).
+        #   stale_released 는 「사용자 메시지를 버렸다」는 뜻인데 종전엔 이 로그만 남고
+        #   당사자에게는 아무 말도 안 나갔다. 2026-08-01 아침 실피해 = 질문 2건이 답 없이
+        #   소멸했고, 07:01 에 나간 「대기 안내」가 정정되지 않아 사용자는 계속 기다리는
+        #   것으로 오인했다.
+        #   ★사유별로 막지 않는다 — release_reason 은 현재 7종이고 새로 생길 수 있다.
+        #   모든 폐기가 반드시 지나는 이 병목에서 한 번 잡아야 새 사유도 자동으로 덮인다.
+        #   기본 None = 무동작이라 이 클래스를 단독으로 쓰는 경로는 거동 변화 0.
+        self.stale_release_notifier: Callable[[QueueItem, dict[str, Any]], None] | None = None
 
     def append_status(self, item: QueueItem, status: str, **extra: Any) -> None:
         payload = {"ts": time.time(), "status": status, **item.to_json(), **extra}
         with self.lock:
             append_jsonl(self.path, payload)
             self.compact_if_needed()
+        # 통지는 락 밖에서 — 발신이 큐 락을 잡고 있으면 브릿지 전체가 그 시간만큼 멈춘다.
+        # best-effort: 통지가 실패해도 큐 기록·폐기 처리는 이미 끝났고 되돌리지 않는다.
+        if status == "stale_released" and self.stale_release_notifier is not None:
+            try:
+                self.stale_release_notifier(item, dict(extra))
+            except Exception as exc:  # noqa: BLE001
+                log("QUEUE", f"stale release notice hook failed: {exc}")
 
     def records_by_queue_id(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -5529,6 +5714,10 @@ class Bridge:
         self.token = token
         self.token_hash = token_fingerprint(token)
         self.queue = DurableQueue(config.queue_path, config.queue_compact_max_events)
+        # T-260801-035: 폐기(stale_released)가 조용히 지나가지 않게 통지를 붙인다.
+        self.queue.stale_release_notifier = self.notify_stale_release
+        self.stale_release_suppressed = 0          # 억제된 건수 — 절대 버리지 않는다
+        self.stale_release_notice_times: list[float] = []
         self.outbox = Outbox(config.outbox_path, config.outbox_max_entries)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
@@ -6878,10 +7067,19 @@ class Bridge:
 
     def start_typing_loop(self, max_seconds: int | None = None) -> threading.Event:
         stop_event = threading.Event()
-        activity_frames, activity_reply_to = self.eye_activity_context()
+        activity_frames, activity_reply_to, activity_delay = self.eye_activity_context()
 
         def loop() -> None:
-            start_eye_activity_loop(self.telegram, stop_event, activity_frames, activity_reply_to)
+            # is_alive = 타이핑 루프가 이미 쓰는 생존 판정을 그대로 재사용한다. 새 판정축을
+            # 만들지 않는다 — 지속 국면이 죽은 턴에서 계속 돌면 거짓 생존 신호가 된다.
+            start_eye_activity_loop(
+                self.telegram,
+                stop_event,
+                activity_frames,
+                activity_reply_to,
+                is_alive=self.has_live_typing_work,
+                initial_delay_seconds=activity_delay,
+            )
             deadline = time.monotonic() + max_seconds if max_seconds else None
             pulse_count = 0
             try:
@@ -6921,7 +7119,7 @@ class Bridge:
         threading.Thread(target=loop, daemon=True, name="clb-typing").start()
         return stop_event
 
-    def eye_activity_context(self) -> tuple[list[str], int]:
+    def eye_activity_context(self) -> tuple[list[str], int, float]:
         surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
         enabled = bool(getattr(self.config, "activity_eyes_enabled", False))
         with self.lock:
@@ -6929,11 +7127,15 @@ class Bridge:
             if item is None and self.pending:
                 item = self.pending[0]
         if item is None:
-            return [], 0
+            return [], 0, 0.0
+        # T-260730-002 — 종전에는 추천답변 턴이 아니면 여기서 [],0 을 내서 **일반 긴 턴엔
+        # 화살표가 아예 안 떴다.** 사용자 요청 구간 2개 중 (2)긴턴 진행 중이 그래서 비어 있었다.
+        # 이제 둘 다 대상이되, 뜨는 시점을 가른다: 추천작업은 즉시(사용자가 GO 한 빠른 체감을
+        # 보존), 일반 턴은 지연 뒤에만 — 짧은 턴까지 카드를 만들면 표시가 상시가 되어 못 쓴다.
         suggested = item.source in {"suggested_reply_auto", "suggested_reply_confirmed"}
-        if not suggested:
-            return [], 0
-        return eye_activity_frames("추천작업 진행 중", enabled, surface), int(item.message_id or 0)
+        label = "추천작업 진행 중" if suggested else "응답 처리 중"
+        delay = 0.0 if suggested else EYE_ACTIVITY_LONGTURN_DELAY_SECONDS
+        return eye_activity_frames(label, enabled, surface), int(item.message_id or 0), delay
 
     def has_typing_tracked_work(self) -> bool:
         with self.lock:
@@ -8383,6 +8585,10 @@ class Bridge:
         self.usage_limit_notice_sent = True
 
     def check_queue_stuck_alert(self) -> None:
+        # T-260801-035: 억제된 폐기 건수를 여기서 흘려보낸다. 폐기가 몰렸다가 끊기면
+        #   누적분이 다음 폐기까지 잠들고, 그건 이 티켓이 없애려는 무음과 같은 모양이다.
+        #   주기 틱에 얹기만 하고 큐 인계·주입 타이밍 로직은 건드리지 않는다.
+        self.flush_stale_release_backlog()
         # T-260705-67 ③-b: 수신→주입 정체(세션 busy/브릿지 내부 문제로 pending 이 안 빠지는 상태)
         # 표면화. telegram_loop 틱(기본 2s)마다 불리므로 queue_id 별 1회성 set 로 스팸 차단.
         survey_state = self.dismiss_feedback_survey_if_pending()
@@ -8448,6 +8654,91 @@ class Bridge:
             self.send_queue_stuck_notice(busy_notices, now)
         if stuck_notices:
             self.send_queue_stuck_notice(stuck_notices, now)
+
+    # ⚠️ 제거 금지 (DO NOT REMOVE) — 폐기 통지 (T-260801-035).
+    #   이 자리를 지우면 사용자 메시지가 다시 조용히 사라진다(2026-08-01 실피해 2건).
+    STALE_NOTICE_WINDOW_SEC = 60.0
+    STALE_NOTICE_MAX_PER_WINDOW = 3
+    STALE_NOTICE_PREVIEW_CHARS = 120
+
+    def stale_release_reason_phrase(self, reason: str) -> str:
+        # 사유를 그대로 노출하면 사용자가 읽을 수 없다. 모르는 사유는 원문을 붙여 내보낸다
+        # (새 사유가 생겨도 통지가 비지 않게 — 이 티켓이 겨눈 것이 바로 그 무음이다).
+        table = {
+            "native_queue_wait_timeout": "세션 입력큐에 실렸는데 턴이 끝난 뒤에도 처리되지 않아서",
+            "busy_inject_promote_idle_timeout": "세션이 바빠 넣어뒀는데 한가해진 뒤에도 처리되지 않아서",
+            "active_turn_idle_timeout": "진행 중이던 턴이 끝났는데도 처리되지 않아서",
+            "active_turn_submit_unconfirmed_timeout": "입력은 들어갔는데 제출이 확인되지 않아서",
+            "tmux_session_lost": "노드 세션이 사라져서",
+            "state_load_stale_unseen": "브릿지가 다시 뜨면서 오래된 대기분으로 판정돼서",
+            "stuck_busy_idle": "세션이 바쁨 상태로 굳어 있다가 풀려서",
+        }
+        return table.get(reason, f"내부 사유({reason})로")
+
+    def notify_stale_release(self, item: QueueItem, extra: dict[str, Any]) -> None:
+        """폐기된 메시지를 사용자에게 알린다. 무엇이·왜·어떻게 하면 되는지 셋 다 담는다."""
+        reason = str(extra.get("release_reason") or "unknown")
+        now = time.time()
+        window = [t for t in self.stale_release_notice_times if now - t < self.STALE_NOTICE_WINDOW_SEC]
+        self.stale_release_notice_times = window
+
+        if len(window) >= self.STALE_NOTICE_MAX_PER_WINDOW:
+            # ★한도에 걸려도 사실은 남는다 — 개별 안내만 접고 건수는 누적해서
+            #   다음 통지나 주기 점검(flush_stale_release_backlog)에서 반드시 나간다.
+            self.stale_release_suppressed += 1
+            log("QUEUE", f"stale release notice suppressed (backlog={self.stale_release_suppressed}) reason={reason}")
+            return
+
+        raw = sanitize_text(item.text or "")
+        preview = raw[: self.STALE_NOTICE_PREVIEW_CHARS]
+        cut = len(raw) > len(preview)
+        body = f"“{preview}{'…' if cut else ''}”"
+        if cut:
+            body += f" (앞 {self.STALE_NOTICE_PREVIEW_CHARS}자만 표시했어요)"
+        if not preview:
+            body = "(본문을 복원하지 못했어요)"
+
+        # 앞서 「대기 안내」가 나갔을 수 있으므로 정정임이 읽혀야 한다.
+        # 사용자 1:1 DM 규격 = 맨 앞 장식 이모지 없이 자연어 산문.
+        lines = [
+            f"조금 전 보내신 메시지가 결국 처리되지 못하고 버려졌어요. 대기 중이라고 알려드렸다면 그 안내를 정정합니다.",
+            body,
+            f"이유는 {self.stale_release_reason_phrase(reason)}예요. 같은 내용을 다시 보내주시면 처리됩니다.",
+        ]
+        backlog = self.stale_release_suppressed
+        if backlog:
+            lines.append(f"그 사이 같은 이유로 {backlog}건이 더 버려졌어요.")
+            self.stale_release_suppressed = 0
+
+        self.stale_release_notice_times.append(now)
+        try:
+            self.telegram.send("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"stale release notice send failed: {exc}")
+
+    def flush_stale_release_backlog(self) -> None:
+        """억제된 건수가 다음 폐기까지 잠들어 있지 않게 주기 점검에서 흘려보낸다.
+
+        이게 없으면 폐기가 몰렸다가 뚝 끊긴 경우 누적분이 영원히 안 나가고,
+        그건 이 티켓이 없애려는 무음과 같은 모양이 된다.
+        """
+        backlog = self.stale_release_suppressed
+        if not backlog:
+            return
+        now = time.time()
+        window = [t for t in self.stale_release_notice_times if now - t < self.STALE_NOTICE_WINDOW_SEC]
+        if len(window) >= self.STALE_NOTICE_MAX_PER_WINDOW:
+            return  # 아직 창이 안 열렸다 — 다음 틱에 다시 시도한다(건수는 그대로 보존)
+        self.stale_release_suppressed = 0
+        self.stale_release_notice_times = [*window, now]
+        try:
+            self.telegram.send(
+                f"앞서 알려드린 것 말고도 {backlog}건이 더 처리되지 못하고 버려졌어요. "
+                "개별 안내는 묶었습니다. 필요한 내용은 다시 보내주세요."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.stale_release_suppressed += backlog  # 발신 실패 시 건수를 되돌린다
+            log("QUEUE", f"stale release backlog notice send failed: {exc}")
 
     def send_queue_stuck_notice(self, items: list[QueueItem], now: float) -> None:
         if not items:
@@ -8808,7 +9099,28 @@ class Bridge:
         self.queue.append_status(item, status, **extra)
 
         label = "전달 실패" if status == "failed" else "차단"
-        if self.latest_human_input_is_newer(item):
+        # T-260731-024: supersede 는 **배달 증거가 없을 때만** 덮는다.
+        #   여기는 "터미널 실패로 적힌 항목을, 뒤에 온 사람 발화가 더 새롭다는 이유로 재시도
+        #   없이 dropped 로 지우는" 경로다. 아직 배달 안 된 메시지를 다음 발화가 덮어 지우는
+        #   모양이라, 사용자가 연달아 두 개를 보내면 앞 것이 눈에 안 보이게 사라진다.
+        #   실측(제어 노드 2026-07-31 15:05:36 queue_id 2056faf6 「토스페이먼츠 키 발급…」):
+        #     injected 15:04:34 → failed 15:05:36 → dropped 15:05:36
+        #     (supersede_reason=newer_human_before_terminal_retry, newer_input_at=15:04:34)
+        #   그런데 그 메시지는 실제로 세션에 도달해 답변까지 됐다. 회계와 실물이 갈렸고,
+        #   살아난 건 하네스 native 큐가 받아준 덕이지 이 경로가 보장한 게 아니다.
+        #
+        #   ★왜 여기서 막고, 재시도 취소 쪽에서 막지 않는가:
+        #   transcript 의 `queue-operation/enqueue` 관측(native_queue_seen_at)은 **세션이
+        #   idle 이면 배달 증거가 아니다** — Claude Code 가 큐에 담았다가 비워졌다는 뜻일 수
+        #   있고, 그건 진짜 유실이라 유한 재시도가 정답이다. 그 계약은
+        #   test_busy_inject_attachment_timeout_still_fails_on_idle_session_without_evidence
+        #   가 이미 못박고 있다. 그래서 재시도 자체는 건드리지 않는다.
+        #   여기서 고칠 것은 **그 유한 재시도가 아예 일어나지도 못하게 지워지는 것**뿐이다.
+        #   형제 경로 supersede_stale_queued_inputs() 는 같은 판단으로 이미
+        #   `not native_queue_attached(item)` 가드를 걸고 있다 — 그 가드를 여기에 미러링한다.
+        #   ⚠️ 재시도 횟수·상한을 늘리지 않는다(중복 주입이 정반대 사고다). drop 대신 기존
+        #      유한 재시도·파킹 경로로 보낼 뿐이고, 그 경로의 소비증거 가드는 그대로 앞선다.
+        if self.latest_human_input_is_newer(item) and not self.native_queue_attached(item):
             with self.lock:
                 self.superseded_queue_ids.add(item.queue_id)
             self.queue.append_status(
@@ -9317,7 +9629,7 @@ class Bridge:
         with lock():
             for attempt in range(1, attempts + 1):
                 screen = self.repl.capture_pane(80)
-                modal = model_interstitial(screen)
+                modal = pane_interstitial(screen)
                 if modal:
                     if escape_used:
                         log("INJECT", f"{command} stage blocked by persistent {modal}")
@@ -9334,10 +9646,10 @@ class Bridge:
                     clear(interrupt=False)
                     clear_attempts += 1
                     screen = self.repl.capture_pane(80)
-                    if model_interstitial(screen):
+                    if pane_interstitial(screen):
                         break
                     residual = composer_residual_text(screen)
-                if residual or model_interstitial(screen):
+                if residual or pane_interstitial(screen):
                     log("INJECT", f"{command} composer clear not verified attempt={attempt}")
                     continue
 
@@ -9345,7 +9657,7 @@ class Bridge:
                 if stage_settle:
                     time.sleep(stage_settle)
                 screen = self.repl.capture_pane(80)
-                modal = model_interstitial(screen)
+                modal = pane_interstitial(screen)
                 if modal:
                     if not escape_used:
                         submit("Escape")
@@ -9413,13 +9725,13 @@ class Bridge:
             except Exception:  # noqa: BLE001
                 screen = ""
             current = session_model_from_screen(screen) or current
-            if model_interstitial(screen) == "switch_model" and not switch_confirmed:
+            if pane_interstitial(screen) == "switch_model" and not switch_confirmed:
                 lock = getattr(self.repl, "composer_lock", None)
                 submit = getattr(self.repl, "_submit_prompt_unlocked", None)
                 if callable(lock) and callable(submit):
                     with lock():
                         # "1. Yes"가 기본 선택인 확인창에서 Enter로 Yes를 확정한다.
-                        if model_interstitial(self.repl.capture_pane(80)) == "switch_model":
+                        if pane_interstitial(self.repl.capture_pane(80)) == "switch_model":
                             submit("Enter")
                             switch_confirmed = True
                             log("INJECT", f"/model choice={alias} Switch model Yes confirmed")
@@ -9523,11 +9835,29 @@ class Bridge:
             time.sleep(settle)
         deadline = time.monotonic() + timeout
         current = ""
+        mirrored = False
         while True:
             current = self.current_session_effort()
             if current and current.lower() == level.lower():
                 return True, current
+            # ★T-260801-112 — 상태줄만 보던 것을 pane 도 보게 한다.
+            #   종전엔 확인창이 떠 있어도 이 루프가 그것을 못 보고 조용히 타임아웃했다.
+            #   감지되면 무엇을 묻고 있는지를 **폰으로 미러**한다(1회). 자동 응답은 하지
+            #   않는다 — 폰 응답을 프롬프트로 라우팅하는 축(b)은 상태기계라 별건이다.
+            if not mirrored:
+                try:
+                    screen = self.repl.capture_pane(80)
+                except Exception:  # noqa: BLE001
+                    screen = ""
+                if pane_interstitial(screen):
+                    self.telegram.send(interstitial_mirror_text(EFFORT_SLASH_COMMAND, screen))
+                    mirrored = True
+                    log("INJECT", f"/effort interstitial mirrored kind={pane_interstitial(screen)}")
             if time.monotonic() >= deadline:
+                # ★(d) 무증상 정지를 남기지 않는다 — 폰으로 「막혔다」를 밀어넣는다.
+                if mirrored:
+                    self.telegram.send(interstitial_blocked_text(EFFORT_SLASH_COMMAND, level))
+                    log("INJECT", "/effort interstitial blocked notice sent")
                 return False, current
             time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
 
@@ -11124,9 +11454,30 @@ class Bridge:
                     record_timestamp_seconds(record) or time.time(),
                     reason="direct_human_input",
                 )
+            # T-260801-036: 종전에는 여기 `not self.active_turn` 이 있었다. 그래서 사용자가
+            #   텔레그램으로 물어본 턴이 열려 있는 동안 워커 완료보고가 터미널로 주입되면
+            #   받은지시 카드가 통째로 사라졌다 — 원장 실측(2026-08-01 06:45~07:40, 터미널
+            #   주입 배차 2건) 에서 브릿지발 카드 0건, 단위 재현에서도 활성턴 有 → sent=0.
+            #   사용자가 관측한 "터미널에만 남았다" 가 이 창이다(헌법 원칙2 가시성 위반).
+            # ★그 조건은 처음부터 불필요했다 = 바로 위 11909~11912 가드가 "이 레코드가 활성
+            #   턴의 본문인가"를 이미 갈라 **return** 한다. 여기 도달한 레코드는 정의상 활성
+            #   턴 소유가 아니므로, 조건을 빼도 텔레그램 시작 턴이 2통이 되지 않는다.
+            #   그 무해함(=중복 0)은 주장이 아니라 픽스처로 고정돼 있다:
+            #   test_telegram_origin_turn_sends_exactly_one_card / _terminal_origin_turn_
+            #   card_survives_open_active_turn (양방향).
+            # ⚠️ 이 leg 은 **입력 축만** 닫는다. 최종답변 축(sequence_matches_active_turn)은
+            #   좁히면 텔레그램 답변 유실이라는 반대방향 고장이라 별 leg 이다.
+            # ★조건은 "활성 턴이 있는가" 가 아니라 "활성 턴이 아직 자기 본문을 못 봤는가"
+            #   여야 한다. 첨부(이미지) 턴은 nonce 가 본문에 안 보이고 첨부로 따로 오므로,
+            #   본문 도착 전까지는 그 user 레코드가 활성 턴 소유일 수 있다 — 여기서 카드를
+            #   내면 텔레그램 턴이 2통이 된다(회귀 실측: test_sidecar_attachment_nonce_
+            #   confirms_active_turn_without_visible_marker 가 조건을 통째로 뺐을 때 FAIL).
+            #   반대로 본문을 이미 본 뒤(user_uuid 세팅됨) 도착하는 무-nonce user 레코드는
+            #   정의상 그 턴 것이 아니다 = 터미널 주입이다.
+            active_awaiting_body = bool(self.active_turn) and not self.active_turn.user_uuid
             ambient_user_turn = (
                 not nonce
-                and not self.active_turn
+                and not active_awaiting_body
                 and not record.get("isSidechain")
                 and bool(content_text(content).strip())
             )
@@ -11338,9 +11689,15 @@ class Bridge:
         # ⚙️ ambient flow mirror — node-originated work 의 받은 지시(트리거) 카드를 노드
         # 챗에 1장 미러. 결과("✅ 노드 결과")만 떠서 맥락이 끊기던 문제 보완. tool_result
         # (도구 결과) user 레코드는 content_text 가 ""를 반환해 자동 제외된다. Non-fatal;
-        # never affects message delivery. Only emits when no active telegram turn.
-        if self.active_turn:
-            return
+        # never affects message delivery.
+        # T-260801-036: 종전 여기에 `if self.active_turn: return` 이 또 있었다(호출부
+        #   ambient_user_turn 과 같은 조건의 이중 게이트). 호출자는 이 한 곳뿐이고
+        #   그 호출부가 이미 nonce·사이드카 본문해시로 "활성 턴 소유 레코드"를 갈라
+        #   return 하므로 여기 도달분은 정의상 남의 턴이 아니다. 조건을 남겨두면
+        #   사용자 텔레그램 턴이 열린 동안 도착한 워커 완료보고가 통째로 사라진다
+        #   (실측 2026-08-01: 원장 브릿지발 카드 0건 · 단위 재현 sent=0).
+        #   ★수리 순서 주의 = 호출부만 고치면 여기서 다시 막힌다. 실제로 그렇게 한 번
+        #   막혔고 픽스처가 그것을 잡았다(거동으로 재라는 이유).
         body = format_ambient_directive(content_text(content))
         if not body:
             return

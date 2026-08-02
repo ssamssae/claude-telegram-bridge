@@ -37,7 +37,8 @@ class TypingLivenessTest(unittest.TestCase):
         bridge.active_turn = None
         bridge.pending = []
         bridge.ambient_response_active = True
-        bridge.eye_activity_context = lambda: ([], 0)
+        # (frames, reply_to, initial_delay) — 3번째는 T-260730-002 지속 국면에서 추가됐다.
+        bridge.eye_activity_context = lambda: ([], 0, 0.0)
         bridge.session_occupied_excluding_active = mock.Mock(return_value=True)
         bridge.repl = SimpleNamespace(
             supports_pane_features=True,
