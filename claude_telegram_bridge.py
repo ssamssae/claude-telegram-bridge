@@ -58,6 +58,10 @@ NATIVE_WINDOWS_DAEMON_ERROR = (
     "Native Windows tmux mode is unsupported — run the default transport inside WSL, "
     "or explicitly configure CLB_REPL_TRANSPORT=conpty for the experimental owned host."
 )
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 미해석 노드의 짝 폴백 라벨 (T-260802-035).
+#   mesh_send.py UNRESOLVED_NODE_LABEL 과 **같은 낱말**이어야 한다. 두 렌더러가 같은
+#   상황을 다른 말로 부르면 사용자가 카드 두 종을 서로 다른 사고로 읽는다.
+UNRESOLVED_NODE_LABEL = "미상"
 NODE_EMOJI_LINES = {"\U0001f34e", "\U0001f3ed", "\U0001fa9f", "\U0001f5a5", "\U0001f4bb", "\U0001f916",
                     # 2026-07-25 신 이모지 세트 (구 세트는 전환창 동안 계속 인식)
                     "\U0001f989", "\U0001f30b", "\U000026a1", "\U00002696", "\U0001fabd", "\U0001f531",
@@ -2220,6 +2224,15 @@ MODEL_EFFORT_SUFFIX_RE = re.compile(r"\s+\((?:xhigh|high|medium|low|max)\)\s*$",
 # 상태줄 접미에서 현재 사고강도를 읽는다 (settings.json 에 안 남는 세션 전용 값이 있어
 # — CLI 실측: max 는 'this session only' — 착지 확인은 화면이 1차 근거다).
 SESSION_EFFORT_RE = re.compile(r"\((xhigh|high|medium|low|max)\)\s*$", re.IGNORECASE)
+# T-260802-098: 상태줄이 ★실제로 쓰는 꼴은 「… · effort xhigh · …」 다 — 괄호가 없고
+#   첫 구간도 아니다. 위 괄호꼴만 보던 탓에 폰에서 고른 effort 가 6일간 전건
+#   「unverified effort=unknown」 으로 끝났다(작업 노드·작업 노드 저널 시도 7회 confirmed 0회).
+#   쓰는 쪽은 statusline-command.sh 의 `parts.append(f"effort {effort}")` 이고 사용자 지시로
+#   ★상태줄은 건드리지 않는다 — 읽는 쪽을 넓혀 두 표기를 맞춘다.
+#   단어경계를 양쪽에 둬 'efforts'·'effort-max' 같은 산문 오탐을 막는다.
+SESSION_EFFORT_LABELED_RE = re.compile(
+    r"(?<![\w-])effort\s+(ultracode|xhigh|high|medium|low|max)(?![\w-])", re.IGNORECASE
+)
 
 
 def effort_menu_levels() -> list[str]:
@@ -2245,11 +2258,17 @@ def effort_level_rejection_text(level: str) -> str:
 
 
 def session_effort_from_screen(screen: str) -> str:
-    """상태줄 모델 구간의 접미 '(xhigh)' 에서 현재 사고강도를 읽는다 (없으면 "").
+    """상태줄에서 현재 사고강도를 읽는다 (없으면 "").
 
-    상태줄은 'Opus 5 (high) · 5h 1% · W 46%' 꼴이라 괄호가 줄 끝이 아니다 —
-    session_model_from_screen 과 같은 방식으로 '·'/'|' 로 먼저 잘라 첫 구간만 본다.
-    아무 괄호나 줍지 않도록 구간 끝 매치만 인정한다.
+    표기가 두 꼴이라 둘 다 인정한다 (T-260802-098):
+      (1) 'Opus 5 (1M context) · effort max · Context 29% used' — ★현행 실물.
+          statusline-command.sh 가 'effort <level>' 을 뒤 구간에 괄호 없이 찍는다.
+      (2) 'Opus 5 (high) · 5h 1% · W 46%'                       — 종전 접미 괄호꼴.
+    (2)만 보던 동안 (1)을 못 읽어 적용 확인이 전건 실패했다 — 근인·실측은 위 상수 주석.
+
+    ★오탐이 침묵 실패보다 나쁘다 = 틀린 값을 '확인됨'으로 보고하면 사용자가 안 바뀐 것을
+    바뀐 줄 안다. 그래서 (1)은 단어경계로, (2)는 여전히 ★첫 구간 끝 매치로만 인정한다
+    ('Opus 5 (1M context)' 의 괄호를 레벨로 줍지 않는다).
     """
     for raw_line in reversed((screen or "").splitlines()):
         line = strip_ansi_control(raw_line).strip()
@@ -2257,6 +2276,9 @@ def session_effort_from_screen(screen: str) -> str:
             continue
         if "·" not in line and "|" not in line and not line.startswith("🤖"):
             continue
+        labeled = SESSION_EFFORT_LABELED_RE.search(line)
+        if labeled:
+            return labeled.group(1).lower()
         head = re.split(r"\s+(?:·|\|)\s*", line, maxsplit=1)[0].strip()
         match = SESSION_EFFORT_RE.search(head)
         if match:
@@ -2387,6 +2409,308 @@ def interstitial_mirror_text(command: str, screen: str) -> str:
         "여기서 숫자를 보내도 이 확인창에는 안 닿아요 (새 메시지로 들어가요). "
         "지금은 터미널에서 직접 골라 주세요."
     )
+
+
+# ── 화면 선택지 파서 (T-260802-042) ──────────────────────────────────────────
+# 발원 = 사용자 2026-08-02 13:08 「코덱스는 텔레그램에서 선택지 선택 가능하던데 왜
+# 클로드는 1,2 선택 못하냐」. codex 브릿지는 **화면 파싱형**이고 이쪽은 **사전등록형**
+# (SELECTABLE_SLASH_HANDLERS 2종)이라, 표에 없는 선택지는 폰에서 못 골랐다.
+#
+# ⚠️ codex 쪽 정규식을 베끼지 않았다 — 두 CLI 의 TUI 가 다르다(claude=ink).
+#   아래 상수는 전부 **이 노드에서 실제로 뜬 화면 캡처**에서 유도했다:
+#     scripts/tests/fixtures/claude_pane_choice_approval.txt  (Bash 승인, 3지선다)
+#     scripts/tests/fixtures/claude_pane_choice_model.txt     (/model, 5지선다)
+#     scripts/tests/fixtures/claude_pane_choice_trust.txt     (폴더 신뢰, 2지선다)
+#     scripts/tests/fixtures/claude_pane_effort_slider.txt    (음성 대조군 — /effort 의
+#                                                              레벨 슬라이더는 숫자 선택지가 아니다)
+#     scripts/tests/fixtures/claude_pane_effort_confirm.txt   (★음성 대조군 — /effort 의
+#       **두 번째** 화면. 레벨을 실제로 바꿀 때 뜨는 「Change effort level?」 확인창은
+#       번호 2지선다다. T-260802-100 실측 = 그런데 이 화면에는 다른 확인창이 전부 달고
+#       있는 'Esc to cancel' 꼬리표가 없어 CHOICE_HINT_RE 앵커에 안 걸리고, 걸리게 해도
+#       kind='approval' 이라 기본 menu 모드에서 버튼이 금지된다(막는 겹이 둘). 그래서
+#       현행은 음성이다 — 「/effort 는 선택지가 없다」가 아니라 「있는데 두 겹에 막힌다」.
+#       ★확인창은 대화 이력이 있을 때만 뜬다. 빈 REPL 로 재현하면 안 뜬다.)
+#     scripts/tests/fixtures/claude_pane_idle.txt             (음성 대조군 — 입력줄만)
+#
+# 주입 계약도 추정이 아니라 실측이다 (2026-08-02 16:4x KST macOS 노드, 대조군 2본):
+#   pane 에 **맨 숫자 1자**를 보내면 Enter 없이 즉시 확정된다.
+#   '3'(No) → touch 안 일어남 / '1'(Yes) → 파일 생성됨 으로 갈랐다.
+CHOICE_SELECTED_MARK = "❯"
+# 옵션행: 선택커서(❯)는 있을 수도 없을 수도. 번호는 1자리만 — 주입이 1자 키라
+# 10번 이상은 애매해지므로 아예 파싱 대상에서 뺀다(폴백으로 떨어진다).
+CHOICE_OPTION_RE = re.compile(r"^\s*(❯\s+)?([1-9])\.\s+(\S.*)$")
+# 자릿수 무관 번호행 — ★조용한 잘림 차단용. CHOICE_OPTION_RE 가 1자리만 보므로,
+# 11지선다 화면에서 1..9 만 걷어 「완전한 9지선다」로 착각하는 길이 열린다.
+# 그 길을 이 정규식으로 막는다(잘라 보여주느니 버튼을 안 붙인다).
+CHOICE_ANY_NUMBER_RE = re.compile(r"^\s*(?:❯\s+)?\d{1,3}\.\s+\S")
+# 확인/선택창 공통 꼬리표. 실측 3본이 전부 이 문구를 달고 있고, 일반 답변 산문에는
+# 나오지 않는다. "Enter to confirm" 은 승인창에 없어서(=Esc/Tab/ctrl+e) 앵커로 못 쓴다.
+CHOICE_HINT_RE = re.compile(r"(?i)\besc\s+to\s+cancel\b")
+# 가로줄 — U+2500(대화 입력줄 테두리) · U+2594(픽커 상단)
+CHOICE_RULE_RE = re.compile(r"^[─▔]{8,}\s*$")
+CHOICE_MAX_OPTIONS = 9
+CHOICE_TITLE_MAX = 120
+
+# ── 확인창 선언 테이블 (T-260802-100) ─────────────────────────────────────────
+# 'Esc to cancel' 꼬리표가 **없는** 확인창은 ★여기 선언된 것만 통과시킨다.
+#
+# ⚠️ CHOICE_HINT_RE 를 넓히지 않는 이유 = 그 앵커가 **답변 산문 오탐을 막는 유일한
+#   축**이다. CLI 답변이 승인창과 글자까지 같은 「1. Yes / 2. Yes, and don't ask
+#   again / 3. No」를 그대로 출력한 실물 화면이 픽스처로 남아 있다
+#   (claude_pane_prose_numbered.txt). 앵커를 전역 완화하면 그 화면에 버튼이 붙는다.
+#   그래서 완화가 아니라 **allowlist** 다 — 조건을 AND 로 좁게 묶는다.
+#
+# 실측 근거 (2026-08-03 00:0x KST 작업 노드, 전용 소켓 격리 REPL):
+#   /effort 는 화면이 **둘**이다.
+#     (a) 레벨 슬라이더 — ←/→ 라 숫자 선택지가 아니다 (종전 전제 유효, 음성 유지)
+#     (b) 「Change effort level?」 확인창 — 번호 2지선다인데 'Esc to cancel' 이 없다
+#   ★(b) 는 **대화 이력이 있을 때만** 뜬다(캐시 무효화 경고라서). 빈 REPL 에서는
+#   슬라이더 Enter 도 인자형 `/effort max` 도 확인 없이 즉시 적용된다 — 종전 픽스처가
+#   이 화면을 못 뜬 이유가 이것이다. 재현하려면 이력부터 만들 것.
+CONFIRM_SCREENS = (
+    {
+        # 라벨 전용 — 매칭에는 쓰지 않는다(사람이 표를 읽을 때의 이름)
+        "id": "effort-change",
+        # 제목줄이 **정확히** 이 문장일 것 (부분일치 금지 — 산문에 섞여 나오면 안 걸린다)
+        "title_re": re.compile(r"^\s*Change effort level\?\s*$"),
+        # 옵션 개수·순서·문구까지 선언한다. Yes/No 2지선다가 아니면 통과 못 한다.
+        "option_res": (
+            re.compile(r"(?i)^yes\b"),
+            re.compile(r"(?i)^no\b"),
+        ),
+    },
+)
+
+
+def pane_composer_visible(lines) -> bool:
+    """대화 입력줄이 보이면 REPL 은 입력을 받는 중 = 막는 선택지가 없다.
+
+    ★스크롤백 오탐 차단축이다. 답이 끝난 옛 확인창이 위쪽에 남아 있어도 입력줄이
+    보이면 지금 막혀 있는 게 아니므로 버튼을 붙이지 않는다. 실측 = 확인창·픽커가
+    뜨면 입력줄이 통째로 사라지고, 유휴 화면에는 가로줄-❯-가로줄 3줄이 남는다.
+    """
+    for idx in range(len(lines) - 1, -1, -1):
+        if not CHOICE_RULE_RE.match(lines[idx]):
+            continue
+        nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
+        stripped = nxt.lstrip()
+        if not stripped.startswith(CHOICE_SELECTED_MARK):
+            continue
+        if CHOICE_OPTION_RE.match(nxt):
+            # '❯ 1. …' 는 선택커서지 입력줄이 아니다.
+            continue
+        return True
+    return False
+
+
+def _declared_confirm(lines):
+    """선언 테이블에 든 확인창이면 그 옵션 블록의 **끝 인덱스**를 돌려준다 (T-260802-100).
+
+    ★좁게 AND 로 묶는다 — 선언된 제목줄이 있고, 그 아래 번호 옵션 개수가 선언과
+      정확히 같고, 각 옵션 문구가 선언된 형태여야 한다. 하나라도 어긋나면 None 이고,
+      그러면 호출부는 종전 앵커 경로 그대로 거부한다. fail-safe 방향은 '안 붙인다'.
+    """
+    for spec in CONFIRM_SCREENS:
+        title_idx = -1
+        for idx in range(len(lines) - 1, -1, -1):
+            if spec["title_re"].match(lines[idx]):
+                title_idx = idx
+                break
+        if title_idx < 0:
+            continue
+        rows = []
+        for idx in range(title_idx + 1, len(lines)):
+            matched = CHOICE_OPTION_RE.match(lines[idx])
+            if matched:
+                rows.append((idx, matched.group(3).strip()))
+        expected = spec["option_res"]
+        if len(rows) != len(expected):
+            continue
+        if not all(rx.match(label) for rx, (_, label) in zip(expected, rows)):
+            continue
+        return rows[-1][0]
+    return None
+
+
+def parse_pane_choice(screen: str):
+    """pane 캡처에서 숫자 선택지 화면을 **구조로** 판정한다.
+
+    반환 = dict(kind·title·options·selected·signature) 또는 None.
+    ⚠️ 실패는 조용히 None 이다 — 호출부는 버튼을 안 붙이고 기존 미러 문구로 폴백한다.
+      fail-safe 방향이 '안 붙인다' 인 이유 = 오탐 버튼은 사용자 승인 흐름에 잘못된
+      선택을 주입할 수 있고, 미러 폴백은 최악이어도 종전 동작이다.
+    """
+    text = strip_ansi_control(screen or "")
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or pane_composer_visible(lines):
+        return None
+
+    hint_idx = -1
+    for idx in range(len(lines) - 1, -1, -1):
+        if CHOICE_HINT_RE.search(lines[idx]):
+            hint_idx = idx
+            break
+    declared = False
+    if hint_idx < 0:
+        # ★꼬리표가 없는 화면은 **선언 테이블에 든 것만** 통과한다 (T-260802-100).
+        #   전역 앵커를 넓히는 대신 allowlist 로 좁게 뚫는다 — 이유는 CONFIRM_SCREENS 주석.
+        end = _declared_confirm(lines)
+        if end is None:
+            return None
+        declared = True
+        hint_idx = end + 1  # 아래 '블록 밖 번호행' 검사의 상한으로만 쓴다
+    else:
+        # 힌트 위 8줄 안에서 옵션 블록의 끝을 찾는다(픽커는 힌트와 옵션 사이에
+        # ◉ 게이지 같은 크롬 줄을 끼운다 — 실측 /model).
+        end = -1
+        for idx in range(hint_idx - 1, max(-1, hint_idx - 9), -1):
+            if CHOICE_OPTION_RE.match(lines[idx]):
+                end = idx
+                break
+        if end < 0:
+            return None
+
+    collected = []
+    idx = end
+    while idx >= 0:
+        matched = CHOICE_OPTION_RE.match(lines[idx])
+        if not matched:
+            break
+        collected.append(
+            (int(matched.group(2)), matched.group(3).strip(), bool(matched.group(1)))
+        )
+        idx -= 1
+    collected.reverse()
+
+    if len(collected) < 2 or len(collected) > CHOICE_MAX_OPTIONS:
+        return None
+    # 블록 밖에 번호행이 더 있으면 우리가 본 게 목록의 전부가 아니다 — 거부한다.
+    for probe in list(range(idx, max(-1, idx - 2), -1)) + list(range(end + 1, hint_idx)):
+        if 0 <= probe < len(lines) and CHOICE_ANY_NUMBER_RE.match(lines[probe]):
+            return None
+    if [row[0] for row in collected] != list(range(1, len(collected) + 1)):
+        return None
+    marked = [row[0] for row in collected if row[2]]
+    if len(marked) != 1:
+        return None
+
+    title = _choice_title(lines, idx)
+    options = [(row[0], row[1]) for row in collected]
+    payload = title + "|" + "|".join(label for _, label in options)
+    if declared:
+        # ★선언 확인창은 approval **바깥**이다 (T-260802-100).
+        #   이 화면은 1번 옵션이 'Yes…' 라 APPROVAL_WAIT_RE 에 걸리지만, 도구 실행
+        #   승인이 아니라 **비파괴 설정 확인**이다. approval 분류 규칙 자체와
+        #   choice_buttons_mode 기본값·"all" 경로는 ★무접촉으로 두고, 선언 테이블에
+        #   든 이 한 화면만 정확히 빼낸다. 승인창 축을 여는 것은 여전히 사용자 ack
+        #   사안이며 이 변경은 그 축을 건드리지 않는다.
+        kind = "confirm"
+    elif screen_has_approval_wait(screen):
+        kind = "approval"
+    else:
+        kind = "menu"
+    return {
+        "kind": kind,
+        "title": title,
+        "options": options,
+        "selected": marked[0],
+        "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def _choice_title(lines, above_idx: int) -> str:
+    """옵션 블록 위에서 이 창이 묻는 것을 고른다. 물음표 줄 > 문단 첫 줄.
+
+    ★T-260802-100 수리 — 종전에는 빈 줄을 만나면 즉시 멈춰서, 본문과 제목 사이에
+      빈 줄이 낀 확인창의 물음표 줄에 닿지 못했다. /effort 확인창 실측 오탐 =
+      제목이 「This conversation is cached for the current effort level…」 로 나갔다
+      (정작 「Change effort level?」 은 그 위에 있었다). 카드 제목이 그러면 폰에서
+      무엇을 묻는지 안 보인다.
+
+      그래서 **물음표 탐색만** 빈 줄을 넘어 계속한다. 범위는 여전히 같은 대화상자
+      안이다 — 가로줄(CHOICE_RULE_RE)에서 멈추므로 위쪽 스크롤백 산문으로는 못 샌다.
+      물음표가 없을 때의 폴백은 ★종전 그대로 = 옵션 바로 위 문단의 첫 줄
+      (/model 의 「Select model」 이 이 경로다).
+    """
+    block = []    # 옵션 바로 위 문단 — 폴백용 (종전 window 와 같은 범위)
+    spanned = []  # 가로줄까지 확장 — 물음표 탐색용
+    crossed_blank = False
+    for probe in range(above_idx, max(-1, above_idx - 9), -1):
+        if probe < 0:
+            break
+        if CHOICE_RULE_RE.match(lines[probe]):
+            break
+        line = lines[probe].strip()
+        if not line:
+            if spanned:
+                crossed_blank = True
+            continue
+        spanned.append(line)
+        if not crossed_blank:
+            block.append(line)
+    for line in spanned:
+        if line.endswith("?"):
+            return line[:CHOICE_TITLE_MAX]
+    if block:
+        return block[-1][:CHOICE_TITLE_MAX]
+    return "터미널이 선택을 기다리고 있어요"
+
+
+# 콜백 prefix. callback_data = "clb-choice::<signature>::<번호>" (64바이트 한도 안).
+CHOICE_CALLBACK = "clb-choice"
+
+
+def choice_buttons_mode() -> str:
+    """off | menu | all — 기본 menu.
+
+    ⚠️ 'all' 은 **사용자 ack 사안**이다. approval 급 화면(도구 승인·삭제 확인 등)은
+      사람이 그 자리에서 승인하라고 있는 관문이라, 폰 버튼으로 그 관문을 여는 것은
+      승인 흐름 자체를 바꾼다. check_approval_stall_notify 주석이 종전부터
+      「승인 버튼 전송 금지(별도 task, R3 ack 대기)」로 못박아 둔 축이 이것이다.
+      그래서 기본값은 menu = ★승인창에는 버튼을 안 붙인다. 코드는 준비돼 있고
+      사용자가 켜라고 하면 env 한 줄로 켜진다.
+    """
+    value = (os.environ.get("CLB_CHOICE_BUTTONS", "") or "menu").strip().lower()
+    return value if value in ("off", "menu", "all") else "menu"
+
+
+def choice_buttons_allowed(kind: str) -> bool:
+    mode = choice_buttons_mode()
+    if mode == "off":
+        return False
+    if kind == "approval":
+        return mode == "all"
+    return True
+
+
+def choice_card_text(parsed) -> str:
+    """폰에 띄울 선택 카드 본문. 지금 커서가 어디인지도 같이 보여준다."""
+    rows = [f"🔽 {parsed['title']}", ""]
+    for num, label in parsed["options"]:
+        mark = "▸" if num == parsed["selected"] else " "
+        rows.append(f"{mark} {num}. {label}")
+    rows.append("")
+    rows.append("버튼을 누르면 터미널에서 그 항목이 골라져요.")
+    return "\n".join(rows)
+
+
+def choice_keyboard(parsed):
+    buttons = []
+    for num, label in parsed["options"]:
+        text = f"{num}. {label}"
+        if len(text) > 48:
+            text = text[:47] + "…"
+        buttons.append(
+            [{
+                "text": text,
+                "callback_data": "{}::{}::{}".format(
+                    CHOICE_CALLBACK, parsed["signature"], num
+                ),
+            }]
+        )
+    return buttons
 
 
 def interstitial_blocked_text(command: str, arg: str = "") -> str:
@@ -2923,7 +3247,24 @@ def _format_directive_card(
             recv_label, recv_emoji = node_label_emoji(to_alias)
             recv = f"{recv_emoji} {recv_label}".strip()
         else:
-            recv = self_emoji if self_emoji is not None else node_defaults()[1]
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — 화살표 끝에 ★이름 없는 이모지만 찍지 않는다
+            #   (T-260802-035). 받은지시 카드의 **유일한** 호출부는 to_alias·self_alias·
+            #   self_emoji 를 하나도 안 넘긴다 ⇒ 이 else 가 **전량 경로**이고, 종전엔
+            #   node_defaults()[1] 이모지 1자만 찍혀 '🤖 제어 노드 → 🤖 · T-…' 처럼 수신자가
+            #   누구인지 카드만 봐선 알 수 없었다(사용자 실측 신고 2026-08-02).
+            #   ⇒ 자기 노드를 **토큰으로** 풀어 라벨·이모지를 node_label_emoji() 한 번에서
+            #     받는다. 짝은 그 함수가 보장한다(튜플 통째 반환, 미해석이면 둘 다 폴백).
+            #   self_emoji 는 라벨을 못 만들 때만 쓰는 후퇴선으로 남긴다 — 이름 없는 렌더가
+            #   'ㅇㅇ' 보다 낫진 않지만, 종전 동작을 지우지 않고 최후에만 쓴다.
+            recv_label, recv_emoji = node_label_emoji(self_alias or node_defaults()[0])
+            if self_emoji:
+                # 호출자가 이모지를 명시하면 그 노드가 정본이다 — 라벨을 같은 표에서 맞춰 온다.
+                recv_emoji = self_emoji
+                recv_label = _label_for_emoji(self_emoji) or recv_label
+            if not recv_label:
+                # 자기 노드조차 못 읽는 호스트(미등록)에서도 ★이름 없는 끝은 만들지 않는다.
+                recv_label = UNRESOLVED_NODE_LABEL
+            recv = f"{recv_emoji} {recv_label}".strip()
         route_line = f"{sender} → {recv}"
         if task_id:
             route_line = f"{route_line} · {task_id}"
@@ -4412,6 +4753,20 @@ class TmuxClaudeTransport:
             detail = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(f"tmux {' '.join(args)} failed: {detail}")
         return proc
+
+    def send_choice_key(self, key: str) -> None:
+        """선택창에 키 1자를 그대로 보낸다 (T-260802-042).
+
+        ⚠️ composer 경로(stage/paste/submit)를 타지 않는다 — 선택창이 떠 있는 동안
+          입력줄은 아예 없고, 붙여넣기 스테이징은 그 화면에서 의미가 없다.
+          실측 계약 = 숫자 1자를 보내면 Enter 없이 즉시 확정된다(2026-08-02 macOS 노드,
+          '1'→승인 실행됨 / '3'→실행 안 됨 대조군 2본).
+        ⚠️ 한 글자만 받는다. 여러 글자를 허용하면 이 경로가 임의 키 주입구가 된다.
+        """
+        if len(key) != 1 or not key.isdigit():
+            raise ValueError("send_choice_key accepts a single digit")
+        with self.composer_lock():
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), key)
 
     def resolve_session_target(self) -> str:
         if self._session_target:
@@ -8457,7 +8812,10 @@ class Bridge:
         # 아무것도 노출하지 않아, 워커가 승인 대기에서 조용히 멈춘다(2026-07-20 실사례 2회).
         # 대기가 debounce(기본 25s) 이상 지속되면 사용자에게 1통 알린다. episode 당 1회 —
         # 승인이 해소되면 리셋해 다음 재발 시 다시 알린다. 유령 세션 알림과 동형 경로.
-        # ⚠️ 알림만: 가드 무력화·자동 키 주입·승인 버튼 전송 금지(별도 task, R3 ack 대기).
+        # ⚠️ 가드 무력화·자동 키 주입 금지는 그대로다. 승인 버튼은 T-260802-042 에서
+        #   기계는 붙였지만 **기본값은 여전히 안 붙인다** — choice_buttons_allowed() 가
+        #   approval 급 화면을 CLB_CHOICE_BUTTONS=all 뒤로 막아둔다(사용자 ack 사안).
+        #   즉 기본 동작은 종전과 같은 '알림만' 이다.
         if not repl_supports_pane_features(self.repl):
             return
         if os.environ.get("CLB_APPROVAL_STALL_NOTIFY", "1").strip() == "0":
@@ -8490,6 +8848,8 @@ class Bridge:
         if self.approval_stall_notified:
             return
         self.approval_stall_notified = True
+        if self.send_pane_choice_card(screen):
+            return
         gist = summarize_approval_prompt(screen)
         message = "⚠️ 승인 프롬프트 대기 중 — 화면 확인이 필요해요."
         if gist:
@@ -8498,6 +8858,96 @@ class Bridge:
             self.telegram.send(message)
         except Exception as exc:  # noqa: BLE001
             log("BUSY", f"approval stall notice failed: {exc}")
+
+    # ── 화면 선택지 → 폰 버튼 (T-260802-042) ──────────────────────────────
+    def send_pane_choice_card(self, screen: str) -> bool:
+        """선택지가 구조로 읽히고 그 종류가 허용되면 버튼 카드를 보낸다.
+
+        반환 True = 카드를 보냈다. False = 호출부가 종전 문구로 폴백해야 한다.
+        ★파싱 실패를 조용히 넘기지 않는 게 아니라, **조용히 폴백**하는 게 맞다 —
+          오탐 버튼의 대가(잘못된 선택 주입)가 미러 폴백의 대가보다 크다.
+        """
+        parsed = parse_pane_choice(screen)
+        if not parsed or not choice_buttons_allowed(parsed["kind"]):
+            return False
+        try:
+            self.telegram.call(
+                "sendMessage",
+                chat_id=self.config.chat_id,
+                text=getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
+                    choice_card_text(parsed)
+                ),
+                reply_markup=json.dumps(
+                    {"inline_keyboard": choice_keyboard(parsed)}, ensure_ascii=False
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("BUSY", f"choice card send failed: {exc}")
+            return False
+        log(
+            "CHOICE",
+            f"card sent kind={parsed['kind']} options={len(parsed['options'])} "
+            f"sig={parsed['signature']}",
+        )
+        return True
+
+    def handle_pane_choice_callback(self, callback) -> bool:
+        """버튼 탭 → pane 에 숫자 1자 주입. 화면이 그새 바뀌었으면 주입하지 않는다."""
+        data = str(callback.get("data") or "")
+        if not data.startswith(CHOICE_CALLBACK + "::"):
+            return False
+        chat = (callback.get("message") or {}).get("chat") or {}
+        if str(chat.get("id")) != str(self.config.chat_id):
+            return True
+        parts = data.split("::")
+        toast = "적용 중…"
+        if len(parts) != 3 or not parts[2].isdigit():
+            toast = "버튼 값을 못 읽었어요"
+        else:
+            toast = self.apply_pane_choice(parts[1], int(parts[2]))
+        try:
+            self.telegram.call(
+                "answerCallbackQuery",
+                callback_query_id=callback.get("id"),
+                text=toast,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"answerCallbackQuery failed: {exc}")
+        return True
+
+    def apply_pane_choice(self, signature: str, number: int) -> str:
+        if not repl_supports_pane_features(self.repl):
+            return "이 노드에서는 화면 선택을 못 보내요"
+        if not (1 <= number <= CHOICE_MAX_OPTIONS):
+            return "그 번호는 보낼 수 없어요"
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"capture before inject failed: {exc}")
+            return "지금 화면을 못 읽었어요"
+        parsed = parse_pane_choice(screen)
+        # ★핵심 안전축 = 카드를 만든 그 화면이 **아직 그대로** 일 때만 주입한다.
+        #   확인창이 이미 답해졌거나 다른 창으로 바뀐 뒤 누른 탭이 엉뚱한 선택을
+        #   확정시키는 길을 막는다. 서명은 제목+선택지 라벨에서 나오므로 커서만
+        #   움직인 리드로우는 같은 서명으로 통과한다.
+        if not parsed:
+            return "그 선택창이 이미 닫혔어요"
+        if parsed["signature"] != signature:
+            return "화면이 바뀌었어요 — 새 카드에서 골라주세요"
+        if number > len(parsed["options"]):
+            return "그 번호가 지금 화면엔 없어요"
+        if not choice_buttons_allowed(parsed["kind"]):
+            return "이 화면은 폰에서 고르지 않도록 설정돼 있어요"
+        send = getattr(self.repl, "send_choice_key", None)
+        if not callable(send):
+            return "이 노드에서는 화면 선택을 못 보내요"
+        try:
+            send(str(number))
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"inject failed: {exc}")
+            return "터미널에 못 보냈어요"
+        log("CHOICE", f"injected number={number} sig={signature}")
+        return f"{number}번을 골랐어요"
 
     def dismiss_feedback_survey_if_pending(self) -> str:
         """Dismiss an exact Claude feedback card once, only for a waiting queue."""
@@ -9850,9 +10300,19 @@ class Bridge:
                 except Exception:  # noqa: BLE001
                     screen = ""
                 if pane_interstitial(screen):
-                    self.telegram.send(interstitial_mirror_text(EFFORT_SLASH_COMMAND, screen))
+                    # ★T-260802-100 — 버튼 카드를 **선시도**한다. 파싱 불가·종류 불허로
+                    #   False 면 종전 미러 문구로 조용히 폴백한다(문구·동작 무변경).
+                    if self.send_pane_choice_card(screen):
+                        log("INJECT", "/effort interstitial → choice card sent")
+                    else:
+                        self.telegram.send(
+                            interstitial_mirror_text(EFFORT_SLASH_COMMAND, screen)
+                        )
+                        log(
+                            "INJECT",
+                            f"/effort interstitial mirrored kind={pane_interstitial(screen)}",
+                        )
                     mirrored = True
-                    log("INJECT", f"/effort interstitial mirrored kind={pane_interstitial(screen)}")
             if time.monotonic() >= deadline:
                 # ★(d) 무증상 정지를 남기지 않는다 — 폰으로 「막혔다」를 밀어넣는다.
                 if mirrored:
@@ -12193,6 +12653,10 @@ class Bridge:
                     if self.handle_suggested_callback(cb):
                         continue
                     if self.handle_mesh_approval_callback(cb):
+                        continue
+                    # 화면 선택지 버튼 (T-260802-042) — 선택형 슬래시 표보다 먼저 본다.
+                    # 이쪽은 사전등록 없이 화면에서 유도한 선택지라 prefix 가 겹치지 않는다.
+                    if self.handle_pane_choice_callback(cb):
                         continue
                     # 선택형 슬래시 inline keyboard 선택 → 비대화형 인자형 적용
                     # (T-260702-14 /model, T-260726-034 /effort 를 표로 합류).
