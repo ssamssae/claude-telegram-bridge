@@ -226,6 +226,24 @@ FLOW_HEARTBEAT_MAX_TICKS = 40
 # 연속 실패(429·네트워크) 누적 시 이 턴에서 하트비트를 포기한다. 본류(최종답변 발송)와
 # 무관하게 non-fatal — 현행 flow mirror 예외처리와 동일 계약.
 FLOW_HEARTBEAT_MAX_FAILURES = 3
+# 📊 progress board (T-260807-032) — 백그라운드 태스크·서브에이전트 진행률을 카드 1통
+# (editMessageText 갱신, 무음)으로 보여준다. flow mirror 와 별개 축: flow mirror 는
+# "무슨 도구를 썼는지" 로그이고, 이건 "지금 몇 개가 얼마나 진행됐는지" 상태판이다.
+# 총량을 아는 항목만 % 를 낸다 — 없는 총량을 지어내지 않는다(사용자 지시 원문 §3).
+PROGRESS_BOARD_HEADER = "📊 진행 상황"
+PROGRESS_BOARD_ENV = "CLB_PROGRESS_BOARD"
+PROGRESS_BOARD_FLAG = os.path.expanduser(os.environ.get("CLB_PROGRESS_BOARD_FLAG", "~/.config/claude-telegram-bridge/progress-board.on"))
+PROGRESS_BOARD_LIMIT = 1500
+# 최소 편집 간격 — flow heartbeat(45초)보다 짧다: 진행판은 "지금 몇 %" 가 본체라
+# 더 자주 갱신돼야 쓸모가 있다. 그래도 텔레그램 편집 레이트리밋 대비 하한은 둔다.
+PROGRESS_BOARD_MIN_INTERVAL = 8.0
+# 완료 항목을 이만큼 더 보여준 뒤 카드에서 뺀다 — 끝나자마자 사라지면 "언제 끝났는지"
+# 를 놓친다. 전부 빠지면(활성 0) 카드 상태를 리셋해 다음 배치가 새 카드로 시작한다.
+PROGRESS_BOARD_DONE_LINGER_SECONDS = 60.0
+# 설치 프로그램처럼 시각적으로(사용자 실발화 2026-08-07 23:49) — 총량을 아는 항목만
+# ▓░ 고정폭 바를 낸다. subagent-progress-card.py 의 render_bar() 와 같은 시각 언어
+# (BAR_WIDTH=10) 를 그대로 따른다 — 이미 이 함대가 아는 규격이라 새로 만들지 않는다.
+PROGRESS_BOARD_BAR_WIDTH = 10
 ENVELOPE_SIDECAR_FLAG = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.on")).expanduser()
 ENVELOPE_SIDECAR_OFF_FLAG = Path(
     os.environ.get("CLB_ENVELOPE_SIDECAR_OFF_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.off")
@@ -642,6 +660,13 @@ APPROVAL_CALLBACK_PREFIX = "mesh-approval"
 APPROVAL_CALLBACK_ACTIONS = ("grant", "hold")
 # 방 식별은 chat_id 로만 한다 — 방 이름·아바타는 개명 대상이라 판정 근거가 될 수 없다
 # (renderer spec R-A4, T-260725-043 설계 ack).
+# ⚠️ 제거 금지 (DO NOT REMOVE) — team2 값은 팀방 통합 뒤에도 남긴다 (T-260806-014, 2026-08-06).
+#   이 표는 **발신 대상이 아니라 수신 허용 명단**이다 (유일 소비처 = 승인 콜백 처리에서
+#   "이 클릭이 팀방에서 왔는가" 판정). 2026-08-06 팀방 통합으로 새 카드는 team1 방에만
+#   뜨지만, ★옛 개발2팀 방에 이미 떠 있는 승인 카드의 버튼은 계속 눌려야 한다.
+#   여기서 -5128036399 를 빼면 그 카드들이 전부 조용히 TOAST_DENIED 가 된다 —
+#   통합이 얻는 것은 없고 사람이 이미 받은 카드만 죽는다.
+#   ⇒ 라우팅(어디로 보내나)과 인식(어디서 온 걸 받아주나)은 다른 축이다. 합치지 말 것.
 APPROVAL_TEAM_ROOM_CHAT_IDS = {"team1": -5069144185, "team2": -5128036399}
 
 
@@ -951,6 +976,28 @@ def busy_submit_key() -> str:
     # (Codex TUI 는 진행 중 Enter 가 composer 에 텍스트를 남길 수 있어 Tab 로 큐잉). Claude
     # Code TUI 의 generating 중 큐잉 제출키가 Enter 가 맞는지는 미검증 — 아니면 이 env 로 교체.
     return env("CLB_BUSY_SUBMIT_KEY", "Enter") or "Enter"
+
+
+def submit_settle_seconds() -> float:
+    # T-260728-148 — paste-buffer 직후 제출키를 쏘기까지의 정착 대기.
+    #
+    # 왜 있나: 폰(브릿지) 경로는 paste 후 0.1s 만에 Enter 를 단발로 쐈고, 그 Enter 가
+    #   묵음으로 먹히면 봉투가 composer 에 남은 채 아무 데도 기록되지 않았다 — 사용자가
+    #   폰으로 노드를 못 움직이는데(2026-08-02 23:09 '/clear' 미실행) 텔레그램에는 배달
+    #   ✓✓ 만 떴다. 같은 병을 노드간 directive 경로가 2026-06-08 에 먼저 앓았고
+    #   (내부 `*-directive.sh` 의 '⚠️ 제거 금지' 마커 = "단일 Enter 묵음 submit-fail"),
+    #   거기서 검증된 처방이 '정착 대기 2s + 제출키 반복' 이다. 여기서 발명하지 않고
+    #   그 조합을 그대로 이식한다. 정확한 위치·실측은 T-260728-148 보고 참조.
+    return float_env("CLB_SUBMIT_SETTLE_SECONDS", 2.0)
+
+
+def submit_key_repeat() -> int:
+    # directive 경로와 동수(Enter ×5). 1 로 낮추면 종전(단발) 동작으로 되돌아간다.
+    return int_env("CLB_SUBMIT_KEY_REPEAT", 5, minimum=1)
+
+
+def submit_key_interval_seconds() -> float:
+    return float_env("CLB_SUBMIT_KEY_INTERVAL_SECONDS", 0.3)
 
 
 def busy_inject_promote_idle_stale_seconds() -> float:
@@ -2355,19 +2402,60 @@ def model_alias_rejection_text(alias: str) -> str:
 #   돌려줬다. 폰에는 무엇이 왜 막혔는지 0. 사용자가 폰에서 「1」을 눌러도 프롬프트가 아니라
 #   새 메시지로 들어갔다. ⇒ 세션 무증상 정지 (헌법 원칙1 손0·원칙2 가시성 정면 위반).
 #
-#   ★새 확인창은 코드가 아니라 **이 테이블에 한 줄**로 추가한다. 그래야 다음 확인창에서
+#   ★새 확인창은 코드가 아니라 **선언 테이블에 한 줄**로 추가한다. 그래야 다음 확인창에서
 #   같은 사고가 안 난다. 테이블 누락은 픽스처가 RED 로 잡는다
 #   (scripts/tests/test_bridge_interstitial_table.sh).
 #
-#   형식: (판정이름, (화면에 **전부** 있어야 하는 소문자 토큰들))
+# ── T-260801-113: 표의 정본이 **파일로 승격**됐다 ──────────────────────────────
+#   사유 = 소비자가 둘이 됐다. 셸 검출기 scripts/tmux-repl-busy.sh 도 같은 서명을 봐야
+#   「확인창 앞에 멈춘 세션」을 IDLE 로 안 읽는다(그 검출기의 rc=8 BLOCKED).
+#   표를 파이썬과 셸에 각각 적으면 다음 확인창이 늘 때 한쪽만 갱신되고, 그 드리프트가
+#   바로 이 티켓이 고치는 결함 클래스 그 자체다. ⇒ 표는 한 벌만 존재한다.
+#
+#   ⚠️ 폴백 상수를 일부러 두지 않았다. 코드에도 같은 표를 적어두면 파일과 갈릴 수 있고
+#     그 드리프트는 조용하다(두 소비자가 서로 다른 확인창을 알게 된다). 대신
+#     ① 로드 실패를 로그로 크게 남기고 ② 픽스처가 파일의 실재·파싱·행수를 RED 로 고정한다.
+#     감수하는 위험 = 파일이 배포에서 누락되면 확인창 감지가 죽는다. 그 방향을 고른 이유는
+#     조용한 드리프트보다 **한 번에 크게 죽는 쪽**이 관측 가능하기 때문이다.
+#
+#   형식: 파일 주석 참조 (name <TAB> token <TAB> ...) — 판정은 소문자 부분문자열 전건 일치.
 # ⚠️ 타입 어노테이션을 일부러 안 붙였다 — 제어 노드 브릿지는 Python 3.9.6 이고, 모듈 레벨
 #   어노테이션은 런타임에 평가된다. 문법 하나로 브릿지가 안 뜨면 그 사실을 알릴 채널이
 #   그 프로세스 자신이라 폰이 조용히 먹통이 된다 (T-260801-112).
-INTERSTITIAL_PATTERNS = (
-    ("switch_model", ("switch model?", "yes", "no")),
-    ("rewind", ("rewind", "restore the code")),
-    ("switch_effort", ("change effort level?", "yes", "no")),
-)
+# ⚠️ SCRIPT_DIRECTORY 를 쓰지 않는다 (T-260801-113 실측). 공개 export 는 그 상수 정의
+#   (내부 sys.path 셋업)을 통째로 떼어내므로, 여기서 참조하면 **공개 브릿지가 import 시점에
+#   NameError 로 죽는다.** 죽었다는 걸 알릴 채널이 그 프로세스 자신이라 폰이 조용해진다.
+#   composer-clear.sh 참조(§5386)가 쓰는 자기완결 idiom 과 같은 꼴로 맞춘다.
+INTERSTITIAL_TABLE_PATH = Path(__file__).resolve().parent / "lib" / "interstitial-patterns.tsv"
+
+
+def load_interstitial_patterns(path):
+    """선언 파일 → ((name, (token, ...)), ...).
+
+    실패를 빈 표로 조용히 흡수하지 않는다 — 로그 한 줄을 반드시 남긴다. 이 표가 비면
+    폰은 확인창을 못 보고, 그 침묵이 T-260801-112 사고 그 자체였다.
+    """
+    rows = []
+    try:
+        with open(str(path), "r", encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.rstrip("\r\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                fields = [field.strip() for field in line.split("\t")]
+                fields = [field for field in fields if field]
+                if len(fields) < 2:
+                    continue
+                rows.append((fields[0], tuple(f.lower() for f in fields[1:])))
+    except Exception as exc:  # noqa: BLE001
+        log("INTERSTITIAL", "선언 테이블 로드 실패 — 확인창 감지가 죽는다 path=%s err=%s" % (path, exc))
+        return ()
+    if not rows:
+        log("INTERSTITIAL", "선언 테이블이 비었다 — 확인창 감지가 죽는다 path=%s" % (path,))
+    return tuple(rows)
+
+
+INTERSTITIAL_PATTERNS = load_interstitial_patterns(INTERSTITIAL_TABLE_PATH)
 
 
 def pane_interstitial(screen: str) -> str:
@@ -2597,8 +2685,18 @@ def parse_pane_choice(screen: str):
         return None
 
     title = _choice_title(lines, idx)
+    context = _choice_context(lines, idx, title)
     options = [(row[0], row[1]) for row in collected]
-    payload = title + "|" + "|".join(label for _, label in options)
+    # ★서명에 본문을 넣는다 (T-260805-154). 제목·선택지만으로는 승인창끼리 서명이 겹친다 —
+    #   "Do you want to proceed? / 1.Yes / 2.Yes, and don't ask / 3.No" 는 **어떤 명령이든**
+    #   같은 글자다. 그 상태로 카드에 명령을 실어 보내면, 폰에 뜬 명령과 실제로 승인되는
+    #   명령이 다를 수 있는 창이 열린다(앞 창이 닫히고 같은 모양의 다음 창이 뜬 경우).
+    #   본문을 서명에 넣으면 **본 그 화면에만** 탭이 유효하다. 커서만 움직인 리드로우는
+    #   본문이 안 바뀌므로 종전대로 같은 서명이다.
+    payload = (
+        title + "|" + "|".join(label for _, label in options)
+        + "|" + "␟".join(context)
+    )
     if declared:
         # ★선언 확인창은 approval **바깥**이다 (T-260802-100).
         #   이 화면은 1번 옵션이 'Yes…' 라 APPROVAL_WAIT_RE 에 걸리지만, 도구 실행
@@ -2614,6 +2712,7 @@ def parse_pane_choice(screen: str):
     return {
         "kind": kind,
         "title": title,
+        "context": context,
         "options": options,
         "selected": marked[0],
         "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
@@ -2658,22 +2757,80 @@ def _choice_title(lines, above_idx: int) -> str:
     return "터미널이 선택을 기다리고 있어요"
 
 
+# 카드에 실을 본문 상한. 폰 한 화면에서 읽히는 분량 + 텔레그램 본문 여유를 같이 본다.
+CHOICE_CONTEXT_MAX_LINES = 6
+CHOICE_CONTEXT_MAX_CHARS = 160
+
+
+def _choice_context(lines, above_idx: int, title: str) -> list:
+    """옵션 블록 위 **대화상자 본문**을 위에서 아래 순서로 걷는다 (T-260805-154).
+
+    ★왜 필요한가 = 이것이 없으면 카드가 「무엇을」 승인하는지 말하지 않는다.
+      실물 승인창은 이렇게 생겼다:
+          Bash command
+            rm -f "$S"/*.png
+            스크래치패드 png 정리
+          This command requires approval
+          Do you want to proceed?
+          1. Yes / 2. Yes, and don't ask again for: rm * / 3. No
+      종전 카드는 제목(`Do you want to proceed?`)과 선택지만 실었다. 그러면 폰에는
+      「진행할까요? 예 / 항상 예 / 아니오」만 뜨고 정작 `rm -f` 인지 `curl` 인지가
+      안 보인다. 그 상태로 승인 버튼을 열면 **안 보고 누르는 흐름**이 만들어진다 —
+      터미널로 가서 보던 종전보다 나쁘다. 특히 2번(다음부터 안 물어봄)은 한 번 누르면
+      그 패턴이 통째로 자동 승인이 되는 버튼이라 더 그렇다.
+
+    ■경계 = `_choice_title` 과 같다. 가로줄(CHOICE_RULE_RE)에서 멈추므로 위쪽
+      스크롤백 산문으로 못 샌다. 제목 줄은 카드가 따로 그리므로 여기서 뺀다.
+    ■상한 = 줄 수·글자 수 둘 다. 긴 명령이 폰 카드를 밀어내지 않게 한다.
+    """
+    picked = []
+    for probe in range(above_idx, max(-1, above_idx - 14), -1):
+        if probe < 0:
+            break
+        if CHOICE_RULE_RE.match(lines[probe]):
+            break
+        line = lines[probe].strip()
+        if not line or line == title:
+            continue
+        picked.append(line[:CHOICE_CONTEXT_MAX_CHARS])
+    picked.reverse()
+    return picked[-CHOICE_CONTEXT_MAX_LINES:]
+
+
 # 콜백 prefix. callback_data = "clb-choice::<signature>::<번호>" (64바이트 한도 안).
 CHOICE_CALLBACK = "clb-choice"
 
 
 def choice_buttons_mode() -> str:
-    """off | menu | all — 기본 menu.
+    """off | menu | all — 기본 all (T-260805-154, 사용자 GO 2026-08-05 22:4x KST).
 
-    ⚠️ 'all' 은 **사용자 ack 사안**이다. approval 급 화면(도구 승인·삭제 확인 등)은
-      사람이 그 자리에서 승인하라고 있는 관문이라, 폰 버튼으로 그 관문을 여는 것은
-      승인 흐름 자체를 바꾼다. check_approval_stall_notify 주석이 종전부터
-      「승인 버튼 전송 금지(별도 task, R3 ack 대기)」로 못박아 둔 축이 이것이다.
-      그래서 기본값은 menu = ★승인창에는 버튼을 안 붙인다. 코드는 준비돼 있고
-      사용자가 켜라고 하면 env 한 줄로 켜진다.
+    ★기본값이 menu → all 로 바뀐 이력과 근거를 여기 남긴다. 이 축은 「코드가 준비됐는데
+      꺼져 있다」가 오래 유지된 자리라, 왜 켰는지가 없으면 다음 사람이 되돌린다.
+
+    ■종전(menu) = approval 급 화면(도구 승인·삭제 확인 등)에는 버튼을 안 붙였다. 승인창은
+      사람이 그 자리에서 승인하라고 있는 관문이고, 폰 버튼으로 그 관문을 여는 것은 승인
+      흐름 자체를 바꾸므로 **사용자 ack 사안**으로 묶여 있었다.
+    ■개방 근거 = 사용자 직접 발화 2026-08-05 22:42 KST 「이거 텔레그램에서 카드로 표시되서
+      1 2 선택될 수 있게 브릿지 개선해줄 수 있니?」 + 22:4x 「승인 버튼 켜줘」. 계기는
+      macOS 노드 노드의 rm -f 승인 프롬프트가 터미널에만 뜨고 폰에서는 **무음 정지로 보인** 것.
+      즉 종전 기본값은 관문을 지킨 게 아니라 **관문을 폰에서 안 보이게** 만들고 있었다 —
+      사용자가 승인 자체를 못 하니 사람 판단이 늦어질 뿐 판단 주체는 그대로였다.
+    ■★관문은 없어지지 않는다 = 버튼은 사람이 누른다. 자동 승인이 아니다. 그리고 켠 뒤에도
+      다음 축이 그대로 산다 — 카드를 만든 그 화면이 아직 그대로일 때만 주입(서명 대조,
+      apply_pane_choice), chat_id 대조, 번호 범위·현재 옵션 수 검사, 파싱 실패 시 조용한
+      텍스트 폴백. 오탐 버튼의 대가가 폴백의 대가보다 크다는 판단은 유지된다.
+    ■되돌리기 = env 한 줄. CLB_CHOICE_BUTTONS=menu 로 종전 동작, off 로 전면 차단.
     """
-    value = (os.environ.get("CLB_CHOICE_BUTTONS", "") or "menu").strip().lower()
-    return value if value in ("off", "menu", "all") else "menu"
+    raw = (os.environ.get("CLB_CHOICE_BUTTONS", "") or "").strip().lower()
+    if not raw:
+        return "all"
+    if raw in ("off", "menu", "all"):
+        return raw
+    # ★오설정은 기본값이 아니라 **한 칸 보수적인** menu 로 떨어진다.
+    #   미설정 = 의도 없음 → 기본값(all). 그런데 값을 적었다는 것은 제한 의도가 있었다는
+    #   뜻이고("of" 는 off 의 오타지 all 요청이 아니다), 그 의도를 가장 열린 값으로
+    #   해석하면 승인축이 조용히 열린다. 두 경우를 같은 값으로 접지 않는다.
+    return "menu"
 
 
 def choice_buttons_allowed(kind: str) -> bool:
@@ -2686,8 +2843,14 @@ def choice_buttons_allowed(kind: str) -> bool:
 
 
 def choice_card_text(parsed) -> str:
-    """폰에 띄울 선택 카드 본문. 지금 커서가 어디인지도 같이 보여준다."""
+    """폰에 띄울 선택 카드 본문. 무엇을 고르는지 + 지금 커서가 어디인지를 같이 보여준다."""
     rows = [f"🔽 {parsed['title']}", ""]
+    # ★T-260805-154 — 승인 대상 본문을 제목 아래에 싣는다. 이게 없으면 폰에서
+    #   「무엇을」 승인하는지 모른 채 버튼만 누르게 된다(함수 _choice_context 주석).
+    for line in parsed.get("context") or []:
+        rows.append(f"│ {line}")
+    if parsed.get("context"):
+        rows.append("")
     for num, label in parsed["options"]:
         mark = "▸" if num == parsed["selected"] else " "
         rows.append(f"{mark} {num}. {label}")
@@ -2816,6 +2979,67 @@ def flow_mirror_enabled() -> bool:
     if configured is not None and configured.strip():
         return configured.strip().lower() in {"1", "true", "yes", "on"}
     return os.path.exists(FLOW_MIRROR_FLAG)
+
+
+def progress_board_enabled() -> bool:
+    """Same precedence as flow_mirror_enabled(): env override, else flag file.
+    Default OFF — a 5-node shared codebase means most nodes never set the flag."""
+    configured = os.environ.get(PROGRESS_BOARD_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return os.path.exists(PROGRESS_BOARD_FLAG)
+
+
+# 진행 신호 파싱 — "PASS 3/12", "3/12 PASS", "pass=3 ... total=12" 류에서 마지막(=가장
+# 최근) n/total 을 뽑는다. 못 찾으면 (None, None) — 없는 총량을 지어내지 않는다
+# (사용자 지시 원문 §3, "★% 정직성"). 오탐 방지로 분모가 0 이하거나 분자가 음수면 버린다.
+_PROGRESS_SIGNAL_RE = re.compile(r"(\d+)\s*/\s*(\d+)\b")
+
+
+def parse_progress_signal(text: str) -> tuple[int | None, int | None]:
+    """Scan text for the last n/total marker. Returns (current, total) or (None, None)."""
+    if not text:
+        return (None, None)
+    match = None
+    for match in _PROGRESS_SIGNAL_RE.finditer(text):
+        pass
+    if match is None:
+        return (None, None)
+    try:
+        current, total = int(match.group(1)), int(match.group(2))
+    except ValueError:
+        return (None, None)
+    if total <= 0 or current < 0:
+        return (None, None)
+    return (current, total)
+
+
+# run_in_background Bash 의 dispatch tool_result 실측 문구(T-260807-032, 이 브릿지가 도는
+# 하네스에서 직접 관측): "Command running in background with ID: <id>. Output is being
+# written to: <path>." — 출력 파일 경로를 여기서 얻는다. 이 tool_result 는 '백그라운드로
+# 넘어갔다' 는 확인일 뿐이라 done 판정에는 쓰지 않는다(ProgressItem 독스트링 참조).
+_BG_OUTPUT_PATH_RE = re.compile(r"[Oo]utput is being written to:\s*(\S+)")
+
+# 백그라운드/서브에이전트 완료 통지 블록 실측 문구(T-260807-032):
+#   <task-notification>...<tool-use-id>toolu_xxx</tool-use-id>...<status>completed</status>
+#   ...<summary>...</summary>...</task-notification>
+# bg·subagent 두 kind 모두 이 한 형태로 온다 — tool-use-id 가 dispatch 시점에 등록한
+# ProgressItem.tool_use_id 와 정확히 같다(원 tool_use 의 id 를 그대로 되돌려준다, 실측
+# 확인: Task 도 Bash-bg 도 동일). role/type 래핑이 하네스 버전에 따라 달라질 수 있어
+# 특정 record type 에 게이팅하지 않고 평탄화된 텍스트 전체에서 찾는다.
+_TASK_NOTIFICATION_RE = re.compile(
+    r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>([^<]+)</status>(?:.*?<summary>([^<]*)</summary>)?",
+    re.DOTALL,
+)
+
+
+def progress_board_last_line(text: str) -> str:
+    """Last non-empty line of tailed output, for the '총량 미상' honest fallback."""
+    for line in reversed((text or "").splitlines()):
+        line = " ".join(line.strip().split())
+        if line:
+            return flow_cap_text(line, 70)
+    return ""
 
 
 def _tool_detail(name: str, inp: Any) -> str:
@@ -3061,6 +3285,68 @@ def format_ambient_flow(
         done_label=done_label,
         elapsed_text=elapsed_text,
     )
+
+
+def progress_board_bar(current: int, total: int) -> str:
+    """설치 프로그램 스타일 고정폭 바(T-260807-032 후속, 사용자 실발화 23:49). 시각 언어는
+    subagent-progress-card.py 의 render_bar() 와 동일 엣지 케이스 가드를 그대로 따른다 —
+    진행이 있으면 최소 1칸은 채우고(0% 처럼 안 보이게), 안 끝났으면 꽉 찬 바를 보이지
+    않는다(진행중인데 100%처럼 안 보이게). 이 함대가 이미 아는 규격이라 새로 만들지 않는다."""
+    width = PROGRESS_BOARD_BAR_WIDTH
+    if total <= 0:
+        filled = 0
+    else:
+        filled = int(round(width * min(1.0, current / total)))
+        if current > 0:
+            filled = max(1, filled)
+        if current < total:
+            filled = min(width - 1, filled)
+    filled = max(0, min(width, filled))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def format_progress_line(item: "ProgressItem", *, now: float) -> str:
+    """항목 1개 = 1~2줄. 총량을 아는 항목만 ▓░ 바 + %, 나머지는 경과시간 + 최근 활동/상태
+    뿐 — 없는 총량으로 바를 그리지 않는다(가짜 진행률 금지 원칙은 바에도 그대로 적용)."""
+    kind_icon = "▶ 실행" if item.kind == "bg" else "🤝 위임"
+    elapsed = format_flow_elapsed(max(0.0, (item.done_at or now) - item.started_at))
+    if item.done:
+        tail = f" · {item.last_activity}" if item.last_activity else ""
+        return f"✅ 완료 · {item.label} · 소요 {elapsed}{tail}"
+    if item.total:
+        current = item.current or 0
+        pct = int(round(100 * current / item.total))
+        bar = progress_board_bar(current, item.total)
+        return f"{kind_icon} · {item.label}\n{bar} {pct}% ({current}/{item.total}) · {elapsed}"
+    tail = f" · 최근: {item.last_activity}" if item.last_activity else ""
+    return f"{kind_icon} · {item.label} · {elapsed} 경과{tail}"
+
+
+def format_progress_board(
+    items: list["ProgressItem"],
+    *,
+    node: str = "",
+    emoji: str = "",
+    now: datetime | None = None,
+) -> str:
+    """📊 progress board 렌더 (T-260807-032). flow mirror 와 자매 헤더 규격(node·label·갱신
+    시각)이지만 본문은 도구 로그가 아니라 항목당 1줄짜리 진행 상태다."""
+    if not items:
+        return ""
+    default_node, default_emoji = node_defaults()
+    node_token = node or default_node
+    label, mapped_emoji = node_label_emoji(node_token)
+    label = label or node_token or "작업 노드"
+    node_emoji = emoji or mapped_emoji or default_emoji
+    moment = (now or datetime.now(KST)).astimezone(KST)
+    timestamp = moment.strftime("%H:%M")
+    header = f"{node_emoji} {label} · {PROGRESS_BOARD_HEADER} · 갱신 {timestamp}"
+    lines = [format_progress_line(item, now=moment.timestamp()) for item in items]
+    body = "\n".join(lines)
+    available = max(1, PROGRESS_BOARD_LIMIT - len(header) - 4)
+    if len(body) > available:
+        body = body[: max(1, available - 1)].rstrip() + "…"
+    return f"{header}\n\n{body}"
 
 
 _AMBIENT_TREE_PREFIX_RE = re.compile(
@@ -3919,10 +4205,20 @@ class TelegramClient:
                 return None
         return message_ids
 
-    def send(self, text: str, reply_to_message_id: int | None = None, mono: bool = False) -> list[int] | None:
+    def send(
+        self,
+        text: str,
+        reply_to_message_id: int | None = None,
+        mono: bool = False,
+        silent: bool = False,
+    ) -> list[int] | None:
         message_ids: list[int] = []
         for idx, chunk in enumerate(self.chunks(text)):
             params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+            if silent:
+                # 📊 progress board (T-260807-032) — 첫 발신도 무음이어야 한다. editMessageText
+                # 는 텔레그램이 애초에 알림을 안 띄우지만, sendMessage(첫 카드)는 명시해야 한다.
+                params["disable_notification"] = "true"
             if mono:
                 # T-260709-80: 정렬 의존 블록(동전 매트릭스)용 pre entity — offset/length 는
                 # 텔레그램 규격상 UTF-16 code unit 기준.
@@ -4020,7 +4316,13 @@ class NullTelegramClient(TelegramClient):
     # — 즉 답을 만들어 놓고 음성 답변 파일을 못 써서 통째로 사라진다(2026-07-27 13:47 실측).
     # 이 레인의 진짜 배달구는 텔레그램이 아니라 voice answer 파일이므로, 발신 단계는
     # 통과시키고 배달 성공/실패 판정은 그 파일이 갖게 한다. message_id 0 = 실제 메시지 없음.
-    def send(self, text: str, reply_to_message_id: int | None = None, mono: bool = False) -> list[int] | None:
+    def send(
+        self,
+        text: str,
+        reply_to_message_id: int | None = None,
+        mono: bool = False,
+        silent: bool = False,
+    ) -> list[int] | None:
         return [0]
 
     def send_copy_content(self, text: str, code: bool = False) -> list[int] | None:
@@ -4639,6 +4941,34 @@ def flow_card_title_kwargs(active: "ActiveTurn") -> dict[str, Any]:
 
 
 @dataclass
+class ProgressItem:
+    """📊 progress board (T-260807-032) — 백그라운드 태스크 1개 또는 서브에이전트 1개의
+    진행 상태. transient — 재기동을 넘겨 지속하지 않는다(heartbeat 필드와 같은 이유: 새
+    프로세스가 옛 항목을 승계하면 유령 항목이 영원히 '진행중'으로 보인다).
+
+    kind="bg" (run_in_background Bash) 는 dispatch 시점 tool_result 텍스트("Command running
+    in background with ID: … Output is being written to: …")에서 output_path 를 얻어 그
+    파일을 직접 tail 한다. kind="subagent" (Task 도구) 는 총량을 낼 방법이 없어 경과시간만
+    보인다 — 없는 총량을 지어내지 않는다.
+
+    completion 은 두 kind 모두 harness 의 task-notification 블록(<tool-use-id>가 이 항목의
+    tool_use_id 와 일치)으로 판정한다 — dispatch 직후 tool_result 는 '백그라운드로 넘어갔다'
+    는 확인일 뿐 완료가 아니다(그 tool_result 로 done 을 찍으면 시작하자마자 완료로 보인다).
+    """
+
+    tool_use_id: str
+    kind: str  # "bg" | "subagent"
+    label: str
+    started_at: float
+    output_path: str = ""
+    done: bool = False
+    done_at: float = 0.0
+    current: int | None = None
+    total: int | None = None
+    last_activity: str = ""
+
+
+@dataclass
 class SuggestedLoopCandidate:
     candidate_id: str
     reply: str
@@ -4948,13 +5278,38 @@ class TmuxClaudeTransport:
         time.sleep(0.1)
         return True
 
+    def _send_submit_key_unlocked(self, submit_key: str = "Enter") -> None:
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — T-260728-148 submit-reliability.
+        #   정착 대기 후 제출키 반복. 노드간 directive 경로(내부 `*-directive.sh`)가
+        #   2026-06-08 "단일 Enter 묵음 submit-fail" 사고 뒤 검증한 조합의 이식이다.
+        #   단발로 되돌리면 폰에서 보낸 명령이 composer 에 고착돼도 아무 데도 안 남는다.
+        #
+        # ★반복은 Enter 일 때만 한다. codex TUI 의 큐잉 제출키는 Tab 인데
+        #   ("Repeated Enter can leave text sitting in the composer"), Tab 반복은 제출이
+        #   아니라 UI 포커스 이동이라 뜻이 달라진다. 키마다 반복이 안전하다고 가정하지 않는다.
+        #
+        # ★안전 근거를 실측 이상으로 팔지 않는다: Enter 반복이 무해한 이유는 "첫 Enter 로
+        #   composer 가 비고 이후 Enter 는 빈 composer 에서 no-op" 이며, 그 근거는 directive
+        #   경로가 같은 Claude Code REPL 들에 이 시퀀스를 상시 쏘며 함대가 돌아온 운영
+        #   실적이다 — 형식 증명이 아니다. 특히 generating 중 큐잉 제출키가 Enter 가 맞는지는
+        #   busy_submit_key() 주석이 적어둔 대로 여전히 미검증 축이고, 문제가 나면
+        #   CLB_SUBMIT_KEY_REPEAT=1 로 즉시 종전 동작으로 되돌릴 수 있게 열어 뒀다.
+        target = self.resolve_pane_target()
+        repeat = submit_key_repeat() if submit_key == "Enter" else 1
+        interval = submit_key_interval_seconds()
+        for index in range(repeat):
+            if index:
+                time.sleep(interval)
+            self.tmux("send-keys", "-t", target, submit_key)
+
     def _paste_prompt_unlocked(self, prompt: str, submit_key: str = "Enter") -> None:
         if not self._stage_prompt_unlocked(prompt):
             return
-        # submit_key 기본 Enter. codex TUI 는 진행 중 큐잉 제출키가 Tab 이라 별도 submit_key 를
-        # 쓴다("Repeated Enter can leave text sitting in the composer"). Claude Code TUI 의
-        # generating 중 큐잉 제출키가 Enter 가 맞는지는 미검증 — 아니면 CLB_BUSY_SUBMIT_KEY 로 교체.
-        self.tmux("send-keys", "-t", self.resolve_pane_target(), submit_key)
+        # paste 가 TUI 에 삼켜지기 전에 제출키가 도착하면 그 키는 묵음으로 먹힌다.
+        # 정착 대기는 제출 경로에만 둔다 — stage_prompt(제출 없이 붙여넣기만) 경로에
+        # 대기를 얹으면 이 결함과 무관한 흐름까지 느려진다(원칙 9 국소).
+        time.sleep(submit_settle_seconds())
+        self._send_submit_key_unlocked(submit_key)
 
     def _submit_prompt_unlocked(self, submit_key: str = "Enter") -> None:
         self.verify()
@@ -6103,6 +6458,13 @@ class Bridge:
         # 받은지시→결과를 1장으로 통합한다(받은지시/노드결과 2장 중복 제거). 0 = 열린 앵커 없음.
         self.ambient_directive_message_id: int = 0
         self.ambient_directive_body: str = ""
+        # 📊 progress board (T-260807-032) — 백그라운드 태스크·서브에이전트 진행판.
+        # ambient flow 와 같은 이유로 ephemeral: 재기동 시 새로 시작(옛 항목 유령화 방지).
+        # 항목 없어지면(전부 완료+linger 경과) message_id 를 0 으로 되돌려 다음 배치가
+        # 새 카드로 시작한다 — 무관한 미래 작업이 옛 카드에 계속 덧붙는 것을 막는다.
+        self.progress_items: dict[str, ProgressItem] = {}
+        self.progress_message_id: int = 0
+        self.progress_last_render_at: float = 0.0
         self.last_transcript_mtime = 0.0
         self.last_jsonl_read_at = 0.0
         self.last_jsonl_watch_error = ""
@@ -8812,10 +9174,11 @@ class Bridge:
         # 아무것도 노출하지 않아, 워커가 승인 대기에서 조용히 멈춘다(2026-07-20 실사례 2회).
         # 대기가 debounce(기본 25s) 이상 지속되면 사용자에게 1통 알린다. episode 당 1회 —
         # 승인이 해소되면 리셋해 다음 재발 시 다시 알린다. 유령 세션 알림과 동형 경로.
-        # ⚠️ 가드 무력화·자동 키 주입 금지는 그대로다. 승인 버튼은 T-260802-042 에서
-        #   기계는 붙였지만 **기본값은 여전히 안 붙인다** — choice_buttons_allowed() 가
-        #   approval 급 화면을 CLB_CHOICE_BUTTONS=all 뒤로 막아둔다(사용자 ack 사안).
-        #   즉 기본 동작은 종전과 같은 '알림만' 이다.
+        # ⚠️ 가드 무력화·**자동** 키 주입 금지는 그대로다 — 버튼은 사람이 누른다.
+        #   T-260805-154 (사용자 GO 2026-08-05 22:4x): 종전에는 choice_buttons_allowed()
+        #   가 approval 급 화면을 CLB_CHOICE_BUTTONS=all 뒤로 막아 기본 동작이 '알림만'
+        #   이었다. 지금은 기본값이 all 이라 승인창에도 카드가 붙는다(근거·되돌리기 =
+        #   choice_buttons_mode 독스트링). CLB_CHOICE_BUTTONS=menu 로 종전 동작 복귀.
         if not repl_supports_pane_features(self.repl):
             return
         if os.environ.get("CLB_APPROVAL_STALL_NOTIFY", "1").strip() == "0":
@@ -8838,6 +9201,21 @@ class Bridge:
             # 승인/블록 해소 — episode 리셋 (다음 재발 시 재알림).
             self.approval_stall_since = 0.0
             self.approval_stall_notified = False
+            return
+        # ★T-260805-154 (사용자 GO 2026-08-05 22:4x) — 카드가 붙는 화면은 **기다리지 않는다.**
+        #   debounce(기본 25s)는 '무음 정지를 늦게라도 알린다'가 목적이었는데, 버튼이 붙은
+        #   지금은 그 25초가 곧 사용자 폰에서 「멈춘 것처럼 보이는」 시간이다(원 발화:
+        #   "텔레그램에서는 멈춘 것처럼 나오더라고 선택지 터미널에 나오는데 말이야").
+        #   ⚠️ 반쯤 그려진 화면을 성급히 카드로 만드는 사고면은 열리지 않는다 —
+        #     parse_pane_choice 가 구조를 못 읽으면 None 을 내고 send_pane_choice_card 가
+        #     False 로 떨어져 아래 종전 debounce 경로로 그대로 간다(fail-safe 방향 불변).
+        #     그리고 탭 시점에 서명을 다시 대조하므로, 그새 화면이 바뀌었으면 주입 대신
+        #     "화면이 바뀌었어요"가 나간다.
+        #   ⚠️ 텍스트 폴백 알림은 debounce 를 계속 쓴다 — 파싱이 안 되는 화면까지 즉시
+        #     알리면 짧은 승인창에도 매번 한 통이 나가 소음이 된다.
+        if not self.approval_stall_notified and self.send_pane_choice_card(screen):
+            self.approval_stall_notified = True
+            self.approval_stall_since = time.time()
             return
         now = time.time()
         if not self.approval_stall_since:
@@ -12453,6 +12831,128 @@ class Bridge:
         log("SEND", f"closed flow mirror nonce={active.nonce} mid={active.flow_message_id} status={status}")
         return True
 
+    def observe_progress_signals(self, record: dict[str, Any]) -> None:
+        """📊 progress board 감지 (T-260807-032). flow mirror 의 active-turn/ambient/
+        isSidechain 게이팅과 무관하게 **모든** 레코드를 본다 — 서브에이전트는 그걸 dispatch
+        한 부모 turn 의 Task tool_use 하나로 추적하고(원 turn 은 isSidechain 이 아니다),
+        완료 통지는 어느 turn 모양으로 올지 하네스 버전에 따라 달라질 수 있어 role 을
+        가리지 않고 스캔한다."""
+        if not progress_board_enabled():
+            return
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        content = message.get("content")
+        if not isinstance(content, list):
+            return
+        role = message.get("role")
+        now = time.time()
+        if role == "assistant":
+            for item in content:
+                if not (isinstance(item, dict) and item.get("type") == "tool_use"):
+                    continue
+                tool_use_id = str(item.get("id") or "")
+                if not tool_use_id or tool_use_id in self.progress_items:
+                    continue
+                name = str(item.get("name") or "")
+                inp = item.get("input") if isinstance(item.get("input"), dict) else {}
+                if name == "Bash" and inp.get("run_in_background") is True:
+                    label = _tool_detail("Bash", inp) or "백그라운드 작업"
+                    self.progress_items[tool_use_id] = ProgressItem(
+                        tool_use_id=tool_use_id, kind="bg", label=flow_cap_text(label, 60), started_at=now,
+                    )
+                elif name == "Task":
+                    label = str(inp.get("description") or inp.get("subagent_type") or "서브에이전트").strip()
+                    self.progress_items[tool_use_id] = ProgressItem(
+                        tool_use_id=tool_use_id, kind="subagent", label=flow_cap_text(label, 60), started_at=now,
+                    )
+        elif role == "user":
+            for item in content:
+                if not (isinstance(item, dict) and item.get("type") == "tool_result"):
+                    continue
+                tool_use_id = str(item.get("tool_use_id") or "")
+                pitem = self.progress_items.get(tool_use_id)
+                if pitem is None or pitem.kind != "bg" or pitem.output_path:
+                    continue
+                # dispatch 직후 확인 텍스트에서 output 경로만 얻는다 — 이 tool_result 는
+                # "백그라운드로 넘어갔다" 확인일 뿐 완료가 아니므로 done 은 여기서 안 찍는다.
+                raw = item.get("content")
+                text = raw if isinstance(raw, str) else content_text(raw)
+                match = _BG_OUTPUT_PATH_RE.search(text or "")
+                if match:
+                    pitem.output_path = match.group(1).rstrip(".,;)")
+        text_blob = content_text(content)
+        if text_blob:
+            for match in _TASK_NOTIFICATION_RE.finditer(text_blob):
+                tool_use_id = match.group(1).strip()
+                status = match.group(2).strip()
+                summary = (match.group(3) or "").strip()
+                pitem = self.progress_items.get(tool_use_id)
+                if pitem is None or pitem.done:
+                    continue
+                pitem.done = True
+                pitem.done_at = now
+                pitem.last_activity = flow_cap_text(summary, 70) if summary else status
+
+    def refresh_bg_progress_from_output(self) -> None:
+        """실행중 bg 항목의 output_path 를 tail 해 진행 신호를 갱신한다. 디스크 I/O 라
+        레코드마다가 아니라 렌더 직전에만 부른다."""
+        for item in self.progress_items.values():
+            if item.kind != "bg" or item.done or not item.output_path:
+                continue
+            try:
+                with open(item.output_path, "rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(0, size - 4096))
+                    tail = handle.read().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            current, total = parse_progress_signal(tail)
+            if total is not None:
+                item.current, item.total = current, total
+            last_line = progress_board_last_line(tail)
+            if last_line:
+                item.last_activity = last_line
+
+    def maybe_render_progress_board(self, now: float | None = None) -> bool:
+        """진행판 카드를 최소 간격을 지켜 send/edit 한다(무음). 항목이 전부 빠지면(완료 +
+        linger 경과) 앵커를 리셋해 다음 배치가 새 카드로 시작하게 한다 — 무관한 미래
+        작업이 옛 카드에 계속 덧붙는 것을 막는다."""
+        if not progress_board_enabled():
+            return False
+        now = time.time() if now is None else now
+        stale = [
+            key
+            for key, item in self.progress_items.items()
+            if item.done and item.done_at and (now - item.done_at) >= PROGRESS_BOARD_DONE_LINGER_SECONDS
+        ]
+        for key in stale:
+            del self.progress_items[key]
+        if not self.progress_items:
+            if self.progress_message_id:
+                self.progress_message_id = 0
+                self.progress_last_render_at = 0.0
+            return False
+        if self.progress_last_render_at and (now - self.progress_last_render_at) < PROGRESS_BOARD_MIN_INTERVAL:
+            return False
+        self.refresh_bg_progress_from_output()
+        items = sorted(self.progress_items.values(), key=lambda i: i.started_at)
+        body = format_progress_board(items, node=self.config.node, emoji=self.config.emoji)
+        if not body:
+            return False
+        try:
+            if not self.progress_message_id:
+                ids = self.telegram.send(body, silent=True)
+                if not ids:
+                    return False
+                self.progress_message_id = ids[0]
+            else:
+                self.telegram.edit(self.progress_message_id, body)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"progress board render failed (non-fatal): {exc}")
+            return False
+        self.progress_last_render_at = now
+        return True
+
     def quarantine_line(self, line: bytes, error: str, start: int, end: int) -> None:
         append_jsonl(
             self.config.quarantine_path,
@@ -12475,6 +12975,7 @@ class Bridge:
                     self.retry_pending_send()
                     self.write_egress_sidecar()
                     self.maybe_heartbeat_flow_card()
+                    self.maybe_render_progress_board()
                     self.stop_event.wait(0.5)
                     continue
                 with path.open("rb") as handle:
@@ -12484,8 +12985,12 @@ class Bridge:
                     # ⚙️ T-260727-076 — 여기가 정확히 '침묵 구간'이다: 트랜스크립트에 새 줄이
                     # 없다 = 도구 이벤트가 없다 = 종전엔 카드가 정지하던 지점. 자체 시간
                     # 상한을 들고 있으므로 이 0.5초 tick 마다 불려도 실제 edit 은 45초에 1회다.
+                    # 📊 progress board(T-260807-032) 도 같은 이유로 여기서 불린다 — bg 항목의
+                    # 출력 파일은 도구 이벤트 없이도 계속 자라므로, 침묵 구간에서도 갱신돼야
+                    # "지금 몇 %" 가 실시간에 가깝다.
                     self.retry_pending_send()
                     self.maybe_heartbeat_flow_card()
+                    self.maybe_render_progress_board()
                     self.stop_event.wait(0.5)
                     continue
                 cursor = self.session_pos
@@ -12507,11 +13012,13 @@ class Bridge:
                         continue
                     if isinstance(record, dict):
                         self.process_record(record)
+                        self.observe_progress_signals(record)
                     self.session_pos = line_end
                     self.persist_state()
                 self.last_transcript_mtime = path.stat().st_mtime
                 self.last_jsonl_read_at = time.time()
                 self.retry_pending_send()
+                self.maybe_render_progress_board()
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
                 now = time.time()

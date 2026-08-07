@@ -1,0 +1,40 @@
+# interstitial-patterns.tsv — 확인창(interstitial) 서명 **선언 정본** (T-260801-113)
+#
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 두 소비자가 같은 정본을 읽게 하는 forcing function.
+#
+# ■ 왜 파일인가
+#   이 표는 원래 claude-telegram-bridge.py 안의 파이썬 튜플(INTERSTITIAL_PATTERNS)이었다
+#   (T-260801-112, PR#1487). 거기까지는 소비자가 브릿지 하나뿐이라 문제가 없었다.
+#   그런데 소비자가 둘이 됐다 — tmux-repl-busy.sh 가 확인창 앞에 멈춘 세션을 IDLE 로 읽는
+#   결함(T-260801-113)을 닫으려면 **셸 검출기도 같은 서명을 알아야** 한다.
+#
+#   ★후보 3개 중 이 파일을 고른 근거 (티켓 details 의 기각 이력 그대로):
+#     (a) 셸에 패턴을 이식     ← 기각. 같은 표가 두 벌이 되고, 다음에 확인창이 늘 때
+#                                한쪽만 갱신된다. 그게 바로 이 티켓이 고치는 결함 클래스다.
+#     (b) 검출기가 파이썬 헬퍼 호출 ← 기각. 검출기는 배차 preflight·fleet-status 가 고빈도로
+#                                부른다. 매 호출 python3 기동은 비용이 과하다.
+#     (c) 선언 파일 1본을 양쪽이 읽기 ← 채택. 표가 물리적으로 한 벌이라 갈릴 수가 없다.
+#
+# ■ 형식
+#   name <TAB> token <TAB> token <TAB> ...
+#   - 판정 = pane 을 소문자로 접은 뒤 **그 행의 토큰이 전부 부분문자열로 존재**하면 그 name.
+#     (정규식 아님 — 고정 문자열 포함 검사다. 브릿지의 종전 의미론과 한 글자도 다르지 않다.)
+#   - 토큰은 소문자로 적는다. 위에서부터 첫 일치 행이 이긴다.
+#   - `#` 로 시작하는 줄과 빈 줄은 무시한다.
+#
+# ■ 소비자 (둘 다 이 파일을 읽는다 — 픽스처가 그 사실을 행동으로 고정한다)
+#   1) scripts/claude-telegram-bridge.py  pane_interstitial()  — 폰에 확인창을 미러/통지
+#   2) scripts/tmux-repl-busy.sh          rc=8 BLOCKED         — 배차·감시가 IDLE 로 안 읽게
+#   픽스처: scripts/tests/test_tmux_repl_busy_blocked.sh (동일-정본 불변식)
+#           scripts/tests/test_bridge_interstitial_table.sh (분류표 완전성)
+#
+# ■ ★새 확인창이 생기면 **코드가 아니라 여기 한 줄**을 추가한다.
+#   그러면 폰 통지와 배차 게이트가 같은 순간에 같이 눈을 뜬다. 한쪽만 고치는 길이 없다.
+#
+# ⚠️ 범위 한계 (정직하게 적는다): 여기 있는 것은 **브릿지가 아는 확인창**이다.
+#   Claude Code TUI 는 이 저장소가 계수할 수 없는 확인창(도구 권한 프롬프트 등)도 띄운다.
+#   그것들을 넣을지는 별건의 판단이다 — 넣으면 브릿지의 폰 미러 동작도 같이 넓어지기 때문에
+#   이 티켓(검출기 축)에서 조용히 확장하지 않았다.
+switch_model	switch model?	yes	no
+rewind	rewind	restore the code
+switch_effort	change effort level?	yes	no
