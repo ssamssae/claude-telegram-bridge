@@ -180,6 +180,15 @@ NONCE_RE = re.compile(r"clb-[0-9a-f]{8,64}")
 OUTBOUND_CLB_ENVELOPE_RE = re.compile(r"</?claude-telegram-bridge\b[^>]*>|<clb-[0-9a-f]{8,64}/>")
 OUTBOUND_CLB_NONCE_RE = re.compile(r"\bclb-[0-9a-f]{8,64}\b")
 OUTBOUND_CLB_GAP_RE = re.compile(r"[ \t]{2,}")
+# T-260809-015: 대타 중계(relay_final_answer_via_other_node_bot) 조각 억제 — 8/9
+#   01:32~01:33 작업 노드에서 "retired route final"/"final answer" 같은 무의미 조각이
+#   대타 채널로 4회 반복 착지했다(사용자 관찰). content_text() 추출 자체는 정상 —
+#   진짜 답 텍스트를 그대로 옮기므로, 상류(그 턴 자체가 짧게 끊긴 원인)는 여기서 못
+#   고친다. 방어선은 이 게이트뿐: 짧고 한글이 0인 답만(AND, 둘 다) 조각으로 본다 —
+#   길이만 보면 "네" 같은 진짜 짧은 한국어 답도 걸리고, 한글비율만 보면 긴 영어 인용도
+#   걸린다. fail-open — 애매하면 그대로 보낸다, 확실할 때만 원문 대신 알림으로 대체한다.
+RELAY_FRAGMENT_MAX_CHARS = 40
+RELAY_FRAGMENT_HANGUL_RE = re.compile(r"[가-힣]")
 REASONING_HEADER = "\U0001f9e0 클로드 사고"
 REASONING_MIRROR_LIMIT = 3500
 # ⚙️ flow mirror — relays intermediate tool_use steps to Telegram in real time so
@@ -209,6 +218,11 @@ TYPING_LIVENESS_GRACE_PULSES = 5
 TYPING_LIVENESS_CHECK_EVERY = 5
 FLOW_MIRROR_ENV = "CLB_FLOW_MIRROR"
 FLOW_MIRROR_FLAG = os.path.expanduser(os.environ.get("CLB_FLOW_MIRROR_FLAG", "~/.config/claude-telegram-bridge/flow-mirror.on"))
+# T-260809-020: hold-all — 추천답변 후보를 declared class 와 무관하게 전건 HOLD 카드로
+# 강제한다(자동발사 경로 절대 미진입). 킬스위치(claude-suggested-loop.off)와 별도 축 —
+# 킬스위치는 카드 자체를 안 띄우고, hold-all 은 카드는 띄우되 항상 확인 버튼을 요구한다.
+SUGGESTED_HOLD_ALL_ENV = "CLB_SUGGESTED_HOLD_ALL"
+SUGGESTED_HOLD_ALL_FLAG = os.path.expanduser("~/.claude/state/claude-suggested-loop.hold-all")
 # ⚙️ flow mirror 침묵구간 하트비트 (T-260727-076) — 카드는 도구 이벤트가 있을 때만 렌더된다.
 # 워커가 도구 하나를 오래 도는 구간엔 이벤트가 없어 카드가 정지하고, 그 정지는 죽은 턴과
 # 화면상 완전히 같다(실측 2026-07-27 침묵창 3분19초·6분23초, 같은 구간 mesh-ledger 는 정상).
@@ -251,6 +265,47 @@ ENVELOPE_SIDECAR_OFF_FLAG = Path(
 ENVELOPE_SIDECAR_PATH = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_PATH", "~/.local/state/claude-telegram-bridge/envelope-sidecar.jsonl")).expanduser()
 ENVELOPE_SIDECAR_SCHEMA = "claude-telegram-bridge-envelope-sidecar/v1"
 DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS = 120.0
+# 🚦 priority lane (T-260808-022, parent=T-260808-018 4축 중 4축) — flood 압박 신호등이
+# 켜져 있으면 카드·미러 등 장식 발신을 드랍하고 최종답장·추천답변만 시도한다. 신호등은
+# T-260808-021(scripts/lib/telegram_send_throttle.py 감속기, PR#1658 로 main 착지)이
+# 쓰는 봇·챗별 쿨다운 스탬프다 — 파일명 telegram-flood-cooldown-<sha256(token_env|chat_id)
+# 16자>.json, 만기 필드는 그쪽 cooldown_path()/cooldown_remaining() 이 실제로 쓰는
+# "expires_at"(epoch). 이 파일은 그 스탬프를 읽기만 한다 — 쓰기는 021 소관.
+# 디렉터리 override 도 그쪽 TELEGRAM_SEND_STATE_DIR 계약을 그대로 따른다(상태 디렉터리를
+# 옮기면 감속기와 우선순위 레인이 같이 움직여야 한다 — 별도 env 를 새로 만들면 재배치 시
+# 두 축이 갈라진다). 스탬프가 하나도 없거나 파싱 실패/만기 경과면 평시로 취급(장식 발신
+# 그대로) — fail-open 이 맞다: 신호등 부재를 쿨다운으로 오판하면 장식 발신이 영구 억제된다.
+FLOOD_COOLDOWN_DIR = os.environ.get("TELEGRAM_SEND_STATE_DIR") or "~/.local/state/claude-telegram-bridge"
+FLOOD_COOLDOWN_GLOB = "telegram-flood-cooldown-*.json"
+
+
+def flood_cooldown_active(now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    try:
+        paths = list(Path(FLOOD_COOLDOWN_DIR).expanduser().glob(FLOOD_COOLDOWN_GLOB))
+    except OSError:
+        return False
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        expiry = data.get("expires_at")
+        try:
+            expiry = float(expiry)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if expiry > now:
+            return True
+    return False
+
+
+def log_priority_lane_suppress(kind: str) -> None:
+    log("SUPPRESS", f"priority lane active — skip {kind} (flood cooldown)")
+
+
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
 # cards read like the Korean Codex cards. Unmapped tools keep their original name.
 TOOL_LABEL_KO = {
@@ -1004,6 +1059,12 @@ def busy_inject_promote_idle_stale_seconds() -> float:
     return float_env("CLB_BUSY_INJECT_PROMOTE_IDLE_STALE_SECONDS", 60.0)
 
 
+def orphaned_final_answer_ttl_seconds() -> float:
+    # T-260809-016: 소유권을 잃은 턴의 진짜 최종답장을 얼마나 오래 기다려줄지. 이보다
+    # 늦게 도착하면 더는 그 질문의 답이라고 보기 어렵다고 보고 잊는다(무한 성장 방지).
+    return float_env("CLB_ORPHANED_FINAL_ANSWER_TTL_SEC", 1800.0)
+
+
 def native_queue_wait_timeout_seconds() -> float:
     """'native queue 에 있다'는 믿음을 유지하는 상한 (T-260726-053).
 
@@ -1603,6 +1664,19 @@ def sanitize_text(text: str, limit: int = 12000) -> str:
 
 def strip_ansi_control(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def looks_like_relay_fragment(answer: str) -> bool:
+    """T-260809-015 — 대타 중계 조각 판정. 짧고(RELAY_FRAGMENT_MAX_CHARS 이하) 한글이
+    1자도 없어야만(AND) 조각으로 본다. 둘 중 하나만으론 오탐이 크다 — 길이만 보면
+    "네" 같은 진짜 짧은 한국어 답도 걸리고, 한글비율만 보면 정상 업무상 인용된 긴
+    영어 문장도 걸린다."""
+    stripped = (answer or "").strip()
+    if not stripped:
+        return True
+    if len(stripped) > RELAY_FRAGMENT_MAX_CHARS:
+        return False
+    return not RELAY_FRAGMENT_HANGUL_RE.search(stripped)
 
 
 def strip_bridge_nonce_markers(text: str) -> str:
@@ -2979,6 +3053,19 @@ def flow_mirror_enabled() -> bool:
     if configured is not None and configured.strip():
         return configured.strip().lower() in {"1", "true", "yes", "on"}
     return os.path.exists(FLOW_MIRROR_FLAG)
+
+
+def suggested_hold_all_enabled() -> bool:
+    """Return the explicit env toggle, or fall back to the runtime flag file.
+
+    ``CLB_SUGGESTED_HOLD_ALL`` lets service/config-file users select the
+    behavior without creating another file.  Leaving it unset preserves the
+    flag-file toggle and its default-OFF behavior (T-260809-020).
+    """
+    configured = os.environ.get(SUGGESTED_HOLD_ALL_ENV)
+    if configured is not None and configured.strip():
+        return configured.strip().lower() in {"1", "true", "yes", "on"}
+    return os.path.exists(SUGGESTED_HOLD_ALL_FLAG)
 
 
 def progress_board_enabled() -> bool:
@@ -6441,6 +6528,13 @@ class Bridge:
         self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
+        # T-260809-016: 소유권을 잃은(stale release) 뒤 도착하는 진짜 최종답장을 위한
+        # 임시 보관소 — user_uuid 로 실제 도착이 확인된 턴만 담는다(미확인 주입은 제외,
+        # 터미널 직접입력 등 무관한 후속 답변을 잘못 끌어오는 오탐 방지). key = 그 턴의
+        # user record uuid, value = {message_id, orphaned_at}. TTL 로 무한 성장 방지.
+        # T-260728-091(채널 무착지)·T-260809-015(작업 노드 대타중계)와 같은 "진짜 답은
+        # 반드시 착지" 계보.
+        self.orphaned_confirmed_turns: dict[str, dict[str, Any]] = {}
         # T-260716-92: top-level node-originated response turn whose typing lifetime
         # is independent from passive background processes shown in the pane.
         self.ambient_response_active = False
@@ -6732,6 +6826,11 @@ class Bridge:
         # (카드는 띄우되 사용자 확인 필수) — 노드발 턴이 auto-fire 로 후속을 자가 트리거하는 위험 차단.
         if force_hold:
             decision = SuggestedDecision("hold", "ambient_origin")
+        # T-260809-020: hold-all — 킬스위치(카드 자체를 안 띄움, suggested_register_skip_reason
+        # 에서 이미 걸러짐)보다 아래 우선순위. declared class 와 무관하게 전건 HOLD 로 고정해
+        # 확인 버튼 카드는 항상 뜨되 자동발사(veto_pending) 경로는 절대 타지 않게 한다.
+        if suggested_hold_all_enabled():
+            decision = SuggestedDecision("hold", "hold_all")
         status = "veto_pending" if decision.decision == "auto-ok" else "hold"
         candidate = SuggestedLoopCandidate(
             candidate_id=secrets.token_hex(6),
@@ -7839,6 +7938,9 @@ class Bridge:
     def eye_activity_context(self) -> tuple[list[str], int, float]:
         surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
         enabled = bool(getattr(self.config, "activity_eyes_enabled", False))
+        if enabled and flood_cooldown_active():
+            log_priority_lane_suppress("eyes activity card")
+            enabled = False
         with self.lock:
             item: QueueItem | ActiveTurn | None = self.active_turn
             if item is None and self.pending:
@@ -8131,9 +8233,15 @@ class Bridge:
         mirror = format_reasoning_mirror(reasoning)
         if not mirror:
             return
+        if flood_cooldown_active():
+            log_priority_lane_suppress(f"reasoning mirror nonce={active.nonce}")
+            return
         try:
-            self.telegram.send(mirror)
-            log("SEND", f"sent reasoning mirror nonce={active.nonce} len={len(mirror)}")
+            ids = self.telegram.send(mirror)
+            if ids:
+                log("SEND", f"sent reasoning mirror nonce={active.nonce} len={len(mirror)}")
+            else:
+                log("SEND", f"send-unconfirmed reasoning mirror nonce={active.nonce} len={len(mirror)}")
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"reasoning mirror send failed (non-fatal): {exc}")
 
@@ -8319,6 +8427,13 @@ class Bridge:
                 return False
             if self.session_occupied_excluding_active(missing_transcript_busy=False):
                 return False
+            # T-260809-016: 릴리즈 직전 재확인 — 단일 capture_pane 스냅샷이 스피너 리드로
+            # 사이의 화면 깜빡임을 우연히 잡으면 아직 생성 중인 턴을 놓아버린다(실사고
+            # 2026-08-09 13:40:38 KST, 제어 노드 mac — busy_state() 앞뒤 폴에서는 generating 인데
+            # 이 판정 순간의 캡처만 idle 이었다). 이 63초 빠른경로만 재확인한다 — 900초
+            # 일반 idle 경로(elif 분기)는 촉발 빈도·위험이 달라 이 배차 범위 밖.
+            if self.session_occupied_excluding_active(missing_transcript_busy=False):
+                return False
             if self.active_turn_session_transcript_lost():
                 return False
             release_reason = "busy_inject_promote_idle_timeout"
@@ -8329,6 +8444,9 @@ class Bridge:
         with self.lock:
             if self.active_turn is not active:
                 return False
+            # T-260809-016: 놓기 전에 기억 — user_uuid 가 확인된 턴이면, 이 릴리즈 뒤에도
+            # 실제 최종답장이 도착할 수 있다(세션 자체는 계속 돌고 있었을 수 있어서다).
+            self._remember_orphaned_confirmed_turn(active)
             self.active_turn = None
         self.stop_typing()
         self.queue.append_status(
@@ -11772,6 +11890,73 @@ class Bridge:
             return None
         return active
 
+    def _remember_orphaned_confirmed_turn(self, active: ActiveTurn) -> None:
+        """T-260809-016 — stale-release 로 소유권을 놓기 직전 호출. user_uuid 가 실제로
+        확인된(=진짜 텔레그램 질문이었음이 확정된) 턴만 기억한다 — 미확인 주입까지
+        담으면 터미널 직접입력 등 무관한 후속 답변을 잘못 끌어올 위험이 있다.
+        # T-260809-016: 테스트 더블 다수가 Bridge.__new__() 로 __init__ 을 건너뛰고
+        #   필요한 속성만 손으로 채운다(test_claude_telegram_bridge.py 외 10개 파일).
+        #   그런 더블은 이 속성이 없을 수 있어 getattr 로 방어한다 — 실제 운영
+        #   인스턴스는 항상 __init__ 이 채우므로 이 분기는 테스트 더블 전용이다."""
+        if not active.user_uuid:
+            return
+        if not hasattr(self, "orphaned_confirmed_turns"):
+            self.orphaned_confirmed_turns = {}
+        self.orphaned_confirmed_turns[active.user_uuid] = {
+            "message_id": active.message_id,
+            "orphaned_at": time.time(),
+        }
+        ttl = orphaned_final_answer_ttl_seconds()
+        if ttl > 0:
+            now = time.time()
+            self.orphaned_confirmed_turns = {
+                key: value
+                for key, value in self.orphaned_confirmed_turns.items()
+                if now - value.get("orphaned_at", 0.0) < ttl
+            }
+
+    def match_orphaned_confirmed_turn(self, assistant_parent_uuid: str | None) -> dict[str, Any] | None:
+        """T-260809-016 — ancestor_matches_active_turn 과 같은 모양의 parentUuid 체인
+        탐색이지만, 지금 활성인 턴이 아니라 '방금 소유권을 잃은' 턴들의 기억을 뒤진다.
+        찾으면 1회 소비(pop)한다 — 같은 답장이 두 번 전달되지 않게."""
+        orphans = getattr(self, "orphaned_confirmed_turns", None)  # T-260809-016: 위 방어 참고
+        if not orphans:
+            return None
+        seen: set[str] = set()
+        cursor = assistant_parent_uuid
+        while isinstance(cursor, str) and cursor and cursor not in seen:
+            if cursor in orphans:
+                return orphans.pop(cursor)
+            seen.add(cursor)
+            cursor = self.parent_map.get(cursor)
+        return None
+
+    def deliver_orphaned_final_answer(self, orphan: dict[str, Any], content: Any) -> None:
+        """T-260809-016 — 소유권을 잃은 뒤 도착한 진짜 최종답장을 착지시킨다. ambient
+        미러(flow_mirror_enabled() 게이트 뒤, 노드챗 대상)와는 다른 축이다 — 이건 진짜
+        텔레그램 질문의 답이므로 그 플래그와 무관하게, 평소 답장이 가는 곳으로 보낸다.
+        fail-open: 평소 채널이 막히면 T-260809-015 의 대타 중계로 한 번 더 시도한다."""
+        answer = sanitize_text(content_text(content), limit=16000)
+        if not answer:
+            return
+        prefix = (
+            "⚠️ 소유권을 잃은 뒤 늦게 도착한 답장(T-260809-016) — 원래 대화 흐름과 "
+            "안 이어질 수 있지만 원문 그대로 전달함\n\n"
+        )
+        delivered = prefix + answer
+        reply_to = orphan.get("message_id") or None
+        try:
+            ids = self.telegram.send(delivered, reply_to_message_id=reply_to)
+        except Exception as exc:  # noqa: BLE001
+            ids = None
+            log("SEND", f"orphaned final answer send raised, falling back to relay: {exc}")
+        if ids:
+            log("SEND", f"sent orphaned final answer mid={ids[0]}")
+            mesh_ledger_record("sendMessage", self.config.chat_id, delivered, result="sent")
+            return
+        log("SEND", "orphaned final answer send unconfirmed — relaying via other-node bot")
+        self.relay_final_answer_via_other_node_bot(delivered, attempts=1, send_error="orphaned_final_send_unconfirmed")
+
     @staticmethod
     def append_reasoning(active: ActiveTurn, text: str) -> None:
         text = sanitize_text(text, limit=REASONING_MIRROR_LIMIT)
@@ -12096,6 +12281,53 @@ class Bridge:
             active.send_in_progress = True
             return active, assistant_uuid, answer, key
 
+    def relay_final_answer_via_other_node_bot(self, answer: str, *, attempts: int, send_error: str) -> bool:
+        """최종답장이 재시도 소진으로 실패 확정됐을 때 타 노드 봇 경유 대타 중계를 시도한다
+        (T-260808-022, parent=T-260808-018 4축 중 4축). 신규 채널 발명 금지(원칙 8) — 이
+        노드의 발신이 죽은 상황이므로 기존 정본 scripts/notify-aniki.sh(비-telegram 턴이
+        chat_id 없이 사용자에게 직접 보고할 때 쓰는, 이미 착탄이 실증된 경로)를 그대로
+        재사용한다. 착탄 여부(rc==0)를 반환하고 장부에도 남긴다."""
+        label, _emoji = node_label_emoji(self.config.node)
+        label = label or self.config.node or "노드"
+        if looks_like_relay_fragment(answer):
+            log("RELAY", f"final answer relay suppressed fragment (len={len((answer or '').strip())}): {answer!r}")
+            relay_text = (
+                f"{label} 챗 발신 장애 중 대타 중계 — 답장이 짧고 한글이 없는 조각으로 판단돼 "
+                f"원문 대신 이 알림만 보냄(T-260809-015, attempts={attempts})"
+            )
+        else:
+            relay_text = f"{label} 챗 발신 장애 중 대타 중계\n\n{answer}"
+        alert_bin = relay_alert_bin()
+        chat_id = self.config.chat_id
+        if not alert_bin.exists():
+            log("RELAY", f"final answer relay skipped — alert bin missing: {alert_bin}")
+            mesh_ledger_record("sendMessage", chat_id, relay_text, result="fallback_unavailable")
+            return False
+        try:
+            proc = subprocess.run(
+                [str(alert_bin), relay_text],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("RELAY", f"final answer relay failed to launch ({alert_bin.name}): {exc}")
+            mesh_ledger_record("sendMessage", chat_id, relay_text, result="fallback_failed")
+            return False
+        landed = proc.returncode == 0
+        log(
+            "RELAY",
+            f"final answer relay via {alert_bin.name}: attempts={attempts} rc={proc.returncode} "
+            f"landed={landed} original_error={send_error}",
+        )
+        mesh_ledger_record(
+            "sendMessage",
+            chat_id,
+            relay_text,
+            result="fallback_delivered" if landed else "fallback_failed",
+        )
+        return landed
+
     def send_claimed_active_answer(
         self,
         active: ActiveTurn,
@@ -12169,12 +12401,16 @@ class Bridge:
                     active.send_in_progress = False
             if maxed:
                 log("SEND", f"telegram send failed after {attempts} attempts; releasing active turn")
+                relay_landed = self.relay_final_answer_via_other_node_bot(
+                    answer, attempts=attempts, send_error=send_error
+                )
                 self.queue.append_status(
                     item,
                     "failed",
                     error=send_error,
                     assistant_uuid=assistant_uuid,
                     attempts=attempts,
+                    relay_landed=relay_landed,
                 )
                 self.stop_typing()
                 self.persist_state()
@@ -12198,11 +12434,15 @@ class Bridge:
                 log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
             else:
                 sent_ids.extend(bubble_ids)
+                confirmation_enabled = getattr(self.config, "suggested_reply_confirmation_enabled", True)
+                if confirmation_enabled and flood_cooldown_active():
+                    log_priority_lane_suppress("suggested reply eyes reaction")
+                    confirmation_enabled = False
                 apply_suggested_reply_confirmation(
                     self.telegram,
                     bubble_ids,
                     surface,
-                    getattr(self.config, "suggested_reply_confirmation_enabled", True),
+                    confirmation_enabled,
                     "telegram" if active.message_id > 0 else "node",
                 )
         self.register_suggested_reply(active, parsed_suggested, answer)
@@ -12332,13 +12572,25 @@ class Bridge:
                 flow_mirror_enabled()
                 and ambient_user_turn
             ):
-                self.mirror_ambient_directive(content)
+                if flood_cooldown_active():
+                    log_priority_lane_suppress("ambient directive mirror")
+                else:
+                    self.mirror_ambient_directive(content)
             return
 
         if record_type != "assistant" or message.get("role") != "assistant":
             return
         active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
         if not active:
+            # T-260809-016: 소유권을 잃은(stale release) 뒤 도착한 진짜 최종답장 —
+            # ambient(노드발/cron) 미러와 달리 flow_mirror_enabled() 플래그와 무관하게
+            # 반드시 착지시킨다. 진짜 텔레그램 질문의 답이었음이 user_uuid 로 이미
+            # 확인된 턴만 대상이라, 터미널 직접입력 등 무관한 답변을 잘못 끌어오지 않는다.
+            if message.get("stop_reason") == "end_turn" and record.get("isSidechain") is False:
+                orphan = self.match_orphaned_confirmed_turn(record.get("parentUuid"))
+                if orphan:
+                    self.deliver_orphaned_final_answer(orphan, content)
+                    return
             if record.get("isSidechain") is False:
                 if message.get("stop_reason") == "end_turn":
                     self.finish_ambient_response()
@@ -12351,7 +12603,10 @@ class Bridge:
             # reset whenever an incoming telegram message opens a new active turn.
             if flow_mirror_enabled():
                 if message.get("stop_reason") != "end_turn":
-                    self.mirror_ambient_flow(content)
+                    if flood_cooldown_active():
+                        log_priority_lane_suppress("ambient flow mirror")
+                    else:
+                        self.mirror_ambient_flow(content)
                 else:
                     # ⚠️ 제거 금지 (DO NOT REMOVE) — 비-텔레그램-origin(노드발/cron/노드간)
                     # 작업의 최종 답변을 노드 챗에 미러. 작업흐름 카드(도구 단계)만 뜨고
@@ -12384,7 +12639,9 @@ class Bridge:
             # fully non-fatal: failures here never affect final answer delivery.
             # Edit-in-place: accumulate this turn's steps into ONE growing card
             # (edit the same message) instead of one card per tool-use message.
-            if flow_mirror_enabled():
+            if flow_mirror_enabled() and flood_cooldown_active():
+                log_priority_lane_suppress("flow mirror")
+            elif flow_mirror_enabled():
                 summary = content_tool_summary(content)
                 if summary:
                     candidate = f"{active.flow_body}\n{summary}".strip() if active.flow_body else summary
@@ -12404,7 +12661,10 @@ class Bridge:
                             # T-260727-076: 하트비트 기준점. 도구 이벤트가 낸 렌더도 '갱신'
                             # 이므로, 다음 하트비트는 여기서부터 45초를 센다.
                             active.flow_last_render_at = time.time()
-                            log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
+                            if ids:
+                                log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
+                            else:
+                                log("SEND", f"send-unconfirmed flow mirror nonce={active.nonce}")
                         except Exception as exc:  # noqa: BLE001
                             log("SEND", f"flow mirror send failed (non-fatal): {exc}")
                     else:
@@ -12476,7 +12736,10 @@ class Bridge:
                 )
                 self.ambient_flow_message_id = ids[0] if ids else 0
                 self.ambient_flow_started_at = time.time()  # 종료 카드 소요시간 기준 (T-260721-024)
-                log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
+                if ids:
+                    log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
+                else:
+                    log("SEND", "send-unconfirmed ambient flow")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient flow send failed (non-fatal): {exc}")
         else:
@@ -12547,7 +12810,10 @@ class Bridge:
             # 새 ✅ 카드 대신 이 카드를 edit 해 받은지시→결과를 1장으로 통합한다.
             self.ambient_directive_message_id = ids[0] if ids else 0
             self.ambient_directive_body = body
-            log("SEND", f"sent ambient directive mid={self.ambient_directive_message_id}")
+            if ids:
+                log("SEND", f"sent ambient directive mid={self.ambient_directive_message_id}")
+            else:
+                log("SEND", "send-unconfirmed ambient directive")
         except Exception as exc:  # noqa: BLE001
             self.ambient_directive_message_id = 0
             self.ambient_directive_body = ""
@@ -12676,7 +12942,7 @@ class Bridge:
         else:
             try:
                 delivered = True if not text and copy_content_bubbles else bool(self.telegram.send(format_ambient_final(text)))
-                log("SEND", "sent ambient final")
+                log("SEND", "sent ambient final" if delivered else "send-unconfirmed ambient final")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final send failed (non-fatal): {exc}")
         if delivered:
@@ -12938,6 +13204,9 @@ class Bridge:
         items = sorted(self.progress_items.values(), key=lambda i: i.started_at)
         body = format_progress_board(items, node=self.config.node, emoji=self.config.emoji)
         if not body:
+            return False
+        if flood_cooldown_active():
+            log_priority_lane_suppress("progress board")
             return False
         try:
             if not self.progress_message_id:

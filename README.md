@@ -67,6 +67,7 @@ Optional — flip one switch when you want more:
 | Flow mirror — live card showing each tool step of the current turn | off | `CLB_FLOW_MIRROR=1` | [Optional Settings](#optional-settings) |
 | Suggested-reply bubble — copy-ready follow-up you can tap and send | off | `SUGGESTED_REPLY_BUBBLE=1` | [Optional Settings](#optional-settings) |
 | Suggested-reply auto-send loop — the bridge sends the follow-up for you, inside strict guardrails | off | `CLB_SUGGESTED_LOOP=1` | [Suggested-reply auto-send](#suggested-reply-auto-send-clb_suggested_loop) — read this first |
+| Hold-all — force every suggested reply to wait for your confirm tap, auto-send never fires | off | `CLB_SUGGESTED_HOLD_ALL=1` | [Optional Settings](#optional-settings) |
 | Silent auto-update (upgrade without the button) | off | `CLB_AUTO_UPDATE=1` | `config.example.env` |
 | Update check opt-out | check is on | `CLB_NO_UPDATE_CHECK=1` | `config.example.env` |
 | Native Windows ConPTY transport (experimental) | off | `claude-telegram-bridge setup --transport conpty` | [Quick Start](#quick-start-no-prior-bot-experience-needed) |
@@ -628,6 +629,10 @@ Send `/ping` to the bot, then send a normal prompt.
   tap the confirm button instead. Every candidate is appended to a JSONL
   ledger; if that ledger cannot be written the candidate fails closed to HOLD.
   Read "Suggested-reply auto-send" below before enabling.
+- `CLB_SUGGESTED_HOLD_ALL` - set `1` to force every suggested-reply candidate
+  to a HOLD card (confirm/reject buttons) regardless of its declared class,
+  without turning off the confirm card itself. Off by default. See
+  "Hold-all" under [Suggested-reply auto-send](#suggested-reply-auto-send-clb_suggested_loop).
 
 ### Suggested-reply auto-send (`CLB_SUGGESTED_LOOP`)
 
@@ -674,6 +679,18 @@ on the model's own label, not as a replacement for reading the suggestion.
 - Permanently: unset `CLB_SUGGESTED_LOOP` and restart the bridge.
 
 The loop never arms in group chats.
+
+**Hold-all — keep the confirm card, drop only the auto-fire**
+
+`CLB_SUGGESTED_HOLD_ALL=1` (or `touch ~/.claude/state/claude-suggested-loop.hold-all`
+when the env var is unset - env takes precedence, same precedence order as
+`CLB_FLOW_MIRROR`/`CLB_FLOW_MIRROR_FLAG`) forces every suggested-reply candidate to
+render as a HOLD card with confirm/reject buttons, no matter what class it declares.
+A `class="auto-ok"` candidate never enters the auto-send countdown while this is on -
+only your confirm tap enqueues it. This is a different axis from the kill switch above:
+the kill switch removes the card entirely, hold-all keeps the card and removes only the
+auto-fire. If both are set, the kill switch wins and no card is shown either way. Off
+by default.
 
 ### Advanced settings
 
