@@ -562,7 +562,12 @@ def merge_session_start_hook(
             "hooks": [
                 {
                     "type": "command",
-                    "command": str(hook_file.resolve()),
+                    # Must match the normalization command_targets_hook() uses when
+                    # reading the command back (normalized_hook_path), not Path.resolve().
+                    # resolve() follows symlinks (e.g. macOS /tmp -> /private/tmp) while
+                    # normalized_hook_path() intentionally does not, so mixing the two
+                    # broke idempotent installs/doctor/uninstall on symlinked paths.
+                    "command": normalized_hook_path(hook_file)[1],
                 }
             ]
         }
