@@ -371,6 +371,18 @@ TERMINAL_INPUT_HEADER = "⌨️ 터미널 입력"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
+# ⚠️ 제거 금지 (DO NOT REMOVE) — 최종답변 한도는 ★카드 한도와 다른 자다 (T-260822-062).
+#   실사고 2026-08-22 19:38 작업 노드(사용자 스크린샷 제보 20:25): 노드발/directive 턴의
+#   최종답변이 문장 중간에서 끊기고 뒷부분이 영영 안 왔다. 저널은 `SEND sent ambient final`
+#   1줄뿐이고 에러 0 — 브릿지는 ★정상 발신으로 알고 끝냈다(조용한 유실).
+#   근인 = mirror_ambient_final() 이 답변 본문에 FLOW_MIRROR_LIMIT 를 물렸다. 그 상수는
+#   ⚙️ flow **카드**(도구 단계 요약) 크기이지 **답변** 크기가 아니다. 카드용 자를 답변에
+#   댄 것이다. 계측으로 확정 = 잘린 자리가 본문의 ★정확히 1500번째 글자였다.
+#   ★자를 이유가 애초에 없다 — telegram.send() 가 이미 chunks() 로 쪼갠다(CLB_TG_CHUNK
+#   기본 4096). 그래서 여기는 「표시 한도」가 아니라 ★폭주 방어 상한이고, 값은
+#   sanitize_text 기본값과 같다. 넘으면 sanitize_text 가 절단 표식을 붙여 ★보이게 자른다.
+#   카드는 format_ambient_final() 이 FLOW_MIRROR_LIMIT 로 따로 자르므로 영향 없다.
+AMBIENT_FINAL_LIMIT = 12000
 VOICE_PROMPT_HEADER = "[voice]"
 VOICE_PROMPT_INSTRUCTION = (
     "음성 질문입니다. 2~3문장으로 짧게 한국어로 답하세요. "
@@ -4106,10 +4118,19 @@ def clean_ambient_final_text(text: str) -> str:
     return "\n".join(cleaned).strip()
 
 
-def format_ambient_final(text: str) -> str:
+def format_ambient_final(text: str, limit: int = FLOW_MIRROR_LIMIT) -> str:
     # ⚙️ ambient flow mirror — node-originated work 의 최종 답변(결론) 카드. flow 카드
     # (도구 단계, "작업 흐름")와 구분되는 "✅ 노드 결과" 헤더로 결론임을 표시한다.
-    body = clean_ambient_final_text(text)[:FLOW_MIRROR_LIMIT].strip()
+    #
+    # ⚠️ 제거 금지 (DO NOT REMOVE) — limit 인자가 있는 이유 (T-260822-062).
+    #   이 함수는 두 가지로 쓰인다: ①짧은 **카드** ②실제 **최종답변 발신 본문**(아래
+    #   mirror_ambient_final 의 send 경로들). ②에 카드 크기를 물리면 긴 답의 뒷부분이
+    #   표식·로그 없이 사라진다 — 2026-08-22 19:38 작업 노드 실사고가 정확히 그것이고,
+    #   잘린 자리가 본문의 ★정확히 1500번째 글자였다(계측 확정).
+    #   ★기본값은 카드 크기 그대로다(①의 계약 무손상). ②쪽 호출만 AMBIENT_FINAL_LIMIT 를
+    #   명시로 넘긴다. 자를 이유가 없는 쪽에서만 안 자른다 — telegram.send() 가 이미
+    #   chunks() 로 쪼갠다(CLB_TG_CHUNK 기본 4096).
+    body = clean_ambient_final_text(text)[:limit].strip()
     return f"{AMBIENT_FINAL_HEADER}\n{body}" if body else ""
 
 
@@ -14349,10 +14370,13 @@ class Bridge:
         self.ambient_flow_body = ""
         self.ambient_flow_message_id = 0
         self.ambient_flow_started_at = 0.0
-        # T-260719-078: 추천답변(<추천답변>) 마커는 FLOW_MIRROR_LIMIT truncation 전에
-        # 분리한다. 자율/directive 턴의 최종답변이 1500자를 넘으면 sanitize_text 의
-        # 절단이 꼬리의 마커를 잘라 parse_suggested_reply 가 실패, 추천답변 버블이 매
-        # 자율턴 조용히 드롭됐다(노드 로그 suggested-reply 0회 실측). 본문만 뒤에서 자른다.
+        # T-260719-078: 추천답변(<추천답변>) 마커는 truncation 전에 분리한다. 최종답변이
+        # 한도를 넘으면 sanitize_text 의 절단이 꼬리의 마커를 잘라 parse_suggested_reply 가
+        # 실패, 추천답변 버블이 매 자율턴 조용히 드롭됐다(노드 로그 suggested-reply 0회 실측).
+        # 본문만 뒤에서 자른다.
+        # ★T-260822-062 로 그 한도가 FLOW_MIRROR_LIMIT(1500, 카드 크기) → AMBIENT_FINAL_LIMIT
+        #   (답변 크기)로 바뀌었다. 이 순서 규칙 자체는 그대로 유효하다 — 한도가 커졌을 뿐
+        #   0 이 된 게 아니라서, 폭주 출력에서는 여전히 마커가 꼬리에서 잘릴 수 있다.
         cleaned_final = clean_ambient_final_text(content_text(content))
         surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
         answer_messages = suggested_reply_messages(
@@ -14392,7 +14416,9 @@ class Bridge:
                 return
         except OSError:
             pass
-        text = sanitize_text(answer_messages[0], limit=FLOW_MIRROR_LIMIT)
+        # T-260822-062: 카드 한도(FLOW_MIRROR_LIMIT)가 아니라 답변 한도를 쓴다.
+        #   종전엔 여기서 1500 으로 잘려 긴 답의 뒷부분이 표식·로그 없이 사라졌다.
+        text = sanitize_text(answer_messages[0], limit=AMBIENT_FINAL_LIMIT)
         if not text:
             return
         # T-260812-002: 이 아래 unified-anchor edit 경로(anchor 분기)는 with_emoji_prefix
@@ -14402,7 +14428,7 @@ class Bridge:
         text = self.telegram.guard_korean_prose(text)
         key = hashlib.sha1(text.encode("utf-8")).hexdigest()
         if key == self.ambient_final_last_key:
-            mesh_ledger_record("sendMessage", self.config.chat_id, format_ambient_final(text), result="suppressed")
+            mesh_ledger_record("sendMessage", self.config.chat_id, format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT), result="suppressed")
             return
         self.ambient_final_last_key = key
         copy_content_messages = copy_content_bubble_messages(text, surface)
@@ -14425,12 +14451,12 @@ class Bridge:
                         delivered = True
                         log("SEND", f"sent ambient final as reply to directive root mid={anchor}")
                     else:
-                        delivered = bool(self.telegram.send(format_ambient_final(text)))
+                        delivered = bool(self.telegram.send(format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)))
                         log("SEND", "ambient final reply failed → fallback card send")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final reply failed → fallback send (non-fatal): {exc}")
                 try:
-                    delivered = bool(self.telegram.send(format_ambient_final(text)))
+                    delivered = bool(self.telegram.send(format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)))
                 except Exception as exc2:  # noqa: BLE001
                     log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
             self.ambient_directive_message_id = 0
@@ -14439,7 +14465,7 @@ class Bridge:
             # ⚙️ T-260630-48 — 받은지시 앵커 카드를 결과까지 포함한 1장으로 in-place 통합
             # (새 ✅ 카드 X). 받은지시→노드결과 2장 중복 제거. edit 실패 시 폴백으로 새 카드 send
             # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
-            unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text)}"
+            unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)}"
             try:
                 if (text or not copy_content_bubbles) and not self.telegram.edit(anchor, unified):
                     raise RuntimeError("Telegram editMessageText returned failure")
@@ -14448,14 +14474,14 @@ class Bridge:
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final anchor edit failed → fallback send (non-fatal): {exc}")
                 try:
-                    delivered = bool(self.telegram.send(format_ambient_final(text)))
+                    delivered = bool(self.telegram.send(format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)))
                 except Exception as exc2:  # noqa: BLE001
                     log("SEND", f"ambient final fallback send failed (non-fatal): {exc2}")
             self.ambient_directive_message_id = 0
             self.ambient_directive_body = ""
         else:
             try:
-                delivered = True if not text and copy_content_bubbles else bool(self.telegram.send(format_ambient_final(text)))
+                delivered = True if not text and copy_content_bubbles else bool(self.telegram.send(format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)))
                 log("SEND", "sent ambient final" if delivered else "send-unconfirmed ambient final")
             except Exception as exc:  # noqa: BLE001
                 log("SEND", f"ambient final send failed (non-fatal): {exc}")
