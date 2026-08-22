@@ -20,6 +20,7 @@ except ModuleNotFoundError:  # Native Windows has no POSIX flock implementation.
     fcntl = None  # type: ignore[assignment]
 import hashlib
 import http.client
+import importlib.util
 import json
 import math
 import mimetypes
@@ -48,6 +49,11 @@ try:
     import mesh_approval  # noqa: E402 - 승인 대기함 레지스트리 (renderer spec §7)
 except ModuleNotFoundError:  # Standalone/OSS bridge builds omit internal automation modules.
     mesh_approval = None  # type: ignore[assignment]
+
+try:
+    import mesh_approval_history  # noqa: E402 - 결재방 결정 히스토리 조회 (T-260814-014)
+except ModuleNotFoundError:  # Standalone/OSS bridge builds omit internal automation modules.
+    mesh_approval_history = None  # type: ignore[assignment]
 
 try:
     import send_circuit_breaker  # noqa: E402 - 발신 축 연속실패 차단기 (T-260809-024)
@@ -464,8 +470,83 @@ def flood_cooldown_active(now: float | None = None) -> bool:
     return False
 
 
-def log_priority_lane_suppress(kind: str) -> None:
-    log("SUPPRESS", f"priority lane active — skip {kind} (flood cooldown)")
+# 🚦 priority lane 방아쇠 ② — 발신 예산 잔량 (T-260815-013)
+#
+# 뿌리(사용자 실측 2026-08-15): 추천답변 버블이 폰에 안 와서 사용자가 문구를 손으로
+# 타이핑했다. 로그 = 06:51:27 「★suggested reply bubble FAILED after 3 attempts」,
+# 07:12:17 「recovered on attempt 2」. 사유는 전부 budget_exhausted 이고 그 분의 발신
+# 시도 계수는 12(정확히 상한)·10 이었다 — 간헐이 아니라 ★상시 경계선이다. 턴 1회의
+# 완료 버스트(최종답변 + reasoning mirror + 버블 + mesh cutover + eyes 편집)가 분당
+# 예산을 통째로 채우고, 버블은 버스트의 맨 끝이라 구조적으로 제일 먼저 굶는다.
+#
+# ★근인은 「예산이 작다」가 아니라 「이 레인의 방아쇠가 틀렸다」다. 위 444행 주석이
+# 선언한 이 레인의 의도는 이미 정확하다 — 「장식 발신을 드랍하고 최종답장·추천답변만
+# 시도한다」. 그런데 방아쇠가 flood_cooldown_active() 하나뿐이었다. 그건 429 를 이미
+# 맞은 **사후** 신호다. 버블을 굶기는 것은 그 앞 단계인 예산 잔량인데 레인이 그걸 안
+# 봤다 ⇒ 장식이 예산을 끝까지 먹고 기능성 발신이 남은 것을 못 찾는다.
+#
+# 그래서 예산 게이트를 끄거나 상한을 올리지 않는다(둘 다 밴 방어선을 깎는다). 재시도도
+# 안 늘린다(재시도가 예산을 더 먹어 원인을 키운다). 고치는 것은 ★방아쇠 하나다.
+#
+# 잔량 계산·파일명 규칙은 감속기(T-260808-021)가 소유한다 — 여기서 다시 구현하면
+# 「재는 값」과 「쓰는 값」이 갈라진다. 모듈 부재(OSS 빌드)면 종전 동작 그대로(fail-open).
+_THROTTLE_MODULE_PATH = Path(__file__).resolve().parent / "lib" / "telegram_send_throttle.py"
+try:
+    _throttle_spec = importlib.util.spec_from_file_location(
+        "telegram_send_throttle", _THROTTLE_MODULE_PATH
+    )
+    telegram_send_throttle = importlib.util.module_from_spec(_throttle_spec)  # type: ignore[arg-type]
+    _throttle_spec.loader.exec_module(telegram_send_throttle)  # type: ignore[union-attr]
+except Exception:  # noqa: BLE001 - 모듈 부재·로드 실패는 평시로 (fail-open)
+    telegram_send_throttle = None  # type: ignore[assignment]
+
+# 기능성 발신(최종답변 chunk 들 + 추천답변 버블)이 쓸 몫으로 남겨두는 토큰 수.
+# 4 인 근거 = 실측 버스트에서 기능성은 최종답변(대개 1~3 chunk) + 버블 1 이다.
+DEFAULT_PRIORITY_LANE_RESERVE = 4.0
+
+
+def priority_lane_reserve() -> float:
+    raw = os.environ.get("TELEGRAM_PRIORITY_LANE_RESERVE", "")
+    if not raw:
+        return DEFAULT_PRIORITY_LANE_RESERVE
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return DEFAULT_PRIORITY_LANE_RESERVE
+
+
+def budget_reserve_breached(now: float | None = None) -> bool:
+    """분당 발신 예산의 잔량이 기능성 예비분 밑으로 내려갔는가.
+
+    fail-open 지점 3개 — 전부 「평시」로 떨어진다: 감속기 모듈 부재 / 예비분 0 이하로
+    설정(명시 opt-out) / 버킷 파일 없음(아직 발신 전). 압박 부재를 압박으로 오판하면
+    장식 발신이 영구 억제되므로 의심스러우면 평시가 맞다.
+    """
+    if telegram_send_throttle is None:
+        return False
+    reserve = priority_lane_reserve()
+    if reserve <= 0:
+        return False
+    try:
+        remaining = telegram_send_throttle.budget_min_tokens_remaining(now=now)
+    except Exception:  # noqa: BLE001 - 상태 파일 이상은 평시로
+        return False
+    return remaining is not None and remaining < reserve
+
+
+def priority_lane_active(now: float | None = None) -> bool:
+    """장식 발신이 기능성 발신에 자리를 양보해야 하는 상태.
+
+    ①429 쿨다운(사후 신호) 또는 ②예산 잔량 부족(사전 신호). ②가 T-260815-013 에서
+    추가됐다 — ① 만으로는 「아직 429 는 안 맞았지만 이번 턴 버블이 굶는」 구간을 못 봤다.
+    """
+    return flood_cooldown_active(now) or budget_reserve_breached(now)
+
+
+def log_priority_lane_suppress(kind: str, reason: str = "") -> None:
+    if not reason:
+        reason = "flood cooldown" if flood_cooldown_active() else "send budget reserve"
+    log("SUPPRESS", f"priority lane active — skip {kind} ({reason})")
 
 
 # ⚙️ flow mirror — localize harness tool names to Korean action labels so Claude
@@ -652,6 +733,149 @@ def _sanitize_suggested_inner(reply: str) -> tuple:
     return SUGGESTED_REPLY_ANGLE_RE.split(reply, maxsplit=1)[0].strip(), True
 
 
+# ⚠️ 제거 금지 (DO NOT REMOVE) — T-260815-013 마커 무결성(파서 **입력** 축) 방어.
+#   실사고 2026-08-15 11:03(사용자 스크린샷): 최종답변이 본문에 마커를 raw 로 노출했다.
+#   닫는 태그의 한글 사이에 키릴 `ть` 가 섞였고(`</추ть천답변>`) 같은 메시지에 마커가
+#   ★2개였다. 규격(CLAUDE.md 텔레그램 절)은 마지막 줄에 정확히 1쌍이다.
+#   ★위 CLOSE_RE 는 `</…>` 를 관대하게 절사하므로(T-260719-029) '깨진 닫는 태그가
+#   마지막 줄' 인 모양은 원래도 통과한다 — 작업 노드 실측(구현 전 probe)으로 확인했다.
+#   실제로 raw 태그를 화면에 흘린 것은 **마커 2개** 구조이고(뒤 마커로 파싱이 성공해
+#   앞의 깨진 마커가 body 에 남는다, 로그 0줄), **여는** 태그가 깨지면 matched=False 로
+#   버블이 0이 된다. 세 모양을 여기서 한꺼번에 닫는다.
+#   판정은 블랙리스트(어떤 문자가 섞였나)가 아니라 ★한글 뼈대로 한다 — 태그 이름에서
+#   한글 음절만 남긴 것이 `추천답변` 이면 '마커 의도' 다. 키릴·라틴·제로폭 무엇이 섞여도
+#   같은 판정이 나오고, `<추측답변>`(뼈대가 다르다)은 마커로 오인하지 않는다.
+#   ⚠️ 이 축은 발신 예산(T-260815-013 본류, PR#1777)과 다른 층이다. 예산을 고쳐도
+#   입력이 깨진 이 경로는 계속 샌다 — 두 축을 한 조건으로 접지 말 것.
+SUGGESTED_MARKER_NAME = "추천답변"
+SUGGESTED_MARKER_TAG_SCAN_RE = re.compile(
+    r"<\s*(?P<slash>/?)\s*(?P<name>[^\s<>\r\n]+)(?P<attrs>[^<>\r\n]*)>"
+)
+SUGGESTED_MARKER_HANGUL_RE = re.compile(r"[가-힣]")
+SUGGESTED_MARKER_INTEGRITY_LOG_KEY = "suggested_marker_integrity"
+SUGGESTED_MARKER_BODY_LEAK_LOG_KEY = "suggested_marker_body_leak"
+
+
+def _suggested_marker_skeleton(name: str) -> str:
+    return "".join(SUGGESTED_MARKER_HANGUL_RE.findall(name))
+
+
+def scan_suggested_marker_tags(text: str) -> list:
+    """'마커 의도' 로 보이는 태그를 전부 찾는다. 반환 = [(match, 닫는태그인가, 정확한가)]."""
+    found = []
+    for match in SUGGESTED_MARKER_TAG_SCAN_RE.finditer(text or ""):
+        name = match.group("name")
+        if _suggested_marker_skeleton(name) != SUGGESTED_MARKER_NAME:
+            continue
+        found.append((match, bool(match.group("slash")), name == SUGGESTED_MARKER_NAME))
+    return found
+
+
+def validate_suggested_marker_integrity(text: str) -> tuple:
+    """렌더 직전 무결성 검사. 반환 = grep 가능한 위반코드 튜플(정상이면 빈 튜플).
+
+    마커가 아예 없는 답변은 위반이 아니다 — 대다수 턴이 그렇고, 여기서 시끄러우면
+    다음 사람이 검출기를 끈다(그게 이 방어의 진짜 실패 모드다).
+    """
+    tags = scan_suggested_marker_tags(text)
+    if not tags:
+        return ()
+    violations = []
+    opens = [tag for tag in tags if not tag[1]]
+    closes = [tag for tag in tags if tag[1]]
+    if len(opens) != 1:
+        violations.append(f"marker_count_open={len(opens)}")
+    if len(closes) != 1:
+        violations.append(f"marker_count_close={len(closes)}")
+    for match, _closing, exact in tags:
+        if not exact:
+            violations.append(f"marker_tag_corrupt={match.group(0)}")
+    return tuple(violations)
+
+
+def canonicalize_suggested_markers(text: str) -> tuple:
+    """깨진 마커 **태그 이름만** 정본으로 되돌린다. 반환 = (정규화문, 복원건수).
+
+    attrs(class 선언)와 본문은 한 글자도 건드리지 않는다. 이걸 먼저 통과시키면
+    아래 파서·salvage 기계가 종전 로직 그대로 깨진 마커를 처리한다 — 새 경로 신설 0.
+    """
+    raw = text or ""
+    broken = [tag for tag in scan_suggested_marker_tags(raw) if not tag[2]]
+    if not broken:
+        return raw, 0
+    pieces = []
+    cursor = 0
+    for match, closing, _exact in broken:
+        pieces.append(raw[cursor:match.start()])
+        slash = "/" if closing else ""
+        pieces.append(f"<{slash}{SUGGESTED_MARKER_NAME}{match.group('attrs')}>")
+        cursor = match.end()
+    pieces.append(raw[cursor:])
+    return "".join(pieces), len(broken)
+
+
+def _remove_spans(line: str, spans: list) -> str:
+    """주어진 (start, end) 구간들을 지운 문자열. 겹치거나 붙은 구간은 합쳐서 처리한다."""
+    if not spans:
+        return line
+    merged = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    pieces = []
+    cursor = 0
+    for start, end in merged:
+        pieces.append(line[cursor:start])
+        cursor = end
+    pieces.append(line[cursor:])
+    return "".join(pieces)
+
+
+def _neutralize_leaked_markers(body: str, require_corrupt: bool = False) -> tuple:
+    """본문에 남은 마커를 걷어낸다. 반환 = (정제본문, 걷어낸 문구목록).
+
+    마커는 콘텐츠가 아니라 제어토큰이라 화면에 찍히면 그 자체가 유실이다
+    (T-260728-095 미러 중화와 같은 판단축). 다만 ★산문은 한 글자도 지우지 않는다 —
+    판정을 줄 단위로 두 갈래로 나눈다:
+      · 줄이 **순수 마커 블록**(태그와 그 안쪽 초안 말고는 아무것도 없다)이면 줄째 사라진다.
+        안쪽 문구는 본문 산문이 아니라 추천답변 초안이라, 남기면 그게 곧 노이즈다.
+      · 산문이 섞인 줄이면 **태그만** 벗기고 글자는 전부 보존한다. 어디까지가 인용이고
+        어디부터가 초안인지 단정할 수 없을 때 지우는 쪽으로 기울지 않는다.
+
+    require_corrupt=True 면 **깨진 태그가 섞인 줄만** 손댄다 — 정확한 마커가 꼬리가 아닌
+    곳에 있는 경우는 본문 인용으로 보고 종전대로 통과시켜야 하기 때문이다
+    (renderer fixture suggested_reply_non_tail_marker_is_ignored).
+    """
+    out_lines = []
+    salvaged = []
+    changed = False
+    for line in (body or "").split("\n"):
+        tags = scan_suggested_marker_tags(line)
+        if not tags or (require_corrupt and all(tag[2] for tag in tags)):
+            out_lines.append(line)
+            continue
+        changed = True
+        tag_spans = [[match.start(), match.end()] for match, _c, _e in tags]
+        block_spans = list(tag_spans)
+        for idx, (match, closing, _exact) in enumerate(tags):
+            if closing:
+                continue
+            end = tags[idx + 1][0].start() if idx + 1 < len(tags) else len(line)
+            inner = line[match.end():end].strip()
+            if inner:
+                salvaged.append(inner)
+            block_spans.append([match.end(), end])
+        if _remove_spans(line, block_spans).strip():
+            # 산문이 섞인 줄 — 태그만 벗기고 나머지 글자는 그대로 둔다.
+            out_lines.append(_remove_spans(line, tag_spans).strip())
+        # 순수 마커 블록 줄이면 아무것도 append 하지 않는다(줄째 사라진다).
+    if not changed:
+        return body, []
+    return "\n".join(out_lines).strip(), salvaged
+
+
 SUGGESTED_REPLY_MARKER_TAG_RE = re.compile(r"<\s*/?\s*추천답변(?:\s[^>\r\n]*)?\s*>")
 SUGGESTED_REPLY_MARKER_TAIL_RE = re.compile(r"<\s*/?\s*추천답변[^\r\n]*")
 # T-260728-100: 사고 미러 볼드 평문화. 미러는 parse_mode 없이 sendMessage 로 나가므로
@@ -671,6 +895,34 @@ SUGGESTED_EXCLUSIONS = (
     ("payment", re.compile(r"\b(?:pay|payment|purchase|checkout|wire\s+transfer)\b|결제|구매|송금", re.I)),
     ("external_send", re.compile(r"(?:이메일|메일|문자|메시지|텔레그램|슬랙|카톡|고객|외부|대외|\bdm\b).{0,30}(?:보내|발송|전송|게시|publish|send)|(?:send|publish).{0,30}(?:email|mail|message|post|\bdm\b)|게시\s*(?:해|하|할)|\b(?:email|e-?mail|message|text|dm|forward|share|post|publish|broadcast|notify|send)\b.{0,30}\b(?:customers?|clients?|external|externally|slack|telegram|channels?|recipients?|subscribers?|mailing\s*list|everyone|the\s*team)\b", re.I)),
     ("physical_device", re.compile(r"(?:에어컨|선풍기|조명|전등|정수기|온수매트|스마트홈|가전|실물\s*기기|보일러|도어락|플러그|\btuya\b).{0,30}(?:켜|꺼|끄|작동|제어|급수|토출|실행|on|off)|(?:켜|꺼|끄|작동|제어).{0,30}(?:에어컨|선풍기|조명|전등|정수기|온수매트|스마트홈|가전|보일러|도어락|플러그)|물\s*(?:한\s*잔\s*)?(?:줘|주세요|토출)|\b(?:turn|switch|power|toggle)\s*(?:on|off)?\b.{0,20}\b(?:air\s*condition(?:er|ing)?|ac|fans?|lights?|lamps?|heaters?|boilers?|thermostats?|purifiers?|humidifiers?|plugs?|outlets?|door\s*locks?|smart\s*home|kettles?)\b", re.I)),
+)
+# T-260802-082 — ★권한 오염 차단: 「관문을 세운 그 턴의 추천답변이 그 관문의 답으로
+#   자동발사되어 돌아오는」 경로를 끊는다. 실측 표본 4건이 전부 같은 형태였다 —
+#   본문에서 사람에게 판단을 되돌려 놓고, 그 판단의 답을 스스로 제안해 auto-ok 로 쏜다.
+#   (4번째 표본 2026-08-18 08:46 작업 노드챗: 본문 「붙일지는 형이 정해줘」 → 그 관문의 답이
+#    23초 뒤 suggested:33a96f7e7629 auto_ok_veto_elapsed 로 자동 착지. 사람 탭 아님.)
+#
+#   ★streak cap(T-260817-033)으로는 원리적으로 못 막는다 — 실측 3건 모두 ★첫 발사 1회로
+#   사고가 성립했다. 횟수 축과 직교하므로 별 게이트가 맞다.
+#
+#   ★SUGGESTED_EXCLUSIONS 와 섞지 않는다: 저쪽은 candidate.reply(제안 문구) 스캔이고
+#   이쪽은 candidate.body(그 턴 본문) 스캔이다. 같은 리스트에 넣으면 스캔 대상이 뒤섞인다.
+#
+#   ★표지는 문장 끝 종결형으로 좁힌다. 「주시면·물어·판단이 필요한지」 같은 일상 어절까지
+#   잡으면 과잉 hold 가 되고, 그건 feedback_suggested_reply_hold_on_idle_turns(hold 남용 금지)와
+#   정면 충돌한다. 그래서 re.M + 줄 끝($) 앵커로 ★되돌림 종결형만 인정한다.
+SUGGESTED_BODY_DEFERRAL_MARKERS = (
+    (
+        "body_defers_to_human",
+        re.compile(
+            r"(?:정해|골라|택해|고르)\s*(?:줘|주세요|주십시오|줄래|주라)\s*[.!?~…]*\s*$"
+            r"|(?:되돌립니다|되돌린다|되돌릴게요?|되돌려요)\s*[.!?~…]*\s*$"
+            r"|(?:남겨둡니다|남겨둔다|남겨둘게요?|남깁니다)\s*[.!?~…]*\s*$"
+            r"|판단(?:이|은)?\s*필요(?:합니다|하다|해요|해)\s*[.!?~…]*\s*$"
+            r"|(?:형|사용자)(?:이|가)?\s*(?:정해|골라)\s*(?:줘|주세요)?\s*[.!?~…]*\s*$",
+            re.M,
+        ),
+    ),
 )
 SUGGESTED_REPLY_CLASS_INSTRUCTION = (
     '[SUGGESTED-REPLY CONTRACT] End the final answer with exactly one single-line '
@@ -754,6 +1006,25 @@ def _salvage_suggested_reply(original: str, lines: list) -> SuggestedReply:
 
 
 def parse_suggested_reply(text: str) -> SuggestedReply:
+    """T-260815-013: 깨진 마커 태그 이름을 먼저 정본화하고 종전 파서에 넘긴다.
+
+    정본화가 발동한 건은 구조가 이미 깨진 출력이므로 salvaged 로 표시해
+    classify 가 hold 로 강등하게 한다 — 종전엔 버블이 0이던 경로라 회귀가 아니라
+    순수 개선이고, 방향도 완화가 아니라 조임이다(T-260726-079 와 같은 판단축).
+    """
+    original = text or ""
+    canonical, repaired = canonicalize_suggested_markers(original)
+    if not repaired:
+        return _parse_suggested_reply(original)
+    log("SUGGEST", f"{SUGGESTED_MARKER_INTEGRITY_LOG_KEY} corrupt-tag {repaired}건 "
+                   f"정본화 → hold 강등")
+    parsed = _parse_suggested_reply(canonical)
+    if not parsed.matched:
+        return parsed
+    return SuggestedReply(parsed.body, parsed.reply, parsed.declared_class, True, True)
+
+
+def _parse_suggested_reply(text: str) -> SuggestedReply:
     original = text or ""
     lines = original.rstrip("\r\n").splitlines()
     # T-260726-079: 마커 뒤 공백만 있는 줄이 남으면 마지막 줄 매치가 통째로 빗나간다.
@@ -814,6 +1085,13 @@ def classify_suggested_reply(candidate: SuggestedReply) -> SuggestedDecision:
             return SuggestedDecision("hold", reason)
     if candidate.declared_class == "hold":
         return SuggestedDecision("hold", "assistant_declared_hold")
+    # T-260802-082: 같은 턴 본문이 사람에게 판단을 되돌렸다면, 그 판단의 답을 자동발사하지
+    #   않는다. ★declared_hold 뒤에 두는 이유 = 이미 hold 인 카드까지 이 사유로 덮으면
+    #   원장의 reason 이 「무엇이 막았나」를 흐린다(내가 08-18 에 지적한 cap_reason 축과 같은 함정).
+    #   여기까지 온 카드는 auto-ok 선언분뿐이므로 reason 이 곧 강등 사유다.
+    for reason, pattern in SUGGESTED_BODY_DEFERRAL_MARKERS:
+        if pattern.search(candidate.body or ""):
+            return SuggestedDecision("hold", reason)
     if re.search(r"\b(?:delete|erase|revoke|reset)\b|삭제|폐기|초기화|권한\s*해제", candidate.reply, re.I):
         return SuggestedDecision("hold", "irreversible_or_uncertain")
     return SuggestedDecision("auto-ok", "declared_auto_ok")
@@ -843,10 +1121,38 @@ def should_send_suggested_reply_bubble(
     )
 
 
+def _repair_leaked_body(parsed: SuggestedReply) -> SuggestedReply:
+    """T-260815-013: 파싱이 성공했는데 body 에 마커가 남아 있으면 그건 유실이다.
+
+    규격상 마커는 정확히 1쌍이고 그건 이미 소비됐다 — 그러고도 body 에 남았다면
+    사용자 화면에 제어토큰이 raw 로 찍힌다는 뜻이다(실사고 2026-08-15 11:03).
+    중화하고, 이 턴의 문구가 비어 있으면 잔존 마커에서 폴백 추출한다.
+    구조가 어긋난 출력이므로 salvaged 로 표시해 자동발사까지 이어주지 않는다.
+    """
+    if not parsed.body:
+        return parsed
+    cleaned, stray = _neutralize_leaked_markers(parsed.body)
+    if cleaned == parsed.body:
+        return parsed
+    reply = parsed.reply or (stray[0] if stray else "")
+    log("SUGGEST", f"{SUGGESTED_MARKER_BODY_LEAK_LOG_KEY} body 잔존 마커 중화 "
+                   f"stray={len(stray)} fallback={'yes' if not parsed.reply and reply else 'no'}")
+    return SuggestedReply(cleaned, reply, parsed.declared_class, True, True)
+
+
 def suggested_reply_messages(text: str, enabled: bool, surface: str) -> list[str]:
-    parsed = parse_suggested_reply(text)
+    raw = text or ""
+    violations = validate_suggested_marker_integrity(raw)
+    if violations:
+        log("SUGGEST", f"{SUGGESTED_MARKER_INTEGRITY_LOG_KEY} {' '.join(violations)}")
+    parsed = parse_suggested_reply(raw)
     if not parsed.matched:
-        return [text or ""]
+        # 종전 계약 유지 — 정확한 마커가 꼬리가 아닌 곳에 있으면 본문 인용으로 보고
+        # 손대지 않는다. 다만 ★깨진 태그가 섞인 줄은 제어토큰이 화면에 찍히는 것이라
+        # 중화한다(그 줄만, 산문 무손실).
+        cleaned, _stray = _neutralize_leaked_markers(raw, require_corrupt=True)
+        return [cleaned]
+    parsed = _repair_leaked_body(parsed)
     if not parsed.reply:
         return [parsed.body] if parsed.body else [""]
     if not parsed.body:
@@ -874,7 +1180,10 @@ def suggested_reply_confirmation(
 
 
 APPROVAL_CALLBACK_PREFIX = "mesh-approval"
-APPROVAL_CALLBACK_ACTIONS = ("grant", "hold")
+# "alt" 는 T-260814-015(parent=T-260808-028 ③) 3버튼 확장 — grant/hold 와 달리 판정을
+# 소비하지 않는다. approval_grant_decision() 의 3자 일치 검증(R-A3)은 이 튜플을 통해
+# alt 에도 그대로 적용된다(granted=False 인 valid 판정으로 통과).
+APPROVAL_CALLBACK_ACTIONS = ("grant", "hold", "alt")
 # 방 식별은 chat_id 로만 한다 — 방 이름·아바타는 개명 대상이라 판정 근거가 될 수 없다
 # (renderer spec R-A4, T-260725-043 설계 ack).
 # ⚠️ 제거 금지 (DO NOT REMOVE) — team2 값은 팀방 통합 뒤에도 남긴다 (T-260806-014, 2026-08-06).
@@ -885,6 +1194,33 @@ APPROVAL_CALLBACK_ACTIONS = ("grant", "hold")
 #   통합이 얻는 것은 없고 사람이 이미 받은 카드만 죽는다.
 #   ⇒ 라우팅(어디로 보내나)과 인식(어디서 온 걸 받아주나)은 다른 축이다. 합치지 말 것.
 APPROVAL_TEAM_ROOM_CHAT_IDS = {"team1": -5069144185, "team2": -5128036399}
+
+
+def approval_callback_chat_allowed(chat: dict[str, Any] | None, allowed_user: str) -> bool:
+    """⚠️ 제거 금지 (DO NOT REMOVE) — 승인 콜백 **인식** 면 판정 (T-260818-003).
+
+    라우팅(어디로 보내나)과 인식(어디서 온 걸 받아주나)은 다른 축이다(위 주석).
+    이 함수는 인식 축 전담이고, 뮤트 선언 상태를 **읽지 않는다** — 뮤트를 retired 로
+    되돌려도 이미 DM 에 떠 있는 카드의 버튼은 계속 눌려야 하기 때문이다.
+
+    받아주는 면 2종:
+      · 팀방·결재방 (APPROVAL_TEAM_ROOM_CHAT_IDS) — 종전 그대로. 목록을 줄이면 그 방에
+        이미 떠 있는 카드가 조용히 TOAST_DENIED 가 된다.
+      · 사용자 1:1 DM — 사람 방 뮤트로 카드가 DM 으로 재라우팅되기 때문(T-260818-003).
+        별도 상수가 필요 없다: private chat 은 chat.id == 사람 user_id 다. 즉 넓어지는
+        면은 「사용자 본인과의 1:1」 하나뿐이고, 호출부의 sender 검사가 그대로 남는다.
+    """
+    chat = chat if isinstance(chat, dict) else {}
+    chat_id = str(chat.get("id") or "")
+    if not chat_id:
+        return False
+    if chat_id in {str(value) for value in APPROVAL_TEAM_ROOM_CHAT_IDS.values()}:
+        return True
+    return (
+        str(chat.get("type") or "") == "private"
+        and bool(allowed_user)
+        and chat_id == str(allowed_user)
+    )
 
 
 def approval_grant_decision(
@@ -3237,6 +3573,35 @@ def attachment_text(value: Any) -> str:
     return "\n".join(chunks).strip()
 
 
+# ⚠️ 제거 금지 (DO NOT REMOVE) — queued_command 착지 본문 (T-260816-033 축①).
+#   제어 노드 확정 측정(2026-08-20 01:0x, 표본 nonce clb-a3d74b8a, 재배달 5회): busy 구간에
+#   주입된 프롬프트는 transcript 에 type=user 가 아니라 ★type=attachment /
+#   attachment.type=queued_command 로 착지하고, 원문은 attachment.★prompt 에 담긴다
+#   (22:53 건은 주입 원문과 바이트·해시 완전일치 sha bf0481c6…).
+#   그런데 attachment_text 가 훑는 키는 text/content/body/value 뿐이라 prompt 를 못 본다
+#   ⇒ 본문이 빈 문자열 ⇒ 소비 증거 판정이 통째로 눈이 먼다 ⇒ terminal-fail → 재큐 →
+#   ★같은 원문 중복 배달. 5개 표본 전부 이 모양이었다.
+#   ★attachment_text 자체에 prompt 를 끼워넣지 않는 이유 = 그 함수는 여러 키를 이어붙인다.
+#   text 와 prompt 가 함께 있는 첨부에서는 "text\nprompt" 가 되어 ★기존에 맞던 해시가
+#   깨진다. 그래서 별도 후보로 뽑아 '둘 중 하나라도 일치' 로 본다(무회귀).
+def attachment_prompt_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    prompt = value.get("prompt")
+    if isinstance(prompt, str):
+        return prompt.strip()
+    return attachment_text(prompt) if prompt is not None else ""
+
+
+def attachment_body_candidates(value: Any) -> list[str]:
+    """소비 판정에 쓸 본문 후보 — 기존 경로(attachment_text) 우선, queued_command 보강."""
+    candidates: list[str] = []
+    for text in (attachment_text(value), attachment_prompt_text(value)):
+        if text and text not in candidates:
+            candidates.append(text)
+    return candidates
+
+
 def content_thinking(content: Any) -> str:
     """Extract Claude extended-thinking blocks from an assistant message content.
 
@@ -3263,6 +3628,11 @@ def format_reasoning_mirror(text: str) -> str:
     neutralized = MIRROR_BOLD_RE.sub(r"\1", neutralized)
     body = neutralized.strip()[:REASONING_MIRROR_LIMIT].strip()
     return f"{REASONING_HEADER}\n{body}" if body else ""
+
+
+# T-260818-026: ambient 미러가 이 시간 이상 연속 차단되면 1줄 남긴다(도배 방지 겸 rate-limit).
+#   300s = 정상적인 긴 턴은 넘기고, 「구조적으로 막혔다」만 잡히는 값.
+AMBIENT_MIRROR_BLOCKED_WARN_SEC = float(os.environ.get("CLB_AMBIENT_MIRROR_BLOCKED_WARN_SEC", "300"))
 
 
 def flow_mirror_enabled() -> bool:
@@ -3350,6 +3720,41 @@ _TASK_NOTIFICATION_RE = re.compile(
 #   carrier-<epoch>-<pid>-<random>]". 실측(T-260812-029 세션 자신의 JSONL, 5a030961-
 #   ...jsonl)으로 이 문자열이 user 레코드에 그대로 남는 것을 확인 후 추가했다.
 _DIRECTIVE_CARRIER_RE = re.compile(r"\[directive-carrier nonce:\s*carrier-\d+-\d+-\d+\]")
+
+# ⚠️ 제거 금지 (DO NOT REMOVE) — T-260818-026 (사용자 적발 2026-08-18 19:55·20:25 재적발).
+#   위 두 정규식은 **오케→워커 방향**(지시·완료통지)만 덮는다. 반대 방향인 워커→오케
+#   보고(mac-report.sh 가 오케 REPL 에 paste 하는 페이로드)는 nonce 도 carrier 도
+#   task-notification 도 안 달아서 "마커 없는 순수 cron" 으로 오분류됐다. 그 결과
+#   process_record() 의 최종답변 미러 게이트가 통째로 False → mirror_ambient_final()
+#   에 **도달조차 못 하고** 로그 0줄로 사라진다.
+#   ★실측 = 2026-08-18 17:15~19:55 제어 노드 transcript end_turn 7건 / 폰 착지 0건 / 로그 0줄.
+#   같은 구간 브릿지 경유 입력 턴(20:04:06·20:05:35)은 정상 발신 — 갈림목이 정확히 이것.
+#   식별자는 mac-report.sh:726/735 가 두 분기 모두에서 무조건 찍는 줄이다.
+#   줄 앵커(re.M)를 쓰는 이유 = 본문 중간에 이 문자열을 **언급**한 보고까지 빨아들이면
+#   경계가 아니라 소음이 된다(픽스처 test_title_literal_must_be_line_anchored).
+#   ★닫는 대괄호를 같은 줄에서 요구하지 않는 이유 = 제목에 개행이 든 보고가 실재한다.
+#   실측(노드보고 아카이브 전량 1409건): 닫는 괄호까지 한 줄로 요구하면 73건(5.2%,
+#   전부 2026-06~07 여러 줄 제목)이 샜다. 여는 줄만 앵커하면 1409/1409 다.
+#   mac-report-fragment-guard.py 의 엄격판(닫는 괄호 요구)은 조각 검출용이라 별 축이다.
+_NODE_REPORT_CARRIER_RE = re.compile(r"^\[Mac report title:", re.IGNORECASE | re.MULTILINE)
+
+
+def ambient_final_direct_deliver_kind(text: str) -> str:
+    """이 ambient 재진입이 최종답변 직접발신 대상인가 — 대상이면 갈래 이름, 아니면 "".
+
+    "무엇을 미러하고 무엇을 버리는지" 의 실제 경계가 여기다. 종전에는 이 판정이
+    process_record() 안의 인라인 bool 식이라 픽스처가 걸릴 자리가 없었고, 그래서
+    노드보고 축이 빠진 것을 아무도 못 봤다(T-260818-026). 이름을 준 이유가 그것이다.
+
+    ★확대 금지 — 마커가 하나도 없는 순수 cron/야간 자율워커 재진입은 "" 로 남는다.
+    """
+    if _TASK_NOTIFICATION_RE.search(text):
+        return "task_notification"
+    if _DIRECTIVE_CARRIER_RE.search(text):
+        return "directive_carrier"
+    if _NODE_REPORT_CARRIER_RE.search(text):
+        return "node_report"
+    return ""
 
 
 def progress_board_last_line(text: str) -> str:
@@ -4140,9 +4545,12 @@ def record_contains_nonce(record: dict[str, Any]) -> str | None:
 
 
 def record_attachment_nonce(record: dict[str, Any]) -> str | None:
-    text = attachment_text(record.get("attachment"))
-    match = NONCE_RE.search(text)
-    return match.group(0) if match else None
+    # 봉투 모드(논스가 가시 프롬프트 안)에서는 queued_command 착지분도 논스를 싣는다.
+    for text in attachment_body_candidates(record.get("attachment")):
+        match = NONCE_RE.search(text)
+        if match:
+            return match.group(0)
+    return None
 
 
 def terminal_retry_original_text(text: str) -> str:
@@ -4618,7 +5026,14 @@ class TelegramClient:
     #   (4) 호출부 4곳은 이미 `bubble_ids is None` 을 non-fatal 로 처리하고 있어
     #       새 분기 없이 그대로 재사용된다.
     def send_suggested_reply(self, text: str) -> list[int] | None:
-        """추천답변 버블 발신 — 언어 게이트 실패면 **보내지 않는다**(드롭)."""
+        """추천답변 버블 발신 — 언어 게이트 실패면 **보내지 않는다**(드롭).
+
+        T-260813-025: None 을 돌려주는 이유가 두 가지인데 호출부가 둘을 구분하지 못했다 —
+        ①게이트 드롭(의도된 정책, 다시 보내도 영원히 같은 결과) ②실제 발신 실패(일시적).
+        재시도가 옳은 것은 ②뿐이라 사유를 여기서 기록해 둔다. 값을 읽는 쪽은
+        deliver_suggested_bubble() 하나다.
+        """
+        self.last_suggested_reply_drop_reason = ""
         if text and not korean_gate_passes(text):
             stored_path = store_korean_gate_blocked_text(self.state_dir, self.chat_id, text)
             log(
@@ -4626,6 +5041,7 @@ class TelegramClient:
                 "suggested reply bubble dropped (한국어 부족) "
                 f"len={len(text)} stored={stored_path or 'FAILED'}",
             )
+            self.last_suggested_reply_drop_reason = "korean_gate"
             return None
         return self.send_copy_content(text)
 
@@ -4914,6 +5330,12 @@ class Config:
     suggested_loop_max_iterations: int = 3
     suggested_loop_max_seconds: int = 900
     suggested_loop_max_cost_units: int = 100000
+    # T-260817-033: 사람 발화 없이 연속으로 자동발사할 수 있는 최대 횟수.
+    # 위 3종(iteration/time/cost)은 전부 **턴 체인 스코프**다 — active.loop_iteration 을
+    # 승계해야만 누적되고, active=None 인 마감경로나 체인이 끊긴 재주입에서 1로 리셋된다.
+    # 이 값만 **브릿지 스코프**라 체인이 끊겨도 살아남는다. 리셋 조건은 시간이 아니라
+    # '사람 입력이 들어왔는가' 하나뿐이다.
+    suggested_loop_max_auto_streak: int = 2
     # T-260727-144: superseded 후보를 사람이 탭했을 때 되살릴 수 있는 최대 나이(초).
     # 2시간 = 사용자가 자리를 비우는 일상 단위(식사·이동·외출)는 덮고, 취침 같은 장시간
     # 공백(8시간+)은 일부러 안 덮는 지점 — 밤새 묵은 카드가 아침 탭 한 번으로 되살아나
@@ -4936,6 +5358,10 @@ class Config:
     # (토큰·chat_id 불요) voice 큐만 소비한다 — 폴링·발신 0.
     voice_only: bool = False
     voice_poll_interval: float = 1.0
+    # T-260814-007 axis(a): SIGTERM/SIGINT/SIGHUP 도착 시 턴 진행 중이면 이만큼(초) 안에서만
+    # 경계(active_turn 해제)를 기다린 뒤 멈춘다. systemd/launchd 의 기본 정지 타임아웃보다
+    # 짧게 잡아 SIGKILL 로 강제종료되기 전에 반드시 persist_state() 가 끝나게 한다.
+    shutdown_grace_seconds: float = 8.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -4999,6 +5425,7 @@ class Config:
             injection_verify_timeout=float(env("CLB_INJECTION_VERIFY_TIMEOUT", "20") or "20"),
             send_retry_seconds=float(env("CLB_SEND_RETRY_SECONDS", "5") or "5"),
             send_max_attempts=int_env("CLB_SEND_MAX_ATTEMPTS", 3, minimum=1),
+            shutdown_grace_seconds=float(env("CLB_SHUTDOWN_GRACE_SECONDS", "8") or "8"),
             queue_compact_max_events=int_env("CLB_QUEUE_COMPACT_MAX_EVENTS", 5000, minimum=100),
             outbox_max_entries=int_env("CLB_OUTBOX_MAX_ENTRIES", 2000, minimum=100),
             poll_heartbeat_file=Path(
@@ -5024,6 +5451,7 @@ class Config:
             suggested_loop_max_iterations=int_env("CLB_SUGGESTED_LOOP_MAX_ITERATIONS", 3, minimum=1),
             suggested_loop_max_seconds=int_env("CLB_SUGGESTED_LOOP_MAX_SECONDS", 900, minimum=1),
             suggested_loop_max_cost_units=int_env("CLB_SUGGESTED_LOOP_MAX_COST_UNITS", 100000, minimum=1),
+            suggested_loop_max_auto_streak=int_env("CLB_SUGGESTED_LOOP_MAX_AUTO_STREAK", 2, minimum=1),
             suggested_revive_ttl_seconds=int_env("CLB_SUGGESTED_REVIVE_TTL_SECONDS", 7200, minimum=0),
             suggested_loop_kill_path=Path(env(
                 "CLB_SUGGESTED_LOOP_KILL", "~/.claude/state/claude-suggested-loop.off") or "").expanduser(),
@@ -5409,6 +5837,12 @@ class SuggestedLoopCandidate:
     # 후보인가" 를 재는 유일한 입력이다 — 이 값이 없으면 나이 분포를 못 봐서 TTL 을 못 고친다.
     # 스냅샷(suggested_state_payload)은 veto_pending/hold 만 담으므로 왕복 대상이 아니다.
     superseded_at: float = 0.0
+    # T-260818-010: 이 후보가 실제로 닿은 cap 전건. reason 은 첫 매치 하나만 담는데, 여러
+    # cap 이 동시에 닿으면 원장에는 "무엇이 막았나" 가 아니라 "무엇을 먼저 봤나" 가 남는다
+    # (실측 2026-08-18 candidate a8e76b31cd1e = streak·iteration 동시 도달인데 원장은
+    # auto_streak_cap 단일값). 상한 값 튜닝의 근거가 바로 이 기록이라, 왜곡된 계기로 값을
+    # 만지지 않으려면 닿은 전건이 사후 집계 가능한 형태로 남아야 한다.
+    caps_hit: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -6565,6 +6999,19 @@ class DurableQueue:
         status = record.get("status")
         return str(status) if status else None
 
+    # ⚠️ 제거 금지 (DO NOT REMOVE) — 압축을 넘어 살아남아야 하는 '끈끈한' 필드 (T-260816-033).
+    #   압축은 queue_id 당 ★마지막 레코드 1개만 남긴다. 그런데 재시도·파킹 카운터는 그
+    #   스레드의 ★전체 이력에서 max 로 읽는다(terminal_retry_count / terminal_park_count).
+    #   마지막 레코드가 카운터를 안 싣는 status(stale_released · user_jsonl_seen ·
+    #   sidecar_consumed_seen · dropped …)면 압축이 이력을 통째로 지워 카운터가 0 으로
+    #   되돌아간다. 그러면 재시도 배너가 매번 "1/2" 로 뜨고 상한 2회 가드가 ★영원히 안
+    #   걸린다 — 같은 원문이 무한 재배달될 수 있는 경로다(제어 노드 실측 2026-08-19 01:1x:
+    #   같은 메시지가 2회 중복 배달됐는데 둘 다 "재주입 재시도 1/2").
+    #   카운터를 안 싣는 호출부를 하나씩 고치는 방식은 새 status 가 생길 때마다 다시
+    #   샌다 — 그래서 승계를 ★압축 지점 한 곳에서 보장한다(원칙10: 룰이 아니라 기계).
+    STICKY_MAX_KEYS = ("terminal_retry_count", "park_count")
+    STICKY_TEXT_KEYS = ("terminal_original_text",)
+
     def compact_if_needed(self) -> None:
         if self.max_events <= 0 or not self.path.exists():
             return
@@ -6574,7 +7021,42 @@ class DurableQueue:
             return
         if len(lines) <= self.max_events:
             return
-        last = self.records_by_queue_id()
+        last: dict[str, dict[str, Any]] = {}
+        sticky_max: dict[str, dict[str, int]] = {}
+        sticky_text: dict[str, dict[str, str]] = {}
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or not record.get("queue_id"):
+                continue
+            queue_id = str(record["queue_id"])
+            last[queue_id] = record
+            for key in self.STICKY_MAX_KEYS:
+                try:
+                    value = int(record.get(key) or 0)
+                except (TypeError, ValueError):
+                    continue
+                bucket = sticky_max.setdefault(queue_id, {})
+                if value > bucket.get(key, 0):
+                    bucket[key] = value
+            for key in self.STICKY_TEXT_KEYS:
+                value_text = record.get(key)
+                if isinstance(value_text, str) and value_text.strip():
+                    sticky_text.setdefault(queue_id, {})[key] = value_text
+        for queue_id, record in last.items():
+            for key, value in sticky_max.get(queue_id, {}).items():
+                try:
+                    current = int(record.get(key) or 0)
+                except (TypeError, ValueError):
+                    current = 0
+                if value > current:
+                    record[key] = value
+            for key, value_text in sticky_text.get(queue_id, {}).items():
+                existing = record.get(key)
+                if not isinstance(existing, str) or not existing.strip():
+                    record[key] = value_text
         compacted = sorted(last.values(), key=lambda record: (float(record.get("ts") or 0), str(record.get("queue_id"))))
         tmp = self.path.with_name(self.path.name + ".compact.tmp")
         with tmp.open("w", encoding="utf-8") as handle:
@@ -6769,6 +7251,17 @@ class Outbox:
         with self.lock:
             return key in self.sent
 
+    def status(self, key: str) -> str | None:
+        # T-260814-007 axis(b): contains() 만으론 "sending"(mark_sending 만 찍히고
+        # 프로세스가 재시작/크래시로 mark_sent 를 못 찍은 미확인 발신)과 "sent"(확인된
+        # 발신)를 구분 못 한다 — 호출부가 이 둘을 갈라 판단해야 할 때 쓴다.
+        with self.lock:
+            entry = self.sent.get(key)
+            if isinstance(entry, dict):
+                status = entry.get("status")
+                return status if isinstance(status, str) else None
+            return None
+
     def trim_locked(self) -> None:
         if self.max_entries > 0 and len(self.sent) > self.max_entries:
             ordered = sorted(
@@ -6847,6 +7340,13 @@ def repl_supports_pane_features(repl: Any) -> bool:
 
 
 class Bridge:
+    # T-260818-006 — __new__ 경량 스텁 구제용 클래스 기본값. #1812(T-260817-033)가 신설한
+    # self.suggested_auto_streak 를 suggested_loop_cap_reason 이 읽는데, __init__ 을 건너뛰는
+    # 테스트 스텁(Bridge.__new__(Bridge))에는 그 인스턴스 속성이 없어 AttributeError 로 죽었다.
+    # ★__init__ 의 할당은 그대로 둔다 — 여기 기본값은 스텁용 바닥일 뿐 초기화의 정본이 아니다.
+    #   호출부에 getattr(..., 0) 방어독을 넣지 않는 이유도 같다: 그건 진짜 미초기화 버그를 숨긴다.
+    suggested_auto_streak = 0
+
     def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeReplTransport, token: str) -> None:
         self.config = config
         self.telegram = telegram
@@ -6876,6 +7376,7 @@ class Bridge:
         self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
+        self.ambient_mirror_blocked_log_at = 0.0  # T-260818-026: 침묵 표면화 rate-limit
         # T-260809-016: 소유권을 잃은(stale release) 뒤 도착하는 진짜 최종답장을 위한
         # 임시 보관소 — user_uuid 로 실제 도착이 확인된 턴만 담는다(미확인 주입은 제외,
         # 터미널 직접입력 등 무관한 후속 답변을 잘못 끌어오는 오탐 방지). key = 그 턴의
@@ -6962,6 +7463,12 @@ class Bridge:
         # from an older turn (suggested reply / directive delivery retry).
         self.latest_human_input_at = 0.0
         self.latest_human_update_id = -1
+        # T-260817-033: 사람 입력 이후 연속 자동발사 횟수. 사고(2026-08-17 18:09~18:12)는
+        # 실사용자 발화 0인 채로 auto-ok 카드가 veto 경과 → 자동발사 → 제어 노드 재호출 →
+        # 새 auto-ok 로 1분 주기 핑퐁했다. 턴 체인 예산(iteration)은 체인이 끊기면 1로
+        # 리셋되므로 브레이크가 못 된다 — 이 카운터는 브릿지가 살아 있는 동안 유지되고
+        # 사람 입력에서만 0으로 돌아간다.
+        self.suggested_auto_streak = 0
         self.superseded_queue_ids: set[str] = set()
         # T-260718-046 (a): 재시도 소진된 지시의 하드 드롭 대신 idle-전환 대기 파킹.
         # (item, parked_at) — 장기 generating 턴(40분+)이 재시도 창(3회×~90s)보다 길어
@@ -6982,6 +7489,10 @@ class Bridge:
                 "iteration": candidate.iteration,
                 "started_at": candidate.started_at,
                 "cost_units": candidate.cost_units,
+                # T-260818-010: 닿은 cap 전건. 빈 값은 생략한다 — cap 에 하나도 안 닿은
+                # 건은 reason 이 이미 declared_auto_ok 로 구분해주고, 원장은 append-only 라
+                # 무의미한 키를 매 줄에 실으면 그냥 커지기만 한다.
+                **({"caps_hit": list(candidate.caps_hit)} if candidate.caps_hit else {}),
                 **extra,
             })
             return True
@@ -7093,14 +7604,37 @@ class Bridge:
             log("SUGGEST", f"rehydrated hold candidates restored={restored} dropped_stale={dropped_stale}")
         return restored
 
-    def suggested_loop_cap_reason(self, *, iteration: int, started_at: float, cost_units: int) -> str:
+    def suggested_loop_caps_hit(self, *, iteration: int, started_at: float, cost_units: int) -> list[str]:
+        """닿은 cap 을 **전건** 돌려준다 (T-260818-010).
+
+        cap_reason 은 첫 매치 하나만 돌려주므로 여러 cap 이 동시에 닿으면 뒤엣것이 기록에서
+        사라진다. 그 순서는 판정의 성질이 아니라 코드 작성자가 임의로 정한 것이라, 원장의
+        reason 을 "무엇이 막았나" 로 읽으면 오독이 된다 — 실측(2026-08-18 a8e76b31cd1e)에서
+        streak·iteration 이 동시에 닿았는데 원장에는 앞엣것만 남았다.
+
+        순서는 cap_reason 과 같게 유지한다. `reason == caps_hit[0]` 이 성립해야 기존
+        소비자·픽스처 계약이 한 줄도 안 바뀐다 — 그게 이 설계의 검수 기준이다.
+        """
+        hits: list[str] = []
+        # T-260817-033: 체인 스코프 3종보다 먼저 본다 — 무한 에코는 iteration 이 1로
+        # 리셋된 채로도 성립하므로, 체인을 안 믿는 이 축이 유일한 구조적 브레이크다.
+        if self.suggested_auto_streak >= self.config.suggested_loop_max_auto_streak:
+            hits.append("auto_streak_cap")
         if iteration > self.config.suggested_loop_max_iterations:
-            return "iteration_cap"
+            hits.append("iteration_cap")
         if time.time() - started_at >= self.config.suggested_loop_max_seconds:
-            return "time_cap"
+            hits.append("time_cap")
         if cost_units >= self.config.suggested_loop_max_cost_units:
-            return "cost_cap"
-        return ""
+            hits.append("cost_cap")
+        return hits
+
+    def suggested_loop_cap_reason(self, *, iteration: int, started_at: float, cost_units: int) -> str:
+        # 계약 무변경 — 반환값은 종전과 동일한 "첫 매치 1건" 이다. 판정 로직은 caps_hit
+        # 한 곳에만 두고 여기서는 대표값만 뽑는다(중복 구현 0, 순서 어긋남이 구조적으로 불가).
+        hits = self.suggested_loop_caps_hit(
+            iteration=iteration, started_at=started_at, cost_units=cost_units
+        )
+        return hits[0] if hits else ""
 
     def revive_superseded_candidate(
         self, candidate: SuggestedLoopCandidate
@@ -7184,11 +7718,11 @@ class Bridge:
         iteration = (active.loop_iteration + 1) if active else 1
         started_at = (active.loop_started_at or now) if active else now
         cost_units = active.loop_cost_units if (active and active.loop_cost_units) else max(1, math.ceil(len(answer) / 4))
-        cap_reason = self.suggested_loop_cap_reason(
+        caps_hit = self.suggested_loop_caps_hit(
             iteration=iteration, started_at=started_at, cost_units=cost_units
         )
-        if cap_reason:
-            decision = SuggestedDecision("hold", cap_reason)
+        if caps_hit:
+            decision = SuggestedDecision("hold", caps_hit[0])
         # T-260720-026: 사람이 시작하지 않은 ambient/노드발 마감의 추천답변은 hold 로 고정한다
         # (카드는 띄우되 사용자 확인 필수) — 노드발 턴이 auto-fire 로 후속을 자가 트리거하는 위험 차단.
         if force_hold:
@@ -7210,6 +7744,7 @@ class Bridge:
             iteration=iteration,
             started_at=started_at,
             cost_units=cost_units,
+            caps_hit=caps_hit,
         )
         with self.lock:
             self.suggested_candidates[candidate.candidate_id] = candidate
@@ -7323,6 +7858,16 @@ class Bridge:
         self.queue.append_status(item, "enqueued")
         with self.lock:
             self.pending.append(item)
+            # T-260817-033: 자동발사만 연속 카운트가 오른다. 사람이 '확인하고 실행'을
+            # 누른 발사는 사람이 그 자리에 있다는 증거이므로 0으로 되돌린다 — 발화든
+            # 탭이든 '사람이 개입했다'가 리셋 조건이고, 침묵만이 카운트를 올린다.
+            self.suggested_auto_streak = (self.suggested_auto_streak + 1) if auto_origin else 0
+            streak = self.suggested_auto_streak
+        if auto_origin:
+            log(
+                "SUGGEST",
+                f"auto fire streak={streak}/{self.config.suggested_loop_max_auto_streak}",
+            )
         return True
 
     @staticmethod
@@ -7476,6 +8021,7 @@ class Bridge:
             return 0
         dropped: list[QueueItem] = []
         superseded_candidates: list[SuggestedLoopCandidate] = []
+        broke_streak = 0
         with self.lock:
             if (newer_at, newer_update_id) > (
                 self.latest_human_input_at,
@@ -7483,6 +8029,12 @@ class Bridge:
             ):
                 self.latest_human_input_at = newer_at
                 self.latest_human_update_id = newer_update_id
+                # T-260817-033: 사람 입력 워터마크가 실제로 전진한 그 순간이 유일한
+                # 리셋 지점이다. 호출자 2곳(telegram_human_input / direct_human_input)은
+                # 둘 다 사람 입력 전용이고, 브릿지 자기 주입분은 nonce 매칭에서 먼저
+                # 걸러져 여기 도달하지 않는다 — 그래서 자기 발사로는 리셋되지 않는다.
+                broke_streak = self.suggested_auto_streak
+                self.suggested_auto_streak = 0
             for candidate in self.suggested_candidates.values():
                 if (
                     candidate.status in {"veto_pending", "hold", "dispatching"}
@@ -7518,6 +8070,8 @@ class Bridge:
                 self.superseded_queue_ids.add(active.queue_id)
                 self.active_turn = None
 
+        if broke_streak:
+            log("SUGGEST", f"auto streak reset by {reason} (was {broke_streak})")
         for candidate in superseded_candidates:
             self.suggested_ledger(
                 candidate,
@@ -7688,11 +8242,87 @@ class Bridge:
             self.pending.append(item)
         return True
 
+    def maybe_answer_approval_history(self, message: dict[str, Any]) -> bool:
+        """결재방 '/결정 [N]' 텍스트 명령에 결정 히스토리를 응답한다 (T-260814-014).
+
+        반환 True = 이 메시지를 소비했다(호출자는 unknown-chat drop 을 건너뛴다).
+
+        판정 3중 — 어느 하나라도 아니면 False 로 종전 drop 에 넘긴다(fail-closed):
+          ①chat_id = 결재방 (env TELEGRAM_CHAT_ID_APPROVAL → mesh_send 폴백표, R-A4
+            원칙대로 chat_id 로만 판정 — 방 이름·아바타는 근거가 아니다)
+          ②발신자 = 승인 버튼과 같은 allowlist(ack_veto_allowed_user_id). 미설정 = 전면 불응.
+          ③명령 정확 일치 (mesh_approval_history.parse_command — 산문 오소비 금지)
+
+        격리 계약: 이 경로는 조회 응답만 하고 REPL 에는 아무것도 주입하지 않는다.
+        발신은 카드 마감 edit 와 같은 직접 Bot API 다 (T-260725-078: 버스 경유는 renderer
+        가 그룹 발신을 억제한다). 로그에는 본문·발신자 원문을 남기지 않는다(unknown-chat
+        로그 원칙과 동일). 조회 실패는 브릿지를 죽이지 않는다 — 실패 문구로 물러난다.
+        """
+        if mesh_approval_history is None:
+            return False
+        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        if str(chat.get("id") or "") != str(mesh_approval_history.approval_room_chat_id()):
+            return False
+        allowed_user = str(self.config.ack_veto_allowed_user_id or "")
+        sender = message.get("from") if isinstance(message.get("from"), dict) else {}
+        if not allowed_user or str(sender.get("id") or "") != allowed_user:
+            return False
+        limit = mesh_approval_history.parse_command(message.get("text"))
+        if limit is None:
+            return False
+        try:
+            body = mesh_approval_history.render_history(
+                mesh_approval_history.load_recent_decisions(limit), limit
+            )
+        except Exception as exc:  # noqa: BLE001 — 조회 실패가 수신 루프를 죽이면 안 된다.
+            log("APPROVAL", f"history query failed: {type(exc).__name__}")
+            body = "결정 히스토리 조회 실패 — 브릿지 로그를 확인해 주세요."
+        # group 발신 첫 글자 = 자기 노드 이모지 (헌법 텔레그램 규칙 — DM 규칙과 다르다).
+        reply = f"{self.config.emoji} {body}" if self.config.emoji else body
+        self.telegram.call(
+            "sendMessage",
+            bypass_mesh_cutover=True,
+            chat_id=str(chat.get("id")),
+            text=reply,
+        )
+        log("APPROVAL", f"history query answered n={limit}")
+        return True
+
+    def enqueue_alt_prompt(self, task_id: str, request_id: str) -> bool:
+        """「대안」 버튼 통지를 자기 세션에 1회 주입 (T-260814-015).
+
+        enqueue_approval_prompt 와 같은 레일(QueueItem → queue → pending)이지만 이 요청은
+        판정을 소비하지 않으므로 queue_id 네임스페이스를 분리한다 — grant/hold 주입의
+        dedup(`approval:<request_id>`)과 섞이면 안 된다.
+        """
+        if mesh_approval is None:
+            return False
+        item = QueueItem(
+            queue_id=f"approval-alt:{request_id}",
+            update_id=-int(hashlib.sha256(f"alt:{request_id}".encode("utf-8")).hexdigest()[:12], 16),
+            message_id=0,
+            text=mesh_approval.alt_prompt(task_id, request_id),
+            nonce=bridge_nonce(),
+            received_at=time.time(),
+            source="approval_button",
+            auto_origin=False,
+            suggested_authorization=SUGGESTED_AUTH_HUMAN_CONFIRMED,
+        )
+        self.queue.append_status(item, "received")
+        self.queue.append_status(item, "enqueued")
+        with self.lock:
+            self.pending.append(item)
+        return True
+
     def handle_mesh_approval_callback(self, callback: dict[str, Any]) -> bool:
         """승인 대기함 카드 버튼 (renderer spec §7 R-A2~R-A5, T-260725-066).
 
         승인은 이 경로 하나로만 성립한다 — 판정은 approval_grant_decision, 성립의 정의는
         mesh_approval.decide 의 내구 레코드다. 기록 실패 시 승인 불성립(fail-closed).
+
+        3버튼 확장(T-260814-015, parent=T-260808-028 ③): 「대안」(action=="alt")은 판정을
+        소비하지 않는다 — mesh_approval.record_alt_request() 로 갈라지며 pending 은
+        그대로 열려 있고 카드 버튼도 지우지 않는다. 사용자는 이어서 승인/보류를 누를 수 있다.
         """
         data = str(callback.get("data") or "")
         if not data.startswith(f"{APPROVAL_CALLBACK_PREFIX}::"):
@@ -7715,11 +8345,23 @@ class Bridge:
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         sender = callback.get("from") if isinstance(callback.get("from"), dict) else {}
         chat_id = str(chat.get("id") or "")
+        allowed_user = str(self.config.ack_veto_allowed_user_id or "")
         # R-A4: 방 판정은 chat_id 로만 — 방 개명·아바타 교체와 무관해야 한다.
-        if chat_id not in {str(value) for value in APPROVAL_TEAM_ROOM_CHAT_IDS.values()}:
+        # ⚠️ 제거 금지 (DO NOT REMOVE) — 사용자 1:1 DM 도 승인 면이다 (T-260818-003).
+        #   사람 방 뮤트로 승인 카드가 DM 으로 재라우팅되면, 인식 명단이 방 2개뿐일 때
+        #   그 카드의 버튼이 전부 조용히 TOAST_DENIED 가 된다 = R3 레일 단절.
+        #   ★라우팅(어디로 보내나)과 인식(어디서 온 걸 받아주나)은 다른 축이라(위 주석),
+        #     여기는 뮤트 선언 상태를 읽지 않는다. 뮤트를 retired 로 되돌려도 이 인식은
+        #     남아야 한다 — 이미 DM 에 떠 있는 카드의 버튼이 계속 눌려야 하기 때문이다
+        #     (방 통합 때 옛 방 값을 남긴 것과 같은 이유).
+        #   ★DM 은 별도 상수가 필요 없다: private chat 은 chat.id == 사람 user_id 이고,
+        #     아래 sender 검사가 요구하는 값과 같다. 즉 새로 넓어지는 면은 「사용자 본인과의
+        #     1:1 대화」 하나뿐이고, 아무나 봇에 DM 해도 sender 검사에서 걸린다.
+        #   판정 본체는 approval_callback_chat_allowed() 가 정본이다 — 순수 함수로 떼어
+        #   픽스처가 소스 grep 이 아니라 **행위**로 잰다(test_human_room_mute.sh [6]).
+        if not approval_callback_chat_allowed(chat, allowed_user):
             answer(mesh_approval.TOAST_DENIED)
             return True
-        allowed_user = str(self.config.ack_veto_allowed_user_id or "")
         if not allowed_user or str(sender.get("id") or "") != allowed_user:
             answer(mesh_approval.TOAST_DENIED)
             return True
@@ -7735,6 +8377,31 @@ class Bridge:
         decision = approval_grant_decision("callback", data, pending)
         if not decision["valid"]:
             answer(mesh_approval.TOAST_UNKNOWN)
+            return True
+
+        if decision["action"] == "alt":
+            # 판정을 소비하지 않는 경로 — decide() 를 타지 않는다(카드·pending 불변).
+            try:
+                alt_result = mesh_approval.record_alt_request(
+                    request_id=request_id,
+                    task_id=str((pending or {}).get("task_id") or parts[1]),
+                    actor_user_id=sender.get("id"),
+                    callback_id=callback_query_id,
+                    chat_id=chat_id,
+                    message_id=message.get("message_id"),
+                    requested_at=datetime.now(KST).isoformat(timespec="seconds"),
+                )
+            except Exception as exc:  # noqa: BLE001 - 내구 기록 실패는 fail-closed.
+                log("APPROVAL", f"alt durable record failed: {type(exc).__name__}")
+                answer(mesh_approval.TOAST_FAILED)
+                return True
+            answer(alt_result["toast"])
+            if alt_result["status"] == "alt_requested":
+                # 재누름(alt_already)·already·unknown 경로는 주입하지 않는다 — 1회 통지 계약.
+                self.enqueue_alt_prompt(
+                    str((pending or {}).get("task_id") or parts[1]),
+                    request_id,
+                )
             return True
 
         try:
@@ -7941,15 +8608,16 @@ class Bridge:
                 continue
             if not self.claim_suggested(candidate, "veto_pending", "dispatching"):
                 continue
-            cap_reason = self.suggested_loop_cap_reason(
+            caps_hit = self.suggested_loop_caps_hit(
                 iteration=candidate.iteration,
                 started_at=candidate.started_at,
                 cost_units=candidate.cost_units,
             )
-            if cap_reason:
+            if caps_hit:
                 candidate.status = "hold"
-                candidate.reason = cap_reason
+                candidate.reason = caps_hit[0]
                 candidate.decision = "hold"
+                candidate.caps_hit = caps_hit
                 self.suggested_ledger(candidate, "hold")
                 return False
             if self.config.suggested_loop_kill_path.exists() or candidate.status != "dispatching":
@@ -8041,6 +8709,39 @@ class Bridge:
         if identity:
             payload.update({"dev": identity.dev, "ino": identity.ino, "session_path": str(identity.path)})
         write_json_atomic(self.config.state_path, payload)
+
+    def wait_for_turn_boundary_before_stop(self) -> None:
+        """T-260814-007 axis(a): SIGTERM/SIGINT/SIGHUP 로 이 프로세스가 재시작될 때
+        턴이 진행 중이면 경계(active_turn 해제)까지 짧게 기다린다.
+
+        실사고(2026-08-14 08:2x): 턴 진행 중 브릿지가 재시작돼 그 턴 최종답변이
+        폰에 미착지. 무한 대기는 systemd/launchd 가 결국 SIGKILL 로 끝내버리므로
+        상한(config.shutdown_grace_seconds)을 둔다 — 경계에 못 닿아도 최소한
+        persist_state() 는 반드시 끝낸 뒤 돌아간다. 그래야 다음 프로세스가
+        nonce/pending_outbox_key 로 이어받을 수 있다(axis b 핸드오프 전제).
+        """
+        active = self.active_turn
+        if active is None:
+            self.persist_state()
+            return
+        grace = max(self.config.shutdown_grace_seconds, 0.0)
+        deadline = time.time() + grace
+        log(
+            "STOP",
+            f"turn in progress (queue={active.queue_id[:10]}) — waiting up to {grace}s for a boundary before stop",
+        )
+        while self.active_turn is not None and time.time() < deadline:
+            time.sleep(0.1)
+        if self.active_turn is not None:
+            log(
+                "STOP",
+                f"boundary not reached within {grace}s — persisting pending state for handoff to next process, "
+                f"queue={self.active_turn.queue_id[:10]}",
+            )
+        try:
+            self.persist_state()
+        except Exception as exc:  # noqa: BLE001
+            log("STOP", f"persist_state before stop failed (non-fatal): {exc}")
 
     def load_state_for_identity(self, identity: SessionIdentity, rotated: bool = False) -> None:
         state = read_json(self.config.state_path)
@@ -8305,7 +9006,7 @@ class Bridge:
     def eye_activity_context(self) -> tuple[list[str], int, float]:
         surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
         enabled = bool(getattr(self.config, "activity_eyes_enabled", False))
-        if enabled and flood_cooldown_active():
+        if enabled and priority_lane_active():
             log_priority_lane_suppress("eyes activity card")
             enabled = False
         with self.lock:
@@ -8600,7 +9301,7 @@ class Bridge:
         mirror = format_reasoning_mirror(reasoning)
         if not mirror:
             return
-        if flood_cooldown_active():
+        if priority_lane_active():
             log_priority_lane_suppress(f"reasoning mirror nonce={active.nonce}")
             return
         try:
@@ -8678,6 +9379,31 @@ class Bridge:
             self.repl.invalidate_target_cache()
         log("TURN", f"released active_turn queue={active.queue_id[:10]}: tmux session lost ({detail})")
         return True
+
+    def note_native_queue_progress(self) -> None:
+        """Claude Code 가 우리 프롬프트 중 **하나를** 실제로 집어갔다는 관측 도장 (T-260816-033).
+
+        busy-inject 는 긴 턴 중 여러 건이 native queue 에 쌓이고 Claude 는 순서대로 소비한다.
+        그래서 특정 논스의 attachment 는 앞선 항목이 끝날 때까지 **정상적으로** 늦어진다 —
+        그 대기를 '미전달' 로 오판하면 이미 소유된 프롬프트를 재큐해 중복배달이 된다.
+
+        기존 계기로는 이 구분이 안 됐다: busy_state() 는 active_turn 이 있으면 무조건
+        generating 이라 무용이고, session_occupied_excluding_active() 는 transcript mtime +
+        pane 휴리스틱이라 Claude 가 조용히 생각하는 구간에서 idle 로 읽힌다. 실측(제어 노드
+        2026-08-16 21:08): 21:08:22 에 **다른 논스** clb-e2d4e5b3 의 attachment 가 관측됐는데도
+        35초 뒤 21:08:57 에 clb-f0a3ff21 을 attachment timed out 으로 판정 → 21:08:58 재큐.
+        큐는 멀쩡히 돌고 있었다. 그래서 '큐가 진행 중인가' 를 별도 축으로 둔다.
+
+        런타임 전용(persist 안 함) — 재기동 후엔 0 이라 옛 동작으로 보수적 복귀한다.
+        """
+        self._native_queue_progress_at = time.time()
+
+    def native_queue_progress_recent(self, window: float) -> bool:
+        """window 초 안에 큐 진행(다른 항목의 attachment·소비)이 관측됐는가."""
+        progress_at = getattr(self, "_native_queue_progress_at", 0.0)
+        if progress_at <= 0 or window <= 0:
+            return False
+        return (time.time() - progress_at) < window
 
     def native_queue_wait_expired(self, active: ActiveTurn) -> bool:
         """'큐에 있다' 대기가 상한을 넘겼는가 (T-260726-053).
@@ -9465,6 +10191,7 @@ class Bridge:
             self.queue.append_status(item, "sidecar_consumed_seen", consumed_at=consumed_at)
             self.persist_state()
             self.write_egress_sidecar()
+            self.note_native_queue_progress()  # T-260816-033
             log("JSONL", f"sidecar consumed seen {active.nonce}")
         return True
 
@@ -10273,7 +11000,31 @@ class Bridge:
             return None
         start = max(0, size - window) if window > 0 else 0
         expected_hash = ""
-        reference_at = max(item.received_at, item.native_queue_seen_at)
+        # ── ★시각 가드의 앵커는 재스탬프되지 않는 값이어야 한다 (T-260821-024) ──────
+        # ⚠️ 제거 금지 (DO NOT REMOVE). parent=T-260821-022 ⓑ축.
+        #   종전: reference_at = max(item.received_at, item.native_queue_seen_at)
+        #
+        # ■사고 (제어 노드 mac 2026-08-21, 이중 배달 2건)
+        #   native_queue_seen_at 은 busy-inject **promote 때 다시 찍힌다.** 그런데 mid-turn
+        #   소비는 promote 보다 한참 앞서 일어난다 — 실표본에서 착지 06:19:01 / promote 06:33:51,
+        #   14분 차. max() 로 두면 앵커가 착지보다 뒤로 밀리고, 아래 :11946 의
+        #   `if seen_at + 2.0 < reference_at: continue` 가 ★그 항목 자신의 진짜 착지 레코드를
+        #   건너뛴다. 가드 취지는 「주입 이전의 동일 본문 과거 발화 오매칭 배제」인데,
+        #   앵커가 나중에 재스탬프되는 값이라 취지와 정반대로 작동했다.
+        #   귀결: 06:34:53 failed requeued retry=1/2 → 같은 원문이 「재주입 재시도 1/2」 배너를
+        #   달고 재배달됐다. 실행형 지시였다면 이중 집행이다.
+        #
+        # ■★못 본 이유는 창·본문키·세션이 아니다 (전부 배제 실측, 2026-08-21)
+        #   트랜스크립트 3,857,220B < CLB_TRANSCRIPT_RESCAN_BYTES 기본 4,194,304 → 스캔 시작
+        #   offset=0 이라 레코드는 창 안에 있었다. 본문 키는 attachment.prompt 이고
+        #   attachment_body_candidates 가 T-260816-033 축①로 이미 덮는다. sessionId 도 일치했다.
+        #   남은 게이트는 이 앵커 하나뿐이었다 — 실물 레코드로 A/B/C 삼분 실측:
+        #     A 앵커=max(...)  → None (사고 재현)   B 앵커=received_at → MATCH   C 진짜 과거발화 → None
+        #
+        # ■★가드를 없애지 않는다 = 과매칭은 진짜 유실을 조용히 삼켜 이중 배달보다 나쁘다.
+        #   앵커만 「이 항목이 큐에 들어온 시각」으로 되돌린다. 그 시각보다 앞선 동일 본문은
+        #   여전히 남의 발화로 배제된다(위 C). received_at 이 비는 경로만 종전 값으로 폴백한다.
+        reference_at = item.received_at or item.native_queue_seen_at
         try:
             with binding.transcript_path.open(encoding="utf-8", errors="replace") as fh:
                 if start > 0:
@@ -10310,10 +11061,13 @@ class Bridge:
                         message = record.get("message") if isinstance(record.get("message"), dict) else {}
                         if message.get("role") != "user":
                             continue
-                        body = content_text(message.get("content"))
+                        bodies = [content_text(message.get("content"))]
                     else:
-                        body = attachment_text(record.get("attachment"))
-                    if not body:
+                        # T-260816-033 축①: queued_command 착지분은 본문이 attachment.prompt
+                        # 에 있다. 기존 후보(attachment_text)를 그대로 두고 뒤에 덧붙인다.
+                        bodies = attachment_body_candidates(record.get("attachment"))
+                    bodies = [body for body in bodies if body]
+                    if not bodies:
                         continue
                     # 주입 이전 timestamp 의 동일 본문(과거 중복 발화) 오매칭은 시각 가드로
                     # 배제 — mark_active_sidecar_body_user_seen(T-260710-15)와 동일 규약.
@@ -10322,7 +11076,7 @@ class Bridge:
                         continue
                     if not expected_hash:
                         expected_hash = prompt_sha256(self.sidecar_visible_prompt(item))
-                    if prompt_sha256(body) == expected_hash:
+                    if any(prompt_sha256(body) == expected_hash for body in bodies):
                         return record
         except OSError:
             return None
@@ -10729,6 +11483,11 @@ class Bridge:
             return
         chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
         if str(chat.get("id")) != self.config.chat_id:
+            # 결재방 결정 히스토리 명령 (T-260814-014) — 비DM 텍스트 중 유일한 응답 경로.
+            # 3중(방·발신자·명령 정확 일치) 전부 참일 때만 소비하고, 나머지는 전부 종전
+            # unknown-chat drop 그대로다(fail-closed). REPL 주입은 어느 경우에도 0이다.
+            if self.maybe_answer_approval_history(message):
+                return
             self.note_unknown_chat(update, "chat_not_registered")
             return
         has_location = isinstance(message.get("location"), dict) or isinstance(message.get("venue"), dict)
@@ -12171,6 +12930,24 @@ class Bridge:
                         if self.active_turn and self.active_turn.queue_id == active.queue_id:
                             self.active_turn.injected_at = time.time()
                     return
+                # (1-b) T-260816-033: 큐가 진행 중이면 우리 것은 순서를 기다리는 중이지
+                #     유실이 아니다. busy-inject 는 여러 건이 쌓이고 Claude 가 순서대로
+                #     소비하므로, 앞선 항목의 attachment·소비가 최근에 관측됐다면 이 논스의
+                #     attachment 지연은 정상 대기다. 이 축이 없어서 (2) 의 pane·transcript
+                #     휴리스틱이 idle 로 읽히는 순간 곧장 terminal-fail → 재큐로 갔다
+                #     (제어 노드 실측 2026-08-16 21:08:22 다른 논스 attachment 관측 → 21:08:57
+                #     timed out → 21:08:58 requeue retry=1/2, 같은 로그에 68건).
+                #     ★상한은 그대로다 — 진행이 끊기면 window 를 못 넘겨 아래 판정으로 간다.
+                if self.native_queue_progress_recent(busy_timeout):
+                    with self.lock:
+                        if self.active_turn and self.active_turn.queue_id == active.queue_id:
+                            self.active_turn.injected_at = time.time()
+                    log(
+                        "INJECT",
+                        f"busy-inject nonce {active.nonce} attachment pending; native queue "
+                        f"progressing — extending",
+                    )
+                    return
                 # (2) 세션이 아직 이전 긴 턴을 도는 중이면 enqueue 가 관측된 프롬프트는
                 #     Claude Code native queue 가 보존한다 — 유실이 아니라 대기. 여기서
                 #     terminal-fail 하면 mid-turn 으로 이미 소비된 지시가 재주입돼 중복
@@ -12189,7 +12966,7 @@ class Bridge:
                         return
                     self.active_turn = None
                 self.stop_typing()
-                self.mark_directive_terminal(item, "failed", error="busy-inject native queue attachment not observed")
+                self.mark_directive_terminal(item, "failed", error="busy-inject native queue consumption not observed after attachment")
                 self.persist_state()
                 self.write_egress_sidecar()
                 return
@@ -12376,6 +13153,53 @@ class Bridge:
             cursor = self.parent_map.get(cursor)
         return None
 
+    def deliver_suggested_bubble(self, text: str, *, context: str) -> list[int] | None:
+        """추천답변 버블 발신 단일 통로 — 실패를 조용히 삼키지 않는다 (T-260813-025).
+
+        뿌리(사용자 실측 2026-08-15 00:2x): 작업 노드 보고 턴에서 **최종답변 버블은 착지했는데
+        추천답변 버블만 미착지**했다. 터미널에는 태그가 있었다. 기지 선례 = 8/13 00:11
+        「suggested reply bubble failed (non-fatal)」 — 호출부 4곳이 전부 None 을 한 줄 로그로
+        삼키고 끝냈다. 최종답변에는 outbox+재시도+대타중계 레일이 있는데 버블에는 아무것도 없었다.
+
+        ★두 종류의 None 을 가른다. 이게 이 함수의 요점이다:
+          · 한국어 게이트 드롭 = **정책이 의도한 결과**다. 다시 보내도 영원히 같고, 이미
+            KO-GATE 로그 + 원문 적재로 표면화돼 있다 → 재시도하지 않는다(같은 문장을
+            3번 두드려도 게이트는 3번 막는다).
+          · 발신 실패 = 일시적일 수 있다 → 최종답변과 **같은 knob**(config.send_max_attempts)으로
+            제한 재시도하고, 그래도 실패하면 장부에 result=failed 로 남긴다.
+            로그만으로는 아무도 안 본다 — 최종답변 실패가 장부에 남는 것과 같은 표면이어야 한다.
+
+        재구현 0: 재시도 횟수는 기존 send_max_attempts, 표면화는 기존 mesh_ledger_record 를 쓴다.
+        """
+        if not text:
+            return None
+        attempts = max(1, int(getattr(self.config, "send_max_attempts", 3)))
+        backoff = float(getattr(self.config, "suggested_bubble_retry_backoff", 1.0))
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                bubble_ids = self.telegram.send_suggested_reply(text)
+            except Exception as exc:  # noqa: BLE001
+                bubble_ids, last_exc = None, exc
+            if bubble_ids:
+                if attempt > 1:
+                    log("SEND", f"suggested reply bubble recovered on attempt {attempt} ({context})")
+                return bubble_ids
+            if getattr(self.telegram, "last_suggested_reply_drop_reason", "") == "korean_gate":
+                log("SEND", f"suggested reply bubble dropped by 한국어 게이트 — 재시도 안 함 ({context})")
+                return None
+            if attempt < attempts:
+                log("SEND", f"suggested reply bubble send failed; retry attempt={attempt} ({context})")
+                if backoff > 0:
+                    time.sleep(backoff)
+        detail = f" exc={last_exc}" if last_exc else ""
+        log("SEND", f"★suggested reply bubble FAILED after {attempts} attempts ({context}){detail}")
+        try:
+            mesh_ledger_record("sendMessage", self.config.chat_id, text, result="failed")
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"suggested bubble failure ledger record failed (non-fatal): {exc}")
+        return None
+
     def deliver_orphaned_final_answer(self, orphan: dict[str, Any], content: Any) -> None:
         """T-260809-016 — 소유권을 잃은 뒤 도착한 진짜 최종답장을 착지시킨다. ambient
         미러(flow_mirror_enabled() 게이트 뒤, 노드챗 대상)와는 다른 축이다 — 이건 진짜
@@ -12412,10 +13236,11 @@ class Bridge:
             log("SEND", f"sent orphaned final answer mid={ids[0]}")
             mesh_ledger_record("sendMessage", self.config.chat_id, delivered, result="sent")
             if suggested_reply:
-                bubble_ids = self.telegram.send_suggested_reply(suggested_reply)
-                if bubble_ids is None:
-                    log("SEND", "suggested reply bubble failed after orphaned final answer (non-fatal)")
-                else:
+                # T-260813-025: 단일 통로 경유 — 실패는 재시도·장부 표면화까지 그 안에서 끝난다.
+                bubble_ids = self.deliver_suggested_bubble(
+                    suggested_reply, context="orphaned final answer"
+                )
+                if bubble_ids:
                     apply_suggested_reply_confirmation(
                         self.telegram,
                         bubble_ids,
@@ -12537,6 +13362,7 @@ class Bridge:
             return False
         self.persist_state()
         self.write_egress_sidecar()
+        self.note_native_queue_progress()  # T-260816-033
         log("JSONL", f"attachment nonce seen {nonce}")
         return True
 
@@ -12671,6 +13497,7 @@ class Bridge:
             return False
         self.persist_state()
         self.write_egress_sidecar()
+        self.note_native_queue_progress()  # T-260816-033
         log("JSONL", f"native queue attachment seen {nonce}")
         return True
 
@@ -12712,6 +13539,10 @@ class Bridge:
             return
         if not claim:
             return
+        # T-260814-007 axis(b): nonce/pending_outbox_key 를 실제 네트워크 호출 전에 디스크로
+        # 밀어둔다 — 이 시점 이후 프로세스가 재시작/크래시해도 다음 프로세스가 state.json 의
+        # active_turn 을 복원해 claim_retry_send_attempt() 로 이어받을 수 있다(핸드오프).
+        self.persist_state()
         self.send_claimed_active_answer(active, assistant_uuid, answer, claim)
 
     def claim_send_attempt(self, active: ActiveTurn, assistant_uuid: str, answer: str) -> str | None:
@@ -12721,8 +13552,14 @@ class Bridge:
             if active.send_in_progress:
                 return None
             key = answer_outbox_key(active.nonce, assistant_uuid, answer)
-            if self.outbox.contains(key):
+            outbox_status = self.outbox.status(key)
+            if outbox_status == "sent":
                 return "outbox_sent"
+            if outbox_status == "sending":
+                # T-260814-007 axis(b)/(c): 이전 프로세스가 mark_sending() 뒤 재시작/크래시로
+                # mark_sent() 를 못 찍고 죽은 흔적 — 착지 미확인이므로 delivered 로 취급하지
+                # 않고 재발신을 밟는다(전송 성공 stdout ≠ 착지).
+                log("SEND", f"outbox key {key[:10]} left in 'sending' state (no delivery confirmation) — retrying instead of treating as delivered")
             active.assistant_uuid = assistant_uuid
             active.pending_answer = answer
             active.pending_assistant_uuid = assistant_uuid
@@ -12745,8 +13582,13 @@ class Bridge:
             answer = active.pending_answer
             assistant_uuid = active.pending_assistant_uuid
             key = answer_outbox_key(active.nonce, assistant_uuid, answer)
-            if self.outbox.contains(key):
+            outbox_status = self.outbox.status(key)
+            if outbox_status == "sent":
                 return "outbox_sent", active, answer
+            if outbox_status == "sending":
+                # T-260814-007 axis(b)/(c): claim_send_attempt 와 동일한 이유 — 재기동 뒤
+                # 첫 retry_pending_send() 틱에서 이 갈래를 가장 자주 밟는다(핸드오프 지점).
+                log("SEND", f"outbox key {key[:10]} left in 'sending' state (no delivery confirmation) — retrying instead of treating as delivered")
             active.assistant_uuid = assistant_uuid
             active.pending_outbox_key = key
             active.send_attempts += 1
@@ -12910,13 +13752,13 @@ class Bridge:
             return
 
         if suggested_reply:
-            bubble_ids = self.telegram.send_suggested_reply(suggested_reply)
-            if bubble_ids is None:
-                log("SEND", "suggested reply bubble failed after final answer (non-fatal)")
-            else:
+            # T-260813-025: 정상 최종답변 뒤의 버블도 단일 통로로 — 이 자리가 사용자 실측
+            # (2026-08-15 00:2x, 최종답변만 착지하고 추천답변 미착지)이 난 바로 그 경로다.
+            bubble_ids = self.deliver_suggested_bubble(suggested_reply, context="final answer")
+            if bubble_ids:
                 sent_ids.extend(bubble_ids)
                 confirmation_enabled = getattr(self.config, "suggested_reply_confirmation_enabled", True)
-                if confirmation_enabled and flood_cooldown_active():
+                if confirmation_enabled and priority_lane_active():
                     log_priority_lane_suppress("suggested reply eyes reaction")
                     confirmation_enabled = False
                 apply_suggested_reply_confirmation(
@@ -12979,6 +13821,9 @@ class Bridge:
         if not claim:
             return
         active, assistant_uuid, answer, key = claim
+        # T-260814-007 axis(b): send_active_answer 와 같은 이유 — 재시도마다 새 key/attempt
+        # 를 다시 디스크에 앵커한다.
+        self.persist_state()
         self.send_claimed_active_answer(active, assistant_uuid, answer, key)
 
     def process_record(self, record: dict[str, Any]) -> None:
@@ -13068,9 +13913,17 @@ class Bridge:
                 #   지시 → 워커 응답)도 같은 이유로 직접발신 대상이다. carrier nonce 리터럴이
                 #   없는 순수 cron/야간워커 재진입은 여전히 아래 두 정규식 모두 불일치라 False
                 #   로 남는다 — 무분별 확대가 아니라 "사람 지시" 갈래 하나만 여는 것.
-                self.ambient_final_direct_deliver = bool(
-                    _TASK_NOTIFICATION_RE.search(content_text(content))
-                    or _DIRECTIVE_CARRIER_RE.search(content_text(content))
+                # T-260818-026: 세 번째 경계 축 = 워커→오케 노드보고(mac-report). 판정은
+                #   ambient_final_direct_deliver_kind() 한 곳으로 모았다 — 인라인 bool 식일
+                #   때는 빠진 갈래가 있어도 픽스처가 걸릴 자리가 없었다.
+                kind = ambient_final_direct_deliver_kind(content_text(content))
+                self.ambient_final_direct_deliver = bool(kind)
+                # ⚠️ 제거 금지 (DO NOT REMOVE) — 이 1줄이 없어서 8/18 유실 7턴이 무증상이었다.
+                #   ambient 턴당 1줄이라 폴링 주기와 무관하게 상한이 턴 수다(도배 아님).
+                log(
+                    "JSONL",
+                    f"ambient turn direct-deliver={kind or 'no'}"
+                    + ("" if kind else " (최종답변은 폰에 안 간다 — 마커 없는 재진입)"),
                 )
             # ⚙️ ambient flow mirror — node-originated incoming directive (다른 노드/오케가
             # 주입한 트리거 프롬프트). 텔레그램 active turn 도 nonce 도 없는 user 레코드 =
@@ -13083,7 +13936,7 @@ class Bridge:
                 flow_mirror_enabled()
                 and ambient_user_turn
             ):
-                if flood_cooldown_active():
+                if priority_lane_active():
                     log_priority_lane_suppress("ambient directive mirror")
                 else:
                     self.mirror_ambient_directive(content)
@@ -13126,7 +13979,7 @@ class Bridge:
             if flow_mirror_enabled() or mirror_final_direct:
                 if message.get("stop_reason") != "end_turn":
                     if flow_mirror_enabled():
-                        if flood_cooldown_active():
+                        if priority_lane_active():
                             log_priority_lane_suppress("ambient flow mirror")
                         else:
                             self.mirror_ambient_flow(content)
@@ -13170,7 +14023,7 @@ class Bridge:
             # fully non-fatal: failures here never affect final answer delivery.
             # Edit-in-place: accumulate this turn's steps into ONE growing card
             # (edit the same message) instead of one card per tool-use message.
-            if flow_mirror_enabled() and flood_cooldown_active():
+            if flow_mirror_enabled() and priority_lane_active():
                 log_priority_lane_suppress("flow mirror")
             elif flow_mirror_enabled():
                 # T-260812-002: 이 조각은 growing-edit 분기(self.telegram.edit)로 카드에
@@ -13460,6 +14313,27 @@ class Bridge:
         # 사각 차단. issue: 2026-06-27-bridge-flow-mirror-final-report-missed.
         # Non-fatal; never affects message delivery. Only emits when no active turn.
         if self.active_turn:
+            # ⚠️ 제거 금지 (DO NOT REMOVE) — T-260818-026 (사용자 적발 2026-08-18 19:55).
+            #   이 조기 반환은 정상 동작이다(소유턴이 있으면 ambient 미러는 돌지 않는다).
+            #   문제는 **로그가 한 줄도 없다는 것**이었다. active_turn 이 오래 붙잡히면 그동안
+            #   비소유턴(노드발·cron·mac-report)의 최종답변이 통째로 유실되는데, 그 유실이
+            #   무증상이라 사람이 볼 방법이 없었다 — 2026-08-18 17:15~19:55 실측 = 그 구간
+            #   제어 노드 transcript 에 end_turn 7건이 찍혔는데 폰 착지 0건, 브릿지 로그 0줄.
+            #   ★행위 불변(반환은 그대로). 오래 막힌 경우에만 1줄 남긴다.
+            held = time.time() - float(getattr(self.active_turn, "injected_at", 0.0) or 0.0)
+            now_ts = time.time()
+            if (
+                held >= AMBIENT_MIRROR_BLOCKED_WARN_SEC
+                and now_ts - self.ambient_mirror_blocked_log_at >= AMBIENT_MIRROR_BLOCKED_WARN_SEC
+            ):
+                self.ambient_mirror_blocked_log_at = now_ts
+                log(
+                    "STALE",
+                    "ambient final 미러 차단 "
+                    f"{int(held)}s — active_turn 점유 queue={self.active_turn.queue_id} "
+                    f"nonce={self.active_turn.nonce} "
+                    "(이 구간 비소유턴 최종답변은 폰에 안 간다)",
+                )
             return
         # F9 (T-260705-04): ambient(디렉티브/mac-report) 턴 종료 지점 — typing 명시 소등.
         # 기존엔 finish_active_turn(브릿지가 주입한 턴)만 stop_typing 을 불러, drain_queue
@@ -13496,10 +14370,10 @@ class Bridge:
             if os.path.exists(suppress) and (time.time() - os.path.getmtime(suppress)) < 90:
                 if suggested_reply:
                     try:
-                        bubble_ids = self.telegram.send_suggested_reply(suggested_reply)
-                        if bubble_ids is None:
-                            log("SEND", "suggested reply bubble failed during ambient suppression (non-fatal)")
-                        else:
+                        bubble_ids = self.deliver_suggested_bubble(
+                            suggested_reply, context="ambient suppression"
+                        )
+                        if bubble_ids:
                             apply_suggested_reply_confirmation(
                                 self.telegram,
                                 bubble_ids,
@@ -13593,10 +14467,8 @@ class Bridge:
                     log("SEND", "copy-content bubble failed after ambient final (non-fatal)")
                     break
         if delivered and suggested_reply:
-            bubble_ids = self.telegram.send_suggested_reply(suggested_reply)
-            if bubble_ids is None:
-                log("SEND", "suggested reply bubble failed after ambient final (non-fatal)")
-            else:
+            bubble_ids = self.deliver_suggested_bubble(suggested_reply, context="ambient final")
+            if bubble_ids:
                 apply_suggested_reply_confirmation(
                     self.telegram,
                     bubble_ids,
@@ -13851,7 +14723,7 @@ class Bridge:
         body = format_progress_board(items, node=self.config.node, emoji=self.config.emoji)
         if not body:
             return False
-        if flood_cooldown_active():
+        if priority_lane_active():
             log_priority_lane_suppress("progress board")
             return False
         try:
@@ -14131,6 +15003,10 @@ class Bridge:
 
 def handle_stop_signal(bridge: Bridge, signum: int) -> None:
     bridge.stop_event.set()
+    # T-260814-007 axis(a): stop_event 를 먼저 세워 폴링 루프가 새 작업을 더 안 집게 막고,
+    # 이미 진행 중인 턴이 있으면 경계까지 bounded 로 기다린 뒤(axis b 핸드오프용 persist
+    # 포함) 정리한다.
+    bridge.wait_for_turn_boundary_before_stop()
     reap_inflight_mesh_send_children()
     bridge.release_lock()
     raise SystemExit(0)

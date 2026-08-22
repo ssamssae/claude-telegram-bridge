@@ -653,9 +653,17 @@ so read the guardrails before setting `CLB_SUGGESTED_LOOP=1`.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CLB_SUGGESTED_LOOP_VETO_SECONDS` | `20` | cancel window, clamped to 15-30 |
-| `CLB_SUGGESTED_LOOP_MAX_ITERATIONS` | `3` | consecutive auto-sends |
+| `CLB_SUGGESTED_LOOP_MAX_ITERATIONS` | `3` | consecutive auto-sends *within one turn chain* |
 | `CLB_SUGGESTED_LOOP_MAX_SECONDS` | `900` | wall-clock budget per loop |
 | `CLB_SUGGESTED_LOOP_MAX_COST_UNITS` | `100000` | rough output-size budget |
+| `CLB_SUGGESTED_LOOP_MAX_AUTO_STREAK` | `2` | auto-sends since the last **human** input |
+
+The first three caps are scoped to a turn chain: they ride on `loop_iteration`,
+which resets to `1` whenever the chain breaks (non-standard finalize paths hand
+`register_suggested_reply` an `active=None`). `MAX_AUTO_STREAK` is scoped to the
+bridge process instead, so a broken chain cannot launder the budget — it only
+returns to `0` when a human actually speaks (Telegram message or a direct
+terminal prompt) or taps **확인하고 실행**. T-260817-033.
 
 **Content exclusions.** Even when an answer claims `auto-ok`, the bridge
 re-reads the suggestion text and forces HOLD when it looks like a main merge, an
