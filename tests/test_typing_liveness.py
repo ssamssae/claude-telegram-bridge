@@ -37,6 +37,7 @@ class TypingLivenessTest(unittest.TestCase):
         bridge.active_turn = None
         bridge.pending = []
         bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = True  # T-260829-029: 착지 예정 턴만 typing 대상
         # (frames, reply_to, initial_delay) — 3번째는 T-260730-002 지속 국면에서 추가됐다.
         bridge.eye_activity_context = lambda: ([], 0, 0.0)
         bridge.session_occupied_excluding_active = mock.Mock(return_value=True)
@@ -89,6 +90,7 @@ class TypingLivenessTest(unittest.TestCase):
         bridge.active_turn = None
         bridge.pending = []
         bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = True  # T-260829-029
         bridge.repl = SimpleNamespace(
             supports_pane_features=True,
             capture_pane=lambda _lines: "✻ Working…\nesc to interrupt",
@@ -96,6 +98,90 @@ class TypingLivenessTest(unittest.TestCase):
 
         self.assertTrue(bridge.has_live_typing_work())
         self.assertTrue(bridge.ambient_response_active)
+
+    def test_nondeliverable_ambient_turn_is_not_typing_tracked(self):
+        """T-260829-029: 폰에 최종답변이 안 가는 ambient 턴(마커 없는 재진입 —
+        순수 자율작업·cron·워크플로우·백그라운드 에이전트)은 '입력중'을 켜지 않는다.
+
+        ★변이 프로브 = has_typing_tracked_work/has_live_typing_work 의
+        ambient_typing_eligible() 게이트를 옛 `self.ambient_response_active` 단독으로
+        되돌리면 이 테스트가 FAIL 한다 (2026-08-29 유령 입력중 실사고 — drain 3s 가
+        typing 을 상시 재점화, 착지 0통에 폰엔 '입력중'만 하루 종일).
+        capture_pane 이 호출되면 즉시 FAIL — 판정은 pane 이전에 끝나야 한다."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        bridge.pending = []
+        bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = False
+
+        def _fail_capture(_lines):
+            raise AssertionError("non-deliverable ambient must not reach pane capture")
+
+        bridge.repl = SimpleNamespace(
+            supports_pane_features=True,
+            capture_pane=_fail_capture,
+        )
+
+        self.assertFalse(bridge.has_typing_tracked_work())
+        self.assertFalse(bridge.has_live_typing_work())
+
+    def test_drain_busy_does_not_relight_typing_for_nondeliverable_ambient(self):
+        """T-260829-029 점화 경로 픽스처: busy(generating) 중 drain_queue 는
+        비착지 ambient 만 있으면 ensure_typing 대신 stop_typing 을 불러야 한다."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        bridge.pending = []
+        bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = False
+        bridge.suggested_loop_runtime_enabled = True
+        bridge.config = SimpleNamespace(suggested_loop_kill_path=Path("/nonexistent"))
+        bridge.repl = SimpleNamespace(supports_pane_features=True)
+        bridge.drop_pending_suggested_auto = mock.Mock()
+        bridge.session_clear_pending = mock.Mock(return_value=False)
+        bridge.dismiss_feedback_survey_if_pending = mock.Mock(return_value="none")
+        bridge.busy_state = mock.Mock(return_value="generating")
+        bridge.try_busy_inject = mock.Mock(return_value=False)
+        bridge.ensure_typing = mock.Mock()
+        bridge.stop_typing = mock.Mock()
+        bridge.exhaust_parked = []
+        bridge.last_nonidle_seen_at = 0.0
+
+        bridge.drain_queue()
+
+        bridge.ensure_typing.assert_not_called()
+        bridge.stop_typing.assert_called_once_with()
+
+    def test_drain_busy_keeps_typing_for_deliverable_ambient(self):
+        """T-260829-029 무회귀 짝: 착지 예정(ambient_final_direct_deliver=True) 턴은
+        종전대로 busy 구간에서 ensure_typing 이 유지된다 (2026-06-27 사용자 요청 계보)."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        bridge.pending = []
+        bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = True
+        bridge.suggested_loop_runtime_enabled = True
+        bridge.config = SimpleNamespace(suggested_loop_kill_path=Path("/nonexistent"))
+        bridge.repl = SimpleNamespace(supports_pane_features=True)
+        bridge.drop_pending_suggested_auto = mock.Mock()
+        bridge.session_clear_pending = mock.Mock(return_value=False)
+        bridge.dismiss_feedback_survey_if_pending = mock.Mock(return_value="none")
+        bridge.busy_state = mock.Mock(return_value="generating")
+        bridge.try_busy_inject = mock.Mock(return_value=False)
+        bridge.ensure_typing = mock.Mock()
+        bridge.stop_typing = mock.Mock()
+        bridge.exhaust_parked = []
+        bridge.last_nonidle_seen_at = 0.0
+
+        bridge.drain_queue()
+
+        bridge.ensure_typing.assert_called_once_with()
+        bridge.stop_typing.assert_not_called()
 
     def test_top_level_end_turn_explicitly_stops_ambient_typing(self):
         mod = load_bridge_module()
