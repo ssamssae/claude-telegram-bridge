@@ -711,3 +711,7 @@ of `config.example.env`.
 ## Release Checklist
 
 See `RELEASE_CHECKLIST.md` before publishing a fork or release.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
