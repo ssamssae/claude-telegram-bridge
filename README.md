@@ -1,5 +1,7 @@
 # Claude Telegram Bridge
 
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/claude-telegram-bridge/) · [Web verification](docs/feature-map.md)
+
 Control an already-running interactive Claude Code session from Telegram.
 
 This bridge polls Telegram, pastes incoming messages into a visible tmux Claude
