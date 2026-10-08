@@ -8,8 +8,7 @@ This bridge polls Telegram, pastes incoming messages into a visible tmux Claude
 Code pane, tails Claude transcript JSONL, and sends only the matching final
 answer back to Telegram.
 
-The bridge is Claude-specific. It is not a general multi-AI bridge and it does
-not share runtime code with the Codex Telegram Bridge.
+The bridge is Claude-specific. It is not a general multi-AI bridge and it keeps its own sessions and credentials.
 
 ## 5-Minute Quick Start
 
@@ -714,6 +713,13 @@ of `config.example.env`.
 
 See `RELEASE_CHECKLIST.md` before publishing a fork or release.
 
-## Contributing
+## Interface language
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Use `/language en` or `/language ko` in your configured Telegram chat; `/language`
+shows the current setting. The selection persists after restart. Public installs
+default to English. Bridge instructions, notices and controls are localized;
+your prompts, AI answers, option text and model identifiers remain unchanged.
+
+For the initial setting, use `CLB_LANGUAGE=en` or `CLB_LANGUAGE=ko`.
+The setup wizard also accepts `setup --language ko`.
+See [language settings and verification](docs/i18n.md) for precedence and coverage.

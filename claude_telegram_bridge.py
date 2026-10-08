@@ -48,6 +48,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_flow_progress as _flow_progress  # noqa: E402
+from bridge_i18n import Language, translate  # noqa: E402
 
 try:
     import mesh_approval  # noqa: E402 - 승인 대기함 레지스트리 (renderer spec §7)
@@ -170,6 +171,44 @@ def strip_leading_emoji_decoration(text: str) -> str:
             continue
         break
     return value[index:].lstrip() if seen_decoration else value
+
+
+_DISPLAY_EMOJI_COMPONENT = (
+    r"[\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2600-\u27BF"
+    r"\u231A\u231B\u23E9-\u23F3\u23F8-\u23FA\u25B6\u25C0]"
+    r"[\uFE0E\uFE0F\U0001F3FB-\U0001F3FF]*"
+)
+_DISPLAY_EMOJI_OR_CODE = re.compile(
+    r"(`+).*?\1|" + _DISPLAY_EMOJI_COMPONENT
+    + r"(?:\u200D" + _DISPLAY_EMOJI_COMPONENT + r")*[ \t]*"
+)
+
+
+def strip_private_display_emoji(text: str, *, keep_completion_check: bool = False) -> str:
+    """Remove DM decoration on send and edit, preserving literal code content."""
+    lines: list[str] = []
+    fence = ""
+    for line in (text or "").splitlines(keepends=True):
+        if fence:
+            lines.append(line)
+            if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + r"{" + str(len(fence)) + r",}\s*", line):
+                fence = ""
+            continue
+        opening = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if opening:
+            fence = opening.group(1)
+            lines.append(line)
+            continue
+        lines.append(_DISPLAY_EMOJI_OR_CODE.sub(
+            lambda match: match.group(0) if match.group(1) or (
+                keep_completion_check and line.startswith("✅ ") and match.group(0).strip() == "✅"
+            ) else "", line,
+        ))
+    cleaned = "".join(lines)
+    # An intentional symbol-only answer must not become an empty Telegram message.
+    return cleaned if cleaned.strip() else text
+
+
 BRIDGE_OWNER = "claude-telegram-bridge"
 BRIDGE_HEALTH_SLASH_COMMANDS = {"/ping", "/start"}
 BRIDGE_STATUS_SLASH_COMMAND = "/status"
@@ -254,6 +293,12 @@ SESSION_LIFECYCLE_SLASH_COMMANDS = {"/exit", "/quit"}
 # 살아있는 턴 위로 주입되면 유령 리바인드·답 유실로 번진다 (실사고 8/27 22:41 /clear).
 # 이 집합은 transcript 완전 침묵(destructive_slash_quiet_seconds)까지 주입을 미룬다.
 SESSION_DESTRUCTIVE_SLASH_COMMANDS = {"/clear", "/new"} | SESSION_LIFECYCLE_SLASH_COMMANDS
+# T-261004-016: /clear·/new 완료 알림 (코덱스 CLEAR_SLASH_* 동형). 붙여넣기 성공은
+# 완료가 아니다 — 새 transcript 로 실제 갈아탄 것을 본 뒤에만 완료로 알린다.
+SESSION_CLEAR_SLASH_COMMANDS = {"/clear", "/new"}
+CLEAR_SLASH_COMPLETE = "세션을 클리어했습니다."
+CLEAR_SLASH_TIMEOUT = "세션 전환을 확인하지 못했습니다. 완료로 표시하지 않습니다."
+CLEAR_WATCH_TIMEOUT_SEC = 90.0
 
 
 def destructive_slash_quiet_seconds() -> float:
@@ -415,10 +460,13 @@ RELAY_FRAGMENT_MAX_CHARS = 40
 RELAY_FRAGMENT_HANGUL_RE = re.compile(r"[가-힣]")
 REASONING_HEADER = "\U0001f9e0 클로드 사고"
 REASONING_MIRROR_LIMIT = 3500
+# T-261006-018: 사고 수집과 pending 정리는 유지하고, 텔레그램 별도 메시지만 보내지 않는다.
+REASONING_MIRROR_SEND = False
 # ⚙️ flow mirror — relays intermediate tool_use steps to Telegram in real time so
 # the user can see the work flow between final answers, not just endpoints. Default
 # OFF (flag-file gated, runtime-toggleable, no restart). Created per-node only.
 FLOW_MIRROR_HEADER = "⚙️ 작업 흐름"
+# T-261005-003: 이 문구는 답변 앞에 붙이지 않는다. 본문에 같은 글이 있으면 그대로 둔다.
 AMBIENT_FINAL_HEADER = "✅ 노드 결과"
 # ⚙️ ambient flow mirror — node-originated work(다른 노드/오케가 주입한 지시)의 트리거
 # 프롬프트 카드. "✅ 노드 결과"만 떠서 무슨 지시로 나온 결과인지 맥락이 끊기던 문제 보완.
@@ -427,6 +475,10 @@ TERMINAL_INPUT_HEADER = "⌨️ 터미널 입력"
 SENT_DIRECTIVE_HEADER = "📤 보낸 지시"
 AMBIENT_DIRECTIVE_LIMIT = 400
 FLOW_MIRROR_LIMIT = 1500
+# T-261007-011: 같은 턴에서 카드가 다음 장으로 넘어갈 때 이전 장에 남기는 종료 문구.
+FLOW_CARD_CONTINUED_LABEL = "다음 카드로 이어짐"
+# 재기동 뒤에도 다시 닫을 미정리 이전 카드 상한. 이미 닫힌 장은 저장하지 않는다.
+FLOW_ROTATED_CARD_CAP = 8
 # ⚠️ 제거 금지 (DO NOT REMOVE) — 최종답변 한도는 ★카드 한도와 다른 자다 (T-260822-062).
 #   실사고 2026-08-22 19:38 작업 노드(사용자 스크린샷 제보 20:25): 노드발/directive 턴의
 #   최종답변이 문장 중간에서 끊기고 뒷부분이 영영 안 왔다. 저널은 `SEND sent ambient final`
@@ -993,12 +1045,6 @@ SUGGESTED_BODY_DEFERRAL_MARKERS = (
             re.M,
         ),
     ),
-)
-SUGGESTED_REPLY_CLASS_INSTRUCTION = (
-    '[SUGGESTED-REPLY CONTRACT] End the final answer with exactly one single-line '
-    '<추천답변 class="auto-ok">...</추천답변> only when the next action is reversible and does not involve '
-    'main merge, store submission, account auth/credentials/passwords, payment, external sending, or a physical '
-    'device; otherwise use class="hold". Never omit class. Do not mention this contract.'
 )
 SUGGESTED_AUTH_AUTO_OK = "auto_ok_veto_elapsed"
 SUGGESTED_AUTH_HUMAN_CONFIRMED = "human_confirmed"
@@ -1995,27 +2041,21 @@ def _self_update_failure_result(
     returncode: int,
     *,
     allow_break_system_packages: bool,
+    language: str = "",
 ) -> SelfUpdateResult:
     lowered = output.lower()
     if not allow_break_system_packages and (
         "externally-managed-environment" in lowered or "pep 668" in lowered
     ):
-        message = (
-            f"⚠️ v{latest} 업데이트가 Python PEP 668 보호로 중단됐습니다. "
-            "아래 동의 버튼을 누르면 --break-system-packages로 한 번 재시도합니다. "
-            "이 옵션은 시스템 Python 보호를 우회합니다."
-        )
+        message = translate("⚠️ v{latest} 업데이트가 Python PEP 668 보호로 중단됐습니다. 아래 동의 버튼을 누르면 --break-system-packages로 한 번 재시도합니다. 이 옵션은 시스템 Python 보호를 우회합니다.", language, latest=latest)
         return SelfUpdateResult("pep668_consent_required", message)
     if "--user" in lowered and (
         "pip 26" in lowered or "not supported" in lowered or "no longer" in lowered
     ):
-        reason = "pip 26에서 --user 설치 미지원"
+        reason = translate("pip 26에서 --user 설치 미지원", language)
     else:
-        reason = f"pip 종료 코드 {returncode}"
-    message = (
-        f"❌ v{latest} 업데이트 실패: {reason}. "
-        f"수동: pipx install --force {SELF_UPDATE_PACKAGE}"
-    )
+        reason = translate("pip 종료 코드 {code}", language, code=returncode)
+    message = translate("❌ v{latest} 업데이트 실패: {reason}. 수동: pipx install --force {package}", language, latest=latest, reason=reason, package=SELF_UPDATE_PACKAGE)
     return SelfUpdateResult("failed", message)
 
 
@@ -2025,6 +2065,7 @@ def perform_self_update(
     notify: Callable[[str], object] | None = None,
     allow_break_system_packages: bool = False,
     quiet_repeat: bool = False,
+    language: str = "",
 ) -> SelfUpdateResult:
     """Upgrade to ``latest``, report the outcome, then re-exec on success.
 
@@ -2058,6 +2099,7 @@ def perform_self_update(
                 output,
                 proc.returncode,
                 allow_break_system_packages=allow_break_system_packages,
+                language=language,
             )
             if result.status != "pep668_consent_required":
                 _self_update_notify(
@@ -2068,10 +2110,7 @@ def perform_self_update(
             return result
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update install error (staying put): {exc}")
-        message = (
-            f"❌ v{latest} 업데이트 실패: pip 실행 오류. "
-            f"수동: pipx install --force {SELF_UPDATE_PACKAGE}"
-        )
+        message = translate("❌ v{latest} 업데이트 실패: pip 실행 오류. 수동: pipx install --force {package}", language, latest=latest, package=SELF_UPDATE_PACKAGE)
         _self_update_notify(
             notify, message, once_key=f"failed:{latest}" if quiet_repeat else None
         )
@@ -2079,17 +2118,14 @@ def perform_self_update(
 
     os.environ[f"{SELF_UPDATE_PREFIX}_SELF_UPDATED"] = latest
     _self_update_mark_installed(latest)
-    message = f"✅ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다."
+    message = translate("✅ {package} v{latest} 설치 성공 — 지금 브릿지를 재시작합니다.", language, package=SELF_UPDATE_PACKAGE, latest=latest)
     log("UPDATE", f"upgraded to {latest}; restarting")
     _self_update_notify(notify, message)
     try:
         os.execv(sys.executable, [sys.executable, "-m", SELF_UPDATE_MODULE] + sys.argv[1:])
     except Exception as exc:  # noqa: BLE001
         log("UPDATE", f"self-update error (new version active next restart): {exc}")
-        message = (
-            f"⚠️ {SELF_UPDATE_PACKAGE} v{latest} 설치 성공, 자동 재시작 실패. "
-            "브릿지를 수동 재시작하면 신버전이 적용됩니다."
-        )
+        message = translate("⚠️ {package} v{latest} 설치 성공, 자동 재시작 실패. 브릿지를 수동 재시작하면 신버전이 적용됩니다.", language, package=SELF_UPDATE_PACKAGE, latest=latest)
         _self_update_notify(
             notify, message, once_key=f"restart_failed:{latest}" if quiet_repeat else None
         )
@@ -2110,6 +2146,10 @@ def mesh_ledger_record(*args, **kwargs):
 
 def mesh_cutover_call(method, params, *, bot_token=None):
     return None
+
+
+def mesh_cutover_applies(method, params):
+    return False  # Public requests use the direct Telegram API path.
 
 
 class MeshRouteRetiredError(RuntimeError):
@@ -3371,6 +3411,60 @@ def _declared_confirm(lines):
     return None
 
 
+CHOICE_AUTO_DENY_RE = re.compile(
+    r"^(Claude Code will automatically deny this request\s+in\s+)(\d{1,3}):([0-5]\d)"
+    r"(?=,\s+to avoid blocking progress on an\s+unattended session)", re.MULTILINE,
+)
+
+
+COMPUTER_USE_TITLE = "Computer Use wants to control these apps"
+COMPUTER_USE_CALLBACK = "clb-computer-use"
+
+
+def parse_computer_use_choice(screen: str):
+    """Recognize the observed app permission dialog, never a generic Yes/No UI."""
+    lines = [line.strip() for line in strip_ansi_control(screen or "").splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    if not lines or pane_composer_visible(lines):
+        return None
+    titles = [i for i, line in enumerate(lines) if line == COMPUTER_USE_TITLE]
+    if not titles or not re.fullmatch(r"Enter to confirm\s*[·•]\s*Esc to cancel", lines[-1]):
+        return None
+    start = titles[-1]
+    above = [line for line in lines[:start] if line]
+    if not above or not CHOICE_RULE_RE.fullmatch(above[-1]):
+        return None
+    body = [line for line in lines[start + 1:-1] if line]
+    deny = re.compile(r"^(❯\s+)?Deny, and tell Claude what to do differently(?:\s+\(esc\))?$")
+    allow = re.compile(r"^(❯\s+)?Allow for this session \(([1-9][0-9]?) apps?\)$")
+    deny_rows = [(i, deny.fullmatch(line)) for i, line in enumerate(body) if deny.fullmatch(line)]
+    if len(deny_rows) != 1:
+        return None
+    index, denied = deny_rows[0]
+    tail = body[index + 1:]
+    if tail and tail[0] == "(esc)":
+        tail = tail[1:]
+    allowed = allow.fullmatch(tail[0]) if len(tail) == 1 else None
+    if not allowed or bool(denied[1]) == bool(allowed[1]):
+        return None
+    context = body[:index]
+    apps = [re.fullmatch(r"[●•]\s+(.+)", line) for line in context]
+    apps = [match[1] for match in apps if match]
+    if not apps or len(apps) != int(allowed[2]) or len(set(apps)) != len(apps):
+        return None
+    if not context or not re.fullmatch(r"[0-9]+ other apps will be hidden while Claude works\.", context[-1]):
+        return None
+    if len("\n".join(context)) > 2400 or any(CHOICE_OPTION_RE.match(line) for line in context):
+        return None
+    options = [(1, "Deny, and tell Claude what to do differently"),
+               (2, f"Allow for this session ({allowed[2]} {'app' if allowed[2] == '1' else 'apps'})")]
+    payload = json.dumps(["computer-use-v1", COMPUTER_USE_TITLE, context, options], ensure_ascii=False)
+    return {"kind": "computer_use", "title": COMPUTER_USE_TITLE, "context": context,
+            "options": options, "selected": 1 if denied[1] else 2, "expires_in": None,
+            "signature": hashlib.sha1(payload.encode()).hexdigest()[:12]}
+
+
 def parse_pane_choice(screen: str):
     """pane 캡처에서 숫자 선택지 화면을 **구조로** 판정한다.
 
@@ -3380,6 +3474,8 @@ def parse_pane_choice(screen: str):
       선택을 주입할 수 있고, 미러 폴백은 최악이어도 종전 동작이다.
     """
     text = strip_ansi_control(screen or "")
+    if COMPUTER_USE_TITLE in [line.strip() for line in text.splitlines()]:
+        return parse_computer_use_choice(text)
     lines = [line.rstrip() for line in text.splitlines()]
     while lines and not lines[-1].strip():
         lines.pop()
@@ -3437,6 +3533,12 @@ def parse_pane_choice(screen: str):
 
     title = _choice_title(lines, idx)
     context = _choice_context(lines, idx, title)
+    signature_context = "\n".join(_choice_context(lines, idx, title, truncate=False))
+    countdown = CHOICE_AUTO_DENY_RE.search(signature_context)
+    expires_in = int(countdown[2]) * 60 + int(countdown[3]) if countdown else None
+    # Only the known CLI countdown is volatile. Commands, warnings and options
+    # remain bound to the card, including text beyond the display truncation.
+    signature_context = CHOICE_AUTO_DENY_RE.sub(r"\1<countdown>", signature_context)
     options = [(row[0], row[1]) for row in collected]
     # ★서명에 본문을 넣는다 (T-260805-154). 제목·선택지만으로는 승인창끼리 서명이 겹친다 —
     #   "Do you want to proceed? / 1.Yes / 2.Yes, and don't ask / 3.No" 는 **어떤 명령이든**
@@ -3446,7 +3548,7 @@ def parse_pane_choice(screen: str):
     #   본문이 안 바뀌므로 종전대로 같은 서명이다.
     payload = (
         title + "|" + "|".join(label for _, label in options)
-        + "|" + "␟".join(context)
+        + "|" + signature_context
     )
     if declared:
         # ★선언 확인창은 approval **바깥**이다 (T-260802-100).
@@ -3467,6 +3569,7 @@ def parse_pane_choice(screen: str):
         "options": options,
         "selected": marked[0],
         "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
+        "expires_in": expires_in,
     }
 
 
@@ -3513,7 +3616,7 @@ CHOICE_CONTEXT_MAX_LINES = 6
 CHOICE_CONTEXT_MAX_CHARS = 160
 
 
-def _choice_context(lines, above_idx: int, title: str) -> list:
+def _choice_context(lines, above_idx: int, title: str, *, truncate: bool = True) -> list:
     """옵션 블록 위 **대화상자 본문**을 위에서 아래 순서로 걷는다 (T-260805-154).
 
     ★왜 필요한가 = 이것이 없으면 카드가 「무엇을」 승인하는지 말하지 않는다.
@@ -3543,9 +3646,9 @@ def _choice_context(lines, above_idx: int, title: str) -> list:
         line = lines[probe].strip()
         if not line or line == title:
             continue
-        picked.append(line[:CHOICE_CONTEXT_MAX_CHARS])
+        picked.append(line[:CHOICE_CONTEXT_MAX_CHARS] if truncate else line)
     picked.reverse()
-    return picked[-CHOICE_CONTEXT_MAX_LINES:]
+    return picked[-CHOICE_CONTEXT_MAX_LINES:] if truncate else picked
 
 
 # 콜백 prefix. callback_data = "clb-choice::<signature>::<번호>" (64바이트 한도 안).
@@ -3588,12 +3691,12 @@ def choice_buttons_allowed(kind: str) -> bool:
     mode = choice_buttons_mode()
     if mode == "off":
         return False
-    if kind == "approval":
+    if kind in {"approval", "computer_use"}:
         return mode == "all"
     return True
 
 
-def choice_card_text(parsed) -> str:
+def choice_card_text(parsed, translate=lambda text: text) -> str:
     """폰에 띄울 선택 카드 본문. 무엇을 고르는지 + 지금 커서가 어디인지를 같이 보여준다."""
     rows = [f"🔽 {parsed['title']}", ""]
     # ★T-260805-154 — 승인 대상 본문을 제목 아래에 싣는다. 이게 없으면 폰에서
@@ -3606,7 +3709,7 @@ def choice_card_text(parsed) -> str:
         mark = "▸" if num == parsed["selected"] else " "
         rows.append(f"{mark} {num}. {label}")
     rows.append("")
-    rows.append("버튼을 누르면 터미널에서 그 항목이 골라져요.")
+    rows.append(translate("버튼을 누르면 터미널에서 그 항목이 골라져요."))
     return "\n".join(rows)
 
 
@@ -3620,11 +3723,151 @@ def choice_keyboard(parsed):
             [{
                 "text": text,
                 "callback_data": "{}::{}::{}".format(
-                    CHOICE_CALLBACK, parsed["signature"], num
+                    COMPUTER_USE_CALLBACK if parsed["kind"] == "computer_use" else CHOICE_CALLBACK,
+                    parsed["signature"], num
                 ),
             }]
         )
     return buttons
+
+
+# ── AskUserQuestion 질문 화면 → 폰 카드 (T-261004-016, 코덱스 질문 카드 동형) ──────────
+# 실측 화면(Claude Code v2.1.289, 2026-10-04 제어 노드 스크래치 세션):
+#     ☐ Fruit                              ← 질문 1개면 머리표 1개, 여러 개면 「←  ☐ A  ☐ B  ✔ Submit  →」
+#    Which fruit?
+#    ❯ 1. Apple
+#         red fruit                         ← 선택지 설명(들여쓰기)
+#      2. Banana
+#         yellow fruit
+#      3. Type something.                   ← 직접 입력. 숫자를 누르면 그 줄이 입력칸이 된다
+#    ─────────
+#      4. Chat about this
+#    Enter to select · ↑/↓ to navigate · Esc to cancel
+# 설명 줄·가로줄이 선택지 사이에 끼어 parse_pane_choice(연속 번호행만 읽음)는 이 화면을
+# 못 읽는다 — 그래서 폰에는 아무것도 안 떴다. 머리표 줄 + 하단 힌트가 둘 다 있을 때만
+# 읽으므로 일반 승인창·메뉴는 이 해석기에 걸리지 않는다.
+ASKQ_HINT_RE = re.compile(r"(?i)\benter to select\b.*\besc to cancel\b")
+ASKQ_TAB_RE = re.compile(r"^\s*(?:←\s+)?[☐☒]\s+\S")
+ASKQ_FREEFORM_RE = re.compile(r"(?i)^type something\.?$")
+ASKQ_CHAT_RE = re.compile(r"(?i)^chat about this$")
+ASKQ_MULTI_MARK_RE = re.compile(r"^\[[ ✔xX]\]\s*")
+ASKQ_REVIEW_TITLE = "Ready to submit your answers?"
+ASKQ_TEXT_MAX = 500
+
+
+def parse_ask_question(screen: str):
+    """AskUserQuestion 화면을 구조로 읽는다. 못 읽으면 조용히 None (오탐 버튼 < 폴백)."""
+    text = strip_ansi_control(screen or "")
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return None
+    hint_idx = -1
+    for idx in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
+        if ASKQ_HINT_RE.search(lines[idx]):
+            hint_idx = idx
+            break
+    review_idx = -1
+    if hint_idx < 0:
+        # 여러 질문의 마지막 「Review your answers」 화면은 힌트 줄 없이 끝난다(실측).
+        for idx in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
+            if lines[idx].strip() == ASKQ_REVIEW_TITLE:
+                review_idx = idx
+                break
+        if review_idx < 0:
+            return None
+        hint_idx = len(lines)
+    tab_idx = -1
+    for idx in range(hint_idx - 1, max(-1, hint_idx - 45), -1):
+        if ASKQ_TAB_RE.match(lines[idx]):
+            tab_idx = idx
+            break
+    if tab_idx < 0:
+        return None
+    header = " ".join(lines[tab_idx].split())
+    start = review_idx if review_idx >= 0 else tab_idx
+    question = ""
+    options: list[tuple[int, str, str]] = []
+    selected = 0
+    multi = False
+    for idx in range(start + 1, hint_idx):
+        raw = lines[idx]
+        matched = CHOICE_OPTION_RE.match(raw)
+        if matched:
+            label = matched.group(3).strip()
+            if ASKQ_MULTI_MARK_RE.match(label):
+                multi = True
+                label = ASKQ_MULTI_MARK_RE.sub("", label).strip()
+            options.append((int(matched.group(2)), label, ""))
+            if matched.group(1):
+                selected = int(matched.group(2))
+            continue
+        stripped = raw.strip()
+        if not stripped or CHOICE_RULE_RE.match(raw):
+            continue
+        if not options:
+            if not question and review_idx < 0:
+                question = stripped
+            continue
+        num, label, desc = options[-1]
+        if not desc and raw.startswith("     "):
+            options[-1] = (num, label, stripped)
+    if review_idx >= 0:
+        question = ASKQ_REVIEW_TITLE
+    if not question or len(options) < 2 or len(options) > CHOICE_MAX_OPTIONS:
+        return None
+    if [row[0] for row in options] != list(range(1, len(options) + 1)) or not selected:
+        return None
+    freeform = None
+    buttons: list[tuple[int, str]] = []
+    descriptions: dict[int, str] = {}
+    for num, label, desc in options:
+        if ASKQ_FREEFORM_RE.match(label):
+            freeform = num
+            continue
+        if ASKQ_CHAT_RE.match(label) or label == "Submit":
+            continue
+        buttons.append((num, label))
+        if desc:
+            descriptions[num] = desc
+    if not buttons:
+        return None
+    payload = header + "|" + question + "|" + "|".join(label for _, label, _ in options)
+    return {
+        "kind": "question",
+        "header": header,
+        "title": question,
+        "context": [],
+        "options": buttons,
+        "descriptions": descriptions,
+        "freeform": None if multi else freeform,
+        "multi": multi,
+        "review": review_idx >= 0,
+        "selected": selected,
+        "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def ask_question_card_text(parsed, translate=lambda text: text) -> str:
+    rows = [f"❓ {parsed['title']}", ""]
+    for num, label in parsed["options"]:
+        desc = parsed.get("descriptions", {}).get(num)
+        rows.append(f"{num}. {label}" + (f" — {desc}" if desc else ""))
+    rows.append("")
+    if parsed.get("multi"):
+        rows.append(translate("여러 개를 고르는 질문이라 터미널에서 골라주세요."))
+    else:
+        rows.append(translate("버튼을 누르면 그 답이 골라져요."))
+        if parsed.get("freeform"):
+            rows.append(translate("다른 답은 글로 보내면 직접 입력 답으로 넣어요."))
+    return "\n".join(rows)
+
+
+def ask_question_answer_text(text: str) -> str:
+    """직접 입력 답 = 한 줄·제어문자 제거·길이 상한. 입력칸은 한 줄짜리다."""
+    cleaned = "".join(ch for ch in (text or "") if ch.isprintable() or ch in "\n\t")
+    return " ".join(cleaned.split())[:ASKQ_TEXT_MAX]
 
 
 def interstitial_blocked_text(command: str, arg: str = "") -> str:
@@ -3779,6 +4022,13 @@ def suggested_hold_all_enabled() -> bool:
     return os.path.exists(SUGGESTED_HOLD_ALL_FLAG)
 
 
+def background_typing_max_seconds() -> float:
+    try:
+        return max(60.0, float(os.environ.get("CLB_BG_TYPING_MAX_SECONDS", "1800")))
+    except ValueError:
+        return 1800.0
+
+
 def progress_board_enabled() -> bool:
     """Same precedence as flow_mirror_enabled(): env override, else flag file.
     Default OFF — a 5-node shared codebase means most nodes never set the flag."""
@@ -3817,6 +4067,14 @@ def parse_progress_signal(text: str) -> tuple[int | None, int | None]:
 # written to: <path>." — 출력 파일 경로를 여기서 얻는다. 이 tool_result 는 '백그라운드로
 # 넘어갔다' 는 확인일 뿐이라 done 판정에는 쓰지 않는다(ProgressItem 독스트링 참조).
 _BG_OUTPUT_PATH_RE = re.compile(r"[Oo]utput is being written to:\s*(\S+)")
+
+# T-261008-009: 텔레그램 턴이 띄운 백그라운드 작업(서브에이전트·run_in_background Bash)이
+# 도는 동안 '입력중'을 유지한다. 2026-10-08 02:55 macOS 노드 실측: 리서치 서브에이전트 3개를 띄우고
+# 포그라운드 턴이 끝나 02:59 완료까지 폰에 무표시였다. 띄운 직후 tool_result 의 확인 문구로
+# 백그라운드 여부를 판정하고, harness 의 task-notification(<tool-use-id>)으로 끝을 판정한다.
+# 끝 통지가 안 오는 작업(서버 등)의 유령 입력중을 막으려고 항목마다 상한을 둔다.
+_BG_LAUNCH_RE = re.compile(r"Async agent launched|[Rr]unning in background with ID")
+BACKGROUND_TYPING_TOOLS = {"Agent", "Task", "Bash"}
 
 # 백그라운드/서브에이전트 완료 통지 블록 실측 문구(T-260807-032):
 #   <task-notification>...<tool-use-id>toolu_xxx</tool-use-id>...<status>completed</status>
@@ -4202,8 +4460,7 @@ def clean_ambient_final_text(text: str) -> str:
 
 
 def format_ambient_final(text: str, limit: int = FLOW_MIRROR_LIMIT) -> str:
-    # ⚙️ ambient flow mirror — node-originated work 의 최종 답변(결론) 카드. flow 카드
-    # (도구 단계, "작업 흐름")와 구분되는 "✅ 노드 결과" 헤더로 결론임을 표시한다.
+    # 최종 답변은 일반 메시지 본문이다. AMBIENT_FINAL_HEADER 를 앞에 붙이지 않는다.
     #
     # ⚠️ 제거 금지 (DO NOT REMOVE) — limit 인자가 있는 이유 (T-260822-062).
     #   이 함수는 두 가지로 쓰인다: ①짧은 **카드** ②실제 **최종답변 발신 본문**(아래
@@ -4214,7 +4471,7 @@ def format_ambient_final(text: str, limit: int = FLOW_MIRROR_LIMIT) -> str:
     #   명시로 넘긴다. 자를 이유가 없는 쪽에서만 안 자른다 — telegram.send() 가 이미
     #   chunks() 로 쪼갠다(CLB_TG_CHUNK 기본 4096).
     body = clean_ambient_final_text(text)[:limit].strip()
-    return f"{AMBIENT_FINAL_HEADER}\n{body}" if body else ""
+    return body
 
 
 # ⚙️ 받은-지시 카드 gist 정제 (T-260630-33) — 보일러플레이트 라우팅 헤더를 gist 에서
@@ -4430,6 +4687,40 @@ def _format_directive_card(
     return f"{header}\n{gist}" if gist else ""
 
 
+_TASK_NOTIFICATION_BLOCK_RE = re.compile(r"<task-notification>(.*?)</task-notification>", re.DOTALL)
+_TASK_NOTIFICATION_STATUS_KO = {
+    "completed": "끝남",
+    "failed": "실패",
+    "killed": "중단",
+    "stopped": "중단",
+    "cancelled": "중단",
+}
+
+
+def format_task_notification_card(text: str) -> str:
+    """백그라운드 작업 완료통지 재진입 → 한국어 한 줄 카드 (T-261008-011).
+
+    harness 의 <task-notification> 은 내부용 영어 XML 이고 <result> 에 서브에이전트 결과
+    전문이 붙는다. 그대로 받은지시 카드로 보내면 폰에 영어 수천 자가 간다(2026-10-08
+    02:58 macOS 노드 실측 4,660자). 결과 해석·요약은 뒤따르는 클로드 답이 맡는다.
+    통지가 아니면 "" — 호출부가 기존 받은지시 카드로 간다.
+    """
+    blocks = _TASK_NOTIFICATION_BLOCK_RE.findall(text or "")
+    if not blocks:
+        return ""
+    statuses = []
+    for block in blocks:
+        m = re.search(r"<status>([^<]+)</status>", block)
+        raw_status = (m.group(1).strip().lower() if m else "completed")
+        statuses.append(_TASK_NOTIFICATION_STATUS_KO.get(raw_status, "끝남"))
+    if len(blocks) == 1:
+        return f"🔔 백그라운드 작업 {statuses[0]}"
+    done = statuses.count("끝남")
+    others = len(statuses) - done
+    tail = f" (실패·중단 {others}건)" if others else ""
+    return f"🔔 백그라운드 작업 {len(blocks)}건 끝남{tail}"
+
+
 def format_ambient_directive(
     text: str,
     self_emoji: str | None = None,
@@ -4482,7 +4773,7 @@ def screen_status_region(screen: str, tail_lines: int = 16) -> str:
 
 
 def screen_has_approval_wait(screen: str) -> bool:
-    return bool(APPROVAL_WAIT_RE.search(screen_status_region(screen)))
+    return bool(parse_computer_use_choice(screen) or APPROVAL_WAIT_RE.search(screen_status_region(screen)))
 
 
 def screen_has_hook_block(screen: str) -> bool:
@@ -4875,11 +5166,63 @@ class TelegramClient:
         # 관례(~/.claude/state, CLB_STATE_DIR)와 동일 기본값. 명시 인자가 있으면 그걸 우선한다
         # (테스트가 tmp 디렉토리로 격리할 수 있게).
         self.state_dir = state_dir or Path(os.environ.get("CLB_STATE_DIR", "~/.claude/state")).expanduser()
+        self.language = Language(self.state_dir, default="en", env_prefix="CLB", state_name="claude-bridge-language.json")
 
-    def call(self, method: str, *, bypass_mesh_cutover: bool = False, **params: Any) -> dict[str, Any] | None:
+    def tr(self, source: str, **values: object) -> str:
+        return translate(source, getattr(getattr(self, "language", None), "code", ""), **values)
+
+    def call(
+        self,
+        method: str,
+        *,
+        bypass_mesh_cutover: bool = False,
+        _request_timeout: float = 60,
+        _attempts: int = 3,
+        _wait_on_flood: bool = True,
+        _question_completion: bool = False,
+        _flow_completion: bool = False,
+        _flow_origin_message_id: int | None = None,
+        _user_reply_to_message_id: int | None = None,
+        _computer_use_card: dict[str, Any] | None = None,
+        **params: Any,
+    ) -> dict[str, Any] | None:
+        # T-261004-016: _request_timeout/_attempts/_wait_on_flood 는 typing 처럼 짧은
+        # 수명의 호출이 재시도·flood 대기로 다음 펄스를 붙잡지 않게 하는 문이다(코덱스 동형).
         # T-260902-007: Claude node room 7종 ops 는 Bot API·버스·bypass 전부 앞에서 끊는다.
         # mute/human_room_mute 를 읽지 않는다. inbound 는 이 분기 밖(getUpdates).
-        if claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
+        # Completing a user's question or progress card is UI state, not an ops report.
+        # Only closing an existing card in this bot's own chat gets this exception.
+        card_completion = (
+            (_question_completion or _flow_completion) and method == "editMessageText"
+            and str(params.get("chat_id")) == str(self.chat_id)
+            and type(params.get("message_id")) is int and params["message_id"] > 0
+            and params.get("reply_markup") == json.dumps({"inline_keyboard": []})
+        )
+        # A reply to a user in this bot's chat is not an unsolicited ops alert.
+        # Keep the trusted reply origin across chunks without sending this private
+        # marker to Telegram or treating a foreign chat/edit as a user reply.
+        user_reply = (
+            method == "sendMessage"
+            and str(params.get("chat_id")) == str(self.chat_id)
+            and type(_user_reply_to_message_id) is int
+            and _user_reply_to_message_id > 0
+        )
+        user_flow_update = (
+            method == "editMessageText"
+            and str(params.get("chat_id")) == str(self.chat_id)
+            and type(params.get("message_id")) is int and params["message_id"] > 0
+            and type(_flow_origin_message_id) is int and _flow_origin_message_id > 0
+        )
+        permission_card = (
+            method == "sendMessage" and str(params.get("chat_id")) == str(self.chat_id)
+            and isinstance(_computer_use_card, dict)
+            and _computer_use_card.get("kind") == "computer_use"
+            and params.get("text") == self.with_emoji_prefix(choice_card_text(_computer_use_card, translate=self.tr))
+            and params.get("reply_markup") == json.dumps(
+                {"inline_keyboard": choice_keyboard(_computer_use_card)}, ensure_ascii=False,
+            )
+        )
+        if not (card_completion or user_reply or user_flow_update or permission_card) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
             mesh_ledger_record(
                 method,
                 params.get("chat_id"),
@@ -4906,7 +5249,7 @@ class TelegramClient:
             # getUpdates·getMe·getWebhookInfo 같은 인입/조회는 이 축과 무관한데도 종전엔
             # 함께 단락돼, 발신 실패가 인입 폴링을 죽이는 교차오염이 됐다.
             if (
-                method in MESH_CUTOVER_METHODS
+                mesh_cutover_applies(method, params)
                 and send_circuit_breaker is not None
                 and send_circuit_breaker.is_tripped(MESH_CUTOVER_CIRCUIT_AXIS)
             ):
@@ -4946,15 +5289,21 @@ class TelegramClient:
         flood_waits = 0
         while True:
             try:
-                with urllib.request.urlopen(request, timeout=60) as response:
+                with urllib.request.urlopen(request, timeout=_request_timeout) as response:
                     payload = json.load(response)
                 mesh_ledger_record(method, params.get("chat_id"), params.get("text"), payload, message_id=params.get("message_id"))
                 return payload if isinstance(payload, dict) else None
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
+                if method == "editMessageText" and exc.code == 400 and "message is not modified" in body.lower():
+                    # Telegram confirms the requested body and keyboard are already present.
+                    payload = {"ok": True, "result": True, "delivery": "skipped_unchanged"}
+                    mesh_ledger_record(method, params.get("chat_id"), params.get("text"),
+                                       payload, result="skipped_unchanged", message_id=params.get("message_id"))
+                    return payload
                 if exc.code == 409:
                     raise TelegramHTTPError(method, exc.code, body) from exc
-                if exc.code == 429 and flood_waits < TELEGRAM_FLOOD_MAX_WAITS:
+                if exc.code == 429 and _wait_on_flood and flood_waits < TELEGRAM_FLOOD_MAX_WAITS:
                     flood_waits += 1
                     wait = min(telegram_retry_after_seconds(body, exc.headers) + 1.0, TELEGRAM_FLOOD_WAIT_CAP_SECONDS)
                     log("TGERR", f"{method} 429 flood; waiting {wait:.0f}s ({flood_waits}/{TELEGRAM_FLOOD_MAX_WAITS})")
@@ -4965,12 +5314,12 @@ class TelegramClient:
                     give_up(f"HTTP {exc.code} {body[:200]}")
                     return None
                 attempt += 1
-                if attempt >= 3:
+                if attempt >= _attempts:
                     give_up(f"HTTP {exc.code} {body[:200]}")
                     return None
             except Exception as exc:  # noqa: BLE001
                 attempt += 1
-                if attempt >= 3:
+                if attempt >= _attempts:
                     give_up(str(exc))
                     return None
             time.sleep(2)
@@ -5068,8 +5417,18 @@ class TelegramClient:
         payload = self.call("deleteWebhook", drop_pending_updates="false")
         return bool(payload and payload.get("ok"))
 
-    def send_typing(self) -> None:
-        self.call("sendChatAction", chat_id=self.chat_id, action="typing")
+    def send_typing(self) -> bool:
+        payload = self.call(
+            "sendChatAction",
+            # T-261004-016: 텔레그램 typing 수명(5s)보다 짧게 — 걸린 호출 하나가
+            # 표시가 꺼질 때까지 다음 펄스를 붙잡지 않게 한다(코덱스 c370293f 동형).
+            _request_timeout=4,
+            _attempts=1,
+            _wait_on_flood=False,
+            chat_id=self.chat_id,
+            action="typing",
+        )
+        return bool(payload and payload.get("ok"))
 
     def send_activity_indicator(self, text: str, reply_to_message_id: int | None = None) -> int | None:
         params: dict[str, Any] = {"chat_id": self.chat_id, "text": text}
@@ -5187,7 +5546,7 @@ class TelegramClient:
             return text
         return self._korean_gate_block(text)
 
-    def with_emoji_prefix(self, text: str) -> str:
+    def with_emoji_prefix(self, text: str, *, keep_completion_check: bool = False) -> str:
         text = strip_bridge_nonce_markers(text)
         original_text = text
         first_line = text.splitlines()[0].strip() if text.splitlines() else ""
@@ -5196,7 +5555,7 @@ class TelegramClient:
             return text
         text = strip_node_emoji_header(text)
         if private_chat:
-            text = strip_leading_emoji_decoration(text)
+            text = strip_private_display_emoji(text, keep_completion_check=keep_completion_check)
             text = text if text.strip() else original_text
             if not korean_gate_passes(text):
                 return self._korean_gate_block(text)
@@ -5211,7 +5570,9 @@ class TelegramClient:
         text = self.with_emoji_prefix(text or "(empty response)")
         return split_by_utf16_budget(text, self.chunk_size)
 
-    def send_copy_content(self, text: str, code: bool = False) -> list[int] | None:
+    def send_copy_content(
+        self, text: str, code: bool = False, reply_to_message_id: int | None = None,
+    ) -> list[int] | None:
         message_ids: list[int] = []
         chunks = split_by_utf16_budget(text, self.chunk_size)
         for chunk in chunks:
@@ -5219,16 +5580,19 @@ class TelegramClient:
             if code:
                 utf16_len = len(chunk.encode("utf-16-le")) // 2
                 params["entities"] = json.dumps([{"type": "pre", "offset": 0, "length": utf16_len}])
-            payload = self.call("sendMessage", **params)
+            payload = self.call(
+                "sendMessage", _user_reply_to_message_id=reply_to_message_id, **params,
+            )
             if payload and payload.get("error_code") == "mesh_route_retired":
                 raise MeshRouteRetiredError(str(payload.get("description") or "mesh route retired"))
             if not payload or not payload.get("ok"):
                 self.last_send_error = describe_telegram_failure(payload)
                 return None
             result = payload.get("result")
-            if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
                 message_ids.append(int(result["message_id"]))
             else:
+                self.last_send_error = str(payload.get("delivery") or "Telegram returned no confirmed message ID")
                 return None
         return message_ids
 
@@ -5277,10 +5641,18 @@ class TelegramClient:
         reply_to_message_id: int | None = None,
         mono: bool = False,
         silent: bool = False,
+        reply_markup: str | None = None,
+        _user_reply_to_message_id: int | None = None,
     ) -> list[int] | None:
         message_ids: list[int] = []
+        reply_origin = (
+            _user_reply_to_message_id
+            if _user_reply_to_message_id is not None else reply_to_message_id
+        )
         for idx, chunk in enumerate(self.chunks(text)):
             params: dict[str, Any] = {"chat_id": self.chat_id, "text": chunk}
+            if reply_markup is not None and idx == 0:
+                params['reply_markup'] = reply_markup
             if silent:
                 # 📊 progress board (T-260807-032) — 첫 발신도 무음이어야 한다. editMessageText
                 # 는 텔레그램이 애초에 알림을 안 띄우지만, sendMessage(첫 카드)는 명시해야 한다.
@@ -5295,16 +5667,19 @@ class TelegramClient:
                 # §5-4 — 루트 삭제 등 거부 케이스 포함 유실 0.
                 params["reply_to_message_id"] = reply_to_message_id
                 params["allow_sending_without_reply"] = "true"
-            payload = self.call("sendMessage", **params)
+            payload = self.call(
+                "sendMessage", _user_reply_to_message_id=reply_origin, **params,
+            )
             if payload and payload.get("error_code") == "mesh_route_retired":
                 raise MeshRouteRetiredError(str(payload.get("description") or "mesh route retired"))
             if not payload or not payload.get("ok"):
                 self.last_send_error = describe_telegram_failure(payload)
                 return None
             result = payload.get("result")
-            if isinstance(result, dict) and isinstance(result.get("message_id"), int):
+            if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
                 message_ids.append(int(result["message_id"]))
             else:
+                self.last_send_error = str(payload.get("delivery") or "Telegram returned no confirmed message ID")
                 return None
         return message_ids
 
@@ -5331,21 +5706,34 @@ class TelegramClient:
         callback_data: str,
         button_text: str = "\U0001f504 지금 업데이트",
     ) -> None:
+        button_text = self.tr(button_text)
+        if is_private_chat_id(self.chat_id):
+            button_text = strip_private_display_emoji(button_text)
         reply_markup = json.dumps(
             {"inline_keyboard": [[{"text": button_text, "callback_data": callback_data}]]},
             ensure_ascii=False,
         )
         self.call("sendMessage", chat_id=self.chat_id, text=self.with_emoji_prefix(text), reply_markup=reply_markup)
 
-    def edit(self, message_id: int, text: str) -> bool:
+    def edit(self, message_id: int, text: str, *, reply_markup: str | None = None,
+             _flow_completion: bool = False, _flow_origin_message_id: int | None = None) -> bool:
         # ⚙️ flow mirror edit-in-place — update one card instead of sending many.
+        text = strip_bridge_nonce_markers(text) or "(empty response)"
+        if is_private_chat_id(self.chat_id):
+            text = strip_private_display_emoji(text)
         payload = self.call(
             "editMessageText",
+            _flow_completion=_flow_completion,
+            _flow_origin_message_id=_flow_origin_message_id,
             chat_id=self.chat_id,
             message_id=message_id,
-            text=strip_bridge_nonce_markers(text) or "(empty response)",
+            text=text,
+            **({'reply_markup': reply_markup} if reply_markup is not None else {}),
         )
-        return bool(payload and payload.get("ok"))
+        return bool(payload and payload.get("ok")
+                    and payload.get("delivery") != CLAUDE_OPS_OUTBOUND_DROP
+                    and not (isinstance(payload.get("result"), dict)
+                             and payload["result"].get("not_delivered")))
 
 
 class NullTelegramClient(TelegramClient):
@@ -5389,6 +5777,7 @@ class NullTelegramClient(TelegramClient):
         reply_to_message_id: int | None = None,
         mono: bool = False,
         silent: bool = False,
+        reply_markup: str | None = None,
     ) -> list[int] | None:
         return [0]
 
@@ -5835,6 +6224,36 @@ class QueueItem:
         )
 
 
+def _flow_rotated_cards_from_payload(raw: Any) -> list[dict[str, Any]]:
+    """넘침으로 넘어간 이전 카드 중 아직 이어짐 표시에 실패한 것만 복원한다."""
+    if not isinstance(raw, list):
+        return []
+    cards: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        message_id = item.get("message_id")
+        body = item.get("body")
+        if isinstance(message_id, bool) or not isinstance(body, str) or not body.strip():
+            continue
+        try:
+            message_id = int(message_id)
+        except (TypeError, ValueError):
+            continue
+        if message_id <= 0:
+            continue
+        cards.append({
+            "message_id": message_id,
+            "body": body,
+            "retired": bool(item.get("retired")),
+        })
+    return cards[-FLOW_ROTATED_CARD_CAP:]
+
+
+def _empty_flow_keyboard() -> dict[str, str]:
+    return {"reply_markup": json.dumps({"inline_keyboard": []}, ensure_ascii=False)}
+
+
 @dataclass
 class ActiveTurn:
     queue_id: str
@@ -5865,6 +6284,8 @@ class ActiveTurn:
     flow_heartbeat_ticks: int = 0  # 이 턴에서 하트비트가 실제로 갱신한 횟수 (상한 대비)
     flow_heartbeat_failures: int = 0  # 연속 실패 수 (상한 도달 시 이 턴 하트비트 포기)
     flow_body: str = ""  # persisted across restart (anti-fragmentation): accumulated flow lines for this turn's single card
+    # T-261007-011: 넘침으로 넘어간 이전 카드 중 아직 이어짐 표시에 실패한 것만 재기동 뒤 다시 닫는다.
+    flow_rotated_cards: list[dict[str, Any]] = field(default_factory=list)
     sent_at: float = 0.0  # T-260705-67: 사용자 발신 시각 (QueueItem.sent_at 승계, 0.0=unknown)
     source: str = ""
     voice_reply_path: str = ""
@@ -5908,6 +6329,9 @@ class ActiveTurn:
             "last_send_attempt_at": self.last_send_attempt_at,
             "flow_message_id": self.flow_message_id,
             "flow_body": self.flow_body,
+            "flow_rotated_cards": [
+                card for card in self.flow_rotated_cards if not card.get("retired")
+            ],
             "source": self.source,
             "voice_reply_path": self.voice_reply_path,
             # T-260728-065 B축 — 카드 제목 보정분. flow_body 와 같은 이유로 지속한다.
@@ -5960,6 +6384,7 @@ class ActiveTurn:
             last_send_attempt_at=float(payload.get("last_send_attempt_at") or 0.0),
             flow_message_id=int(payload.get("flow_message_id") or 0),
             flow_body=str(payload.get("flow_body") or ""),
+            flow_rotated_cards=_flow_rotated_cards_from_payload(payload.get("flow_rotated_cards")),
             sent_at=float(payload.get("sent_at") or 0.0),
             source=str(payload.get("source") or ""),
             voice_reply_path=str(payload.get("voice_reply_path") or ""),
@@ -6182,6 +6607,74 @@ class TmuxClaudeTransport:
             raise ValueError("send_choice_key accepts a single digit")
         with self.composer_lock():
             self.tmux("send-keys", "-t", self.resolve_pane_target(), key)
+
+    def type_question_text(self, text: str) -> None:
+        """질문 화면의 직접 입력칸에 글자를 그대로 친다 (T-261004-016). 제출(Enter)은 안 한다.
+
+        ⚠️ 한 줄만 받는다 — 개행·제어문자가 섞이면 입력칸 밖 키 주입이 된다. 호출부는
+          ask_question_answer_text 로 정리한 값만 넘기고, 친 뒤 화면을 다시 읽어 확인한다.
+        """
+        if not text or any(not ch.isprintable() for ch in text) or len(text) > ASKQ_TEXT_MAX:
+            raise ValueError("type_question_text accepts one printable line")
+        with self.composer_lock():
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), "-l", text)
+
+    def send_approval_choice_if_matches(self, signature: str, number: int, expires_at: float | None) -> str:
+        """Recheck the approval under the same lock as the single key write."""
+        if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
+            return "invalid"
+        with self.composer_lock():
+            parsed = parse_pane_choice(self.capture_pane(80))
+            if not parsed or parsed["kind"] != "approval" or parsed["signature"] != signature:
+                return "changed"
+            if not choice_buttons_allowed("approval"):
+                return "disabled"
+            if parsed.get("expires_in") == 0 or (expires_at is not None and time.time() >= expires_at):
+                return "expired"
+            if expires_at is not None and parsed.get("expires_in") is not None and parsed["expires_in"] > expires_at - time.time() + 2:
+                return "changed"
+            if number not in {num for num, _ in parsed["options"]}:
+                return "invalid"
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), str(number))
+            return "sent"
+
+    def send_computer_use_choice_if_matches(self, signature: str, number: int, expires_at: float | None) -> str:
+        """Navigate the nonnumbered dialog, then re-read before confirming it."""
+        if type(number) is not int or number not in (1, 2):
+            return "invalid"
+        with self.composer_lock():
+            parsed = parse_computer_use_choice(self.capture_pane(80))
+            if not parsed or parsed["signature"] != signature:
+                return "changed"
+            if not choice_buttons_allowed("computer_use"):
+                return "disabled"
+            if expires_at is not None and time.time() >= expires_at:
+                return "expired"
+            target = self.resolve_pane_target()
+            if parsed["selected"] != number:
+                self.tmux("send-keys", "-t", target, "Down" if number == 2 else "Up")
+                for _ in range(5):
+                    time.sleep(0.05)
+                    parsed = parse_computer_use_choice(self.capture_pane(80))
+                    if not parsed or parsed["signature"] != signature:
+                        return "changed"
+                    if parsed["selected"] == number:
+                        break
+                else:
+                    return "changed"
+            if expires_at is not None and time.time() >= expires_at:
+                return "expired"
+            self.tmux("send-keys", "-t", target, "Enter")
+            return "sent"
+
+    def cancel_question_if_matches(self, signature: str) -> bool:
+        """Cancel only the undelivered question, after re-reading it under the lock."""
+        with self.composer_lock():
+            parsed = parse_ask_question(self.capture_pane(80))
+            if not parsed or parsed["signature"] != signature:
+                return False
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), "Escape")
+            return True
 
     def resolve_session_target(self) -> str:
         if self._session_target:
@@ -7150,7 +7643,7 @@ class TokenOwnership:
 
 
 class DurableQueue:
-    terminal = {"sent", "answered", "failed", "dropped"}
+    terminal = {"sent", "answered", "failed", "dropped", "interrupt"}
     injectable = {"received", "enqueued"}
 
     def __init__(self, path: Path, max_events: int = 5000) -> None:
@@ -7336,6 +7829,24 @@ def bridge_nonce() -> str:
 
 def prompt_sha256(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
+
+
+def transcript_prompt_hashes(body: str) -> set[str]:
+    """Match exact input plus Claude's single, complete pasted-content wrapper.
+
+    Keep the sidecar's original hash contract and all receipt-time guards.
+    Extra text, mismatched IDs and partial wrappers are not delivery evidence.
+    """
+    hashes = {prompt_sha256(body)}
+    match = re.fullmatch(
+        r'\s*<pasted_content id="([A-Za-z0-9_-]+)">\r?\n'
+        r'(.*?)\r?\n</pasted_content id="\1">\s*',
+        body,
+        re.DOTALL,
+    )
+    if match:
+        hashes.add(prompt_sha256(match.group(2)))
+    return hashes
 
 
 @contextmanager
@@ -7567,17 +8078,40 @@ def repl_supports_pane_features(repl: Any) -> bool:
 
 
 class Bridge:
+    def language_code(self) -> str:
+        return getattr(getattr(self, "language", None), "code", "")
+
+    def tr(self, source: str, **values: object) -> str:
+        return translate(source, self.language_code(), **values)
+
     # T-260818-006 — __new__ 경량 스텁 구제용 클래스 기본값. #1812(T-260817-033)가 신설한
     # self.suggested_auto_streak 를 suggested_loop_cap_reason 이 읽는데, __init__ 을 건너뛰는
     # 테스트 스텁(Bridge.__new__(Bridge))에는 그 인스턴스 속성이 없어 AttributeError 로 죽었다.
     # ★__init__ 의 할당은 그대로 둔다 — 여기 기본값은 스텁용 바닥일 뿐 초기화의 정본이 아니다.
     #   호출부에 getattr(..., 0) 방어독을 넣지 않는 이유도 같다: 그건 진짜 미초기화 버그를 숨긴다.
     suggested_auto_streak = 0
+    # T-261004-016 스텁 바닥 — jsonl_loop·inbound 가 새로 읽는 속성.
+    clear_watch = None
+    question_card = None
+    question_pending_sig = ""
+    question_checked_at = float("-inf")
+    question_capture_ok_at = float("-inf")
+    question_tool = None
+    question_receipts = ()
 
     def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeReplTransport, token: str) -> None:
         self.config = config
         self.telegram = telegram
+        self.language = Language(config.state_path.parent, default="en", env_prefix="CLB", state_name="claude-bridge-language.json")
+        self.telegram.language = self.language
         self.repl = repl
+        self.stop_buttons = None
+        if os.name != 'nt' and repl_supports_pane_features(repl):
+            try:
+                from agent_control_adapters import TelegramStopButtons
+                self.stop_buttons = TelegramStopButtons(config.node, 'claude', self, globals())
+            except Exception:
+                log('FLOW', 'stop controls unavailable; bridge delivery continues')
         self.binder = (
             SessionBinder(config, repl)
             if repl_supports_pane_features(repl)
@@ -7593,7 +8127,21 @@ class Bridge:
         self.outbox = Outbox(config.outbox_path, config.outbox_max_entries)
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self.pending_flow_closures: list[dict[str, Any]] = []
         self.typing_lock = threading.Lock()
+        # T-261004-016: /clear 완료 감시 {"started": monotonic, "transcript": 붙여넣기 시점 경로}.
+        self.clear_watch: dict[str, Any] | None = None
+        self.terminal_clear_transition: dict[str, Any] | None = None
+        self.clear_notice_transcript = ""
+        # T-261004-016: 질문 화면 카드 — 보낸 질문(episode)·직전 관측 서명·마지막 확인 시각.
+        self.question_card: dict[str, Any] | None = None
+        self.question_pending_sig = ""
+        self.question_checked_at = float("-inf")
+        self.question_capture_ok_at = float("-inf")
+        self.question_tool: dict[str, Any] | None = None
+        self.question_receipts: list[dict[str, Any]] = []
+        self.approval_cards: list[dict[str, Any]] = []
+        self.completed_reply: dict[str, Any] | None = None
         self.poll_heartbeat_lock = threading.Lock()
         self.typing_stop: threading.Event | None = None
         self.session_binding: ClaudeSessionBinding | None = None
@@ -7627,6 +8175,12 @@ class Bridge:
         #   T-260829-029: 두 번째 소비처 = ambient_typing_eligible() — 폰에 안 가는
         #   ambient 턴은 '입력중'도 켜지 않는다. 재기동 기본값 False = typing 억제 쪽(안전).
         self.ambient_final_direct_deliver: bool = False
+        # T-261007-022: 이번 ambient 턴의 받은지시 카드가 텔레그램에 실제로 올라갔는지.
+        #   카드가 보이는 턴은 사용자이 진행을 지켜보는 턴이라 '입력중' 대상에 넣는다
+        #   (실측 2026-10-07 macOS 노드: 다른 엔진이 주입한 지시 카드는 떴는데 18분 작업 내내
+        #   입력중 무표시). 카드 없는 순수 cron·야간워커 재진입은 여전히 False(T-260829-029
+        #   유령 입력중 방지 유지). 재기동 기본값 False = typing 억제 쪽(안전).
+        self.ambient_directive_card_visible: bool = False
         # T-260810-012 축2 — end_turn 미도래 턴의 보류 최종답장.
         # ★persist_state 에 넣지 않는다: 재기동 뒤 되살아나면 옛 턴의 답이
         #   뒤늦게 나가는 새 사고가 된다(음성 픽스처가 이 축을 지킨다).
@@ -7654,6 +8208,10 @@ class Bridge:
         # 항목 없어지면(전부 완료+linger 경과) message_id 를 0 으로 되돌려 다음 배치가
         # 새 카드로 시작한다 — 무관한 미래 작업이 옛 카드에 계속 덧붙는 것을 막는다.
         self.progress_items: dict[str, ProgressItem] = {}
+        # T-261008-009: 텔레그램 턴이 띄운 백그라운드 작업 — tool_use_id → 시작 시각.
+        # candidates = 띄웠지만 아직 백그라운드 확인 전. 재기동 시 비운다(유령 입력중 방지).
+        self.background_typing_candidates: dict[str, float] = {}
+        self.background_typing_tasks: dict[str, float] = {}
         self.progress_message_id: int = 0
         self.progress_last_render_at: float = 0.0
         self.last_transcript_mtime = 0.0
@@ -7986,15 +8544,15 @@ class Bridge:
         # 기능 전체를 끄던 사고(T-260719-037) 재발 방지. 카드 버튼은 해당 후보 1건에만
         # 작용한다. 전면 정지는 UI 버튼 없이 ops 수동 경로(suggested_loop_kill_path touch)만.
         if status == "veto_pending":
-            text = f"⏳ 자동 진행중 · {self.config.suggested_loop_veto_seconds}초 취소창\n{candidate.reply}"
+            text = self.tr("⏳ 자동 진행중 · {seconds}초 취소창\n{reply}", seconds=self.config.suggested_loop_veto_seconds, reply=candidate.reply)
             buttons = [[
-                {"text": "취소", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::cancel"},
+                {"text": self.tr('취소'), "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::cancel"},
             ]]
         else:
             text = f"🛑 HOLD · {candidate.reason}\n{candidate.reply}"
             buttons = [[
-                {"text": "확인하고 실행", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::confirm"},
-                {"text": "거절", "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::reject"},
+                {"text": self.tr('확인하고 실행'), "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::confirm"},
+                {"text": self.tr('거절'), "callback_data": f"{SUGGESTED_LOOP_CALLBACK}::{candidate.candidate_id}::reject"},
             ]]
         try:
             payload = self.telegram.call(
@@ -8700,7 +9258,7 @@ class Bridge:
             candidate = self.suggested_candidates.get(parts[1]) if len(parts) == 3 else None
         action = parts[2] if len(parts) == 3 else ""
         if not candidate:
-            self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text="만료된 요청입니다.")
+            self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text=self.tr('만료된 요청입니다.'))
             return True
         callback_from = callback.get("from") if isinstance(callback.get("from"), dict) else {}
         if not callback.get("id"):
@@ -8724,7 +9282,7 @@ class Bridge:
             self.telegram.call(
                 "answerCallbackQuery",
                 callback_query_id=callback.get("id"),
-                text="확인 주체를 검증하지 못해 HOLD를 유지합니다.",
+                text=self.tr('확인 주체를 검증하지 못해 HOLD를 유지합니다.'),
             )
             return True
         if candidate.status == "superseded":
@@ -8928,6 +9486,7 @@ class Bridge:
             "binding": self.binding_payload(),
             "offset": self.session_pos,
             "active_turn": self.active_turn.to_json() if self.active_turn else None,
+            "pending_flow_closures": list(getattr(self, "pending_flow_closures", [])),
             "parent_map": list(self.parent_map.items())[-500:],
             # T-260718-046 (a): 파킹 지시는 재기동을 넘어 생존해야 유실 방지가 완결된다.
             "exhaust_parked": [
@@ -8937,6 +9496,10 @@ class Bridge:
             # T-260825-008: 고아 최종답 기억은 재기동을 넘어야 한다. 메모리만 있으면
             # 슬롯 해제 뒤 도착한 답이 침묵 유실된다(디스크 state 가 null 이던 실측).
             "orphaned_confirmed_turns": dict(getattr(self, "orphaned_confirmed_turns", {}) or {}),
+            "question_tool": self.question_tool,
+            "question_receipts": list(self.question_receipts),
+            "approval_cards": list(getattr(self, "approval_cards", [])),
+            "completed_reply": getattr(self, "completed_reply", None),
         }
         if identity:
             payload.update({"dev": identity.dev, "ino": identity.ino, "session_path": str(identity.path)})
@@ -8977,6 +9540,16 @@ class Bridge:
 
     def load_state_for_identity(self, identity: SessionIdentity, rotated: bool = False) -> None:
         state = read_json(self.config.state_path)
+        pending = (state or {}).get("pending_flow_closures", [])
+        if isinstance(pending, list):
+            self.pending_flow_closures = [
+                card for card in pending if isinstance(card, dict)
+                and type(card.get("message_id")) is int and card["message_id"] > 0
+                and card.get("chat_id") == str(self.config.chat_id)
+                and isinstance(card.get("body"), str) and card["body"].strip()
+                and type(card.get("attempts")) is int and card["attempts"] >= 0
+                and isinstance(card.get("next_attempt_at"), (int, float))
+            ]
         # T-260709-50 M9: offset 기본값을 고르기 전에 active_turn 을 먼저 복원해야 한다.
         # 옛 순서는 self.active_turn=None 을 보고 start_at_end 로 건너뛴 뒤 active 를
         # 복원해, 재기동 직전 주입된 턴의 user/assistant 레코드를 영구히 놓쳤다.
@@ -9041,6 +9614,53 @@ class Bridge:
                 restored.append((parked_item, parked_at))
             self.exhaust_parked = restored
         self._restore_orphaned_confirmed_turns((state or {}).get("orphaned_confirmed_turns"))
+        self.restore_question_state(state or {})
+        self.restore_approval_cards(state or {})
+        self.restore_completed_reply((state or {}).get("completed_reply"))
+
+    def restore_completed_reply(self, value: Any) -> None:
+        """Restore provenance only for this session; never resend during restore."""
+        binding = self.session_binding
+        valid = (
+            isinstance(value, dict) and binding
+            and value.get("session_id") == binding.session_id
+            and type(value.get("message_id")) is int and value["message_id"] > 0
+            and isinstance(value.get("last_final_uuid"), str) and bool(value["last_final_uuid"])
+            and isinstance(value.get("answer_sha"), str)
+        )
+        self.completed_reply = dict(value) if valid else None
+
+    def restore_approval_cards(self, state: dict[str, Any]) -> None:
+        """Keep display retries, but never resume an old approval after restart."""
+        self.approval_cards = []
+        cards = state.get("approval_cards")
+        for card in cards[-32:] if isinstance(cards, list) else []:
+            if not isinstance(card, dict) or type(card.get("message_id")) is not int:
+                continue
+            if card["message_id"] <= 0 or card.get("chat_id") != str(self.config.chat_id):
+                continue
+            if not isinstance(card.get("body"), str) or not isinstance(card.get("signature"), str):
+                continue
+            if not card.get("completion"):
+                card.update(completion=self.tr('이전 승인창입니다. 새 카드에서 선택해 주세요.'), edited=False)
+            self.approval_cards.append(card)
+
+    def restore_question_state(self, state: dict[str, Any]) -> None:
+        """Keep card message IDs across bridge reloads; never replay an answer."""
+        session_id = self.session_binding.session_id if self.session_binding else None
+        tool = state.get("question_tool")
+        self.question_tool = tool if isinstance(tool, dict) and tool.get("session_id") == session_id else None
+        self.question_receipts = []
+        receipts = state.get("question_receipts")
+        for card in receipts if isinstance(receipts, list) else []:
+            if not isinstance(card, dict) or not isinstance(card.get("message_id"), int):
+                continue
+            if not isinstance(card.get("title"), str) or not card.get("episode"):
+                continue
+            if card.get("session_id") != session_id and not card.get("completion"):
+                card["completion"] = self.tr('그 선택창이 이미 닫혔어요')
+            self.question_receipts.append(card)
+        self.question_card = None
 
     def _restore_orphaned_confirmed_turns(self, payload: Any) -> None:
         """T-260825-008 — persist 된 고아 기억을 인메모리에 되돌린다.
@@ -9136,6 +9756,15 @@ class Bridge:
 
         identity = session_identity(binding.transcript_path) if binding.transcript_path.exists() else None
         if self.session_binding != binding or (identity is not None and self.transcript_identity_changed(identity)):
+            # A live rotation can come from a terminal /clear, outside the Telegram queue.
+            # First binding after restart must never replay an old completion notice.
+            if previous is not None and previous.transcript_path != binding.transcript_path:
+                self.terminal_clear_transition = {
+                    "previous": str(previous.transcript_path),
+                    "transcript": str(binding.transcript_path),
+                    "observed_at": time.time(),
+                    "command_uuid": "",
+                }
             self.session_binding = binding
             if identity is None:
                 self.session_identity = None
@@ -9207,6 +9836,7 @@ class Bridge:
             "pane_pid": binding.pane_pid,
             "claimed_turn_nonce": active.nonce if active else "",
             "active_queue_id": active.queue_id if active else "",
+            "question_card_capability": self.question_card_capability(),
         }
         write_json_atomic(
             self.config.egress_sidecar_path,
@@ -9276,11 +9906,18 @@ class Bridge:
                                 break
                         except Exception:  # noqa: BLE001
                             pass
+                    pulse_started = time.monotonic()
                     try:
                         self.telegram.send_typing()
                     except Exception as exc:  # noqa: BLE001
                         log("TYPE", f"sendChatAction failed: {exc}")
-                    wait_seconds = TYPING_PULSE_FIRST_WAIT if pulse_count == 1 else TYPING_PULSE_WAIT
+                    scheduled = TYPING_PULSE_FIRST_WAIT if pulse_count == 1 else TYPING_PULSE_WAIT
+                    # T-261004-016: 간격은 펄스 "시작"부터 잰다 — 요청 시간이 간격을 5s 넘게
+                    # 밀어 표시가 꺼지지 않게 한다(코덱스 c370293f 동형). 이미 간격을 다 썼으면
+                    # 바로 다음 펄스로 간다.
+                    wait_seconds = max(0.0, scheduled - (time.monotonic() - pulse_started))
+                    if wait_seconds <= 0:
+                        continue
                     if deadline is not None:
                         wait_seconds = min(wait_seconds, max(0.0, deadline - time.monotonic()))
                     if wait_seconds <= 0:
@@ -9324,17 +9961,83 @@ class Bridge:
         # response 가 assistant 레코드마다 켜지고 drain(≈3s)의 ensure_typing 이 상시
         # 재점화해 유령 '입력중'이 됐다 (2026-08-29 사용자 적발, macOS 노드·제어 노드 실측 —
         # 착지 0통에 typing 버스트 하루 수십 회).
-        return bool(getattr(self, "ambient_response_active", False)) and bool(
-            getattr(self, "ambient_final_direct_deliver", False)
+        # T-261007-022: 받은지시 카드가 실제로 올라간 ambient 턴도 대상이다 — 카드로
+        # 진행이 보이는데 입력중만 꺼져 있으면 "멈췄나?"로 읽힌다. 화면 유휴 판정
+        # (has_live_typing_work 의 session_has_foreground_response · drain 의 busy_state)은
+        # 그대로라 작업이 끝나면 꺼진다.
+        return bool(getattr(self, "ambient_response_active", False)) and (
+            bool(getattr(self, "ambient_final_direct_deliver", False))
+            or bool(getattr(self, "ambient_directive_card_visible", False))
         )
+
+    def has_background_typing_work(self, now: float | None = None) -> bool:
+        tasks = getattr(self, "background_typing_tasks", None)
+        if not tasks:
+            return False
+        now = time.time() if now is None else now
+        cap = background_typing_max_seconds()
+        with self.lock:
+            for key in [k for k, started in tasks.items() if now - started >= cap]:
+                tasks.pop(key, None)
+            return bool(tasks)
+
+    def observe_background_typing(self, record: dict[str, Any]) -> None:
+        """T-261008-009: 텔레그램 턴의 백그라운드 작업 시작·끝을 transcript 에서 추적한다."""
+        if not hasattr(self, "background_typing_tasks"):
+            return
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        content = message.get("content")
+        role = message.get("role")
+        if isinstance(content, str):
+            # task-notification 재진입은 문자열 content 로 온다 (macOS 노드 transcript 실측).
+            if role == "user" and self.background_typing_tasks:
+                with self.lock:
+                    for match in _TASK_NOTIFICATION_RE.finditer(content):
+                        self.background_typing_tasks.pop(match.group(1).strip(), None)
+            return
+        if not isinstance(content, list):
+            return
+        now = time.time()
+        with self.lock:
+            if role == "assistant":
+                if self.active_turn is None:
+                    return
+                for item in content:
+                    if not (isinstance(item, dict) and item.get("type") == "tool_use"):
+                        continue
+                    if str(item.get("name") or "") not in BACKGROUND_TYPING_TOOLS:
+                        continue
+                    tool_use_id = str(item.get("id") or "")
+                    if tool_use_id:
+                        self.background_typing_candidates[tool_use_id] = now
+                return
+            if role != "user":
+                return
+            for item in content:
+                if not (isinstance(item, dict) and item.get("type") == "tool_result"):
+                    continue
+                tool_use_id = str(item.get("tool_use_id") or "")
+                started = self.background_typing_candidates.pop(tool_use_id, None)
+                if started is None:
+                    continue
+                raw = item.get("content")
+                text = raw if isinstance(raw, str) else content_text(raw)
+                if _BG_LAUNCH_RE.search(text or ""):
+                    self.background_typing_tasks[tool_use_id] = started
+            text_blob = content_text(content)
+            if text_blob and self.background_typing_tasks:
+                for match in _TASK_NOTIFICATION_RE.finditer(text_blob):
+                    self.background_typing_tasks.pop(match.group(1).strip(), None)
 
     def has_typing_tracked_work(self) -> bool:
         with self.lock:
-            return (
+            if (
                 self.active_turn is not None
                 or bool(self.pending)
                 or self.ambient_typing_eligible()
-            )
+            ):
+                return True
+        return self.has_background_typing_work()
 
     def has_live_typing_work(self) -> bool:
         with self.lock:
@@ -9342,7 +10045,7 @@ class Bridge:
                 return True
             ambient_response_active = self.ambient_typing_eligible()
         if not ambient_response_active:
-            return False
+            return self.has_background_typing_work()
         try:
             foreground_response = self.session_has_foreground_response()
         except Exception:  # noqa: BLE001
@@ -9353,7 +10056,7 @@ class Bridge:
             if self.active_turn is not None or self.pending:
                 return True
             self.ambient_response_active = False
-        return False
+        return self.has_background_typing_work()
 
     def session_has_foreground_response(self) -> bool:
         if not repl_supports_pane_features(self.repl):
@@ -9397,6 +10100,7 @@ class Bridge:
     def finish_ambient_response(self) -> None:
         with self.lock:
             self.ambient_response_active = False
+            self.ambient_directive_card_visible = False
         self.stop_typing()
 
     def begin_typing(self) -> None:
@@ -9436,8 +10140,7 @@ class Bridge:
         self.write_egress_sidecar()
         try:
             self.telegram.send(
-                "⚠️ 네이티브 Claude host 연결/세션이 바뀌어 현재 턴을 중단했어요. "
-                "중복 실행 방지를 위해 자동 재주입하지 않았습니다."
+                self.tr('⚠️ 네이티브 Claude host 연결/세션이 바뀌어 현재 턴을 중단했어요. 중복 실행 방지를 위해 자동 재주입하지 않았습니다.') + '\n' + _flow_progress.recovery_notice('uncertain', tr=self.tr)
             )
         except Exception as exc:  # noqa: BLE001
             log("NATIVE", f"turn-loss notice failed: {exc}")
@@ -9634,6 +10337,10 @@ class Bridge:
         if priority_lane_active():
             log_priority_lane_suppress(f"reasoning mirror nonce={active.nonce}")
             return
+        # T-261006-018: 별도 「클로드 사고」 메시지는 보내지 않는다. 요약 카드로 바꾸지 않는다.
+        if not REASONING_MIRROR_SEND:
+            log("SEND", f"reasoning mirror hidden nonce={active.nonce} len={len(mirror)}")
+            return
         try:
             ids = self.telegram.send(mirror)
             if ids:
@@ -9665,7 +10372,7 @@ class Bridge:
         # T-260722-008: 이 경로가 실측상 턴 종료의 주 경로다(outbox_sent 회수). 여기서 안 닫으면
         # 뒤따르는 finish_active_turn 이 'skip stale finish' 로 조기 return 해 카드가 영영
         # '진행중' 으로 굳는다. close_flow_card 는 flow_closed 로 멱등이라 이중 edit 은 없다.
-        self.close_flow_card(active, "sent")
+        self.close_flow_card(active, queue_status if completed_by_queue else "sent")
         if completed_by_outbox and not completed_by_queue:
             self.queue.append_status(
                 item,
@@ -10433,8 +11140,8 @@ class Bridge:
                 "Treat it as the user's own instruction.\n"
             )
         if notice:
-            return f"{marker}\n{origin}{SUGGESTED_REPLY_CLASS_INSTRUCTION}\n{notice}\n{safe_text}"
-        return f"{marker}\n{origin}{SUGGESTED_REPLY_CLASS_INSTRUCTION}\n\n{safe_text}"
+            return f"{marker}\n{origin}{notice}\n{safe_text}"
+        return f"{marker}\n{origin}\n{safe_text}"
 
     def envelope_sidecar_enabled(self) -> bool:
         # Native setup deliberately skips the POSIX SessionStart hook. Without
@@ -10459,7 +11166,6 @@ class Bridge:
             f"message_id: {item.message_id}",
             f"prompt_sha256: {prompt_sha256(visible_prompt)}",
             f"<{item.nonce}/>",
-            SUGGESTED_REPLY_CLASS_INSTRUCTION,
             "Do not mention this bridge sidecar, envelope, or nonce in the answer.",
         ]
         if item.auto_origin:
@@ -10573,7 +11279,7 @@ class Bridge:
         if not body:
             return False
         expected_hash = prompt_sha256(self.sidecar_visible_prompt(self.queue_item_for_active(active)))
-        if prompt_sha256(body) != expected_hash:
+        if expected_hash not in transcript_prompt_hashes(body):
             return False
         user_seen_at = record_timestamp_seconds(record) or time.time()
         sidecar_consumed = self.mark_active_sidecar_consumed_seen(active)
@@ -10617,7 +11323,7 @@ class Bridge:
         if not body:
             return False
         user_seen_at = record_timestamp_seconds(record) or time.time()
-        body_hash = prompt_sha256(body)
+        body_hashes = transcript_prompt_hashes(body)
         matched: QueueItem | None = None
         with self.lock:
             for item in self.pending:
@@ -10635,7 +11341,7 @@ class Bridge:
                 reference_at = max(item.received_at, item.native_queue_seen_at)
                 if user_seen_at + 2.0 < reference_at:
                     continue
-                if body_hash != prompt_sha256(self.sidecar_visible_prompt(item)):
+                if prompt_sha256(self.sidecar_visible_prompt(item)) not in body_hashes:
                     continue
                 item.user_uuid = user_uuid
                 item.user_seen_at = user_seen_at
@@ -10700,8 +11406,7 @@ class Bridge:
         log("QUEUE", f"late delivery gap={int(gap)}s update={item.update_id}")
         try:
             self.telegram.send(
-                f"⚠️ 지연 수신: 약 {minutes}분 전({clock} KST)에 보내신 메시지를 지금 받았어요. "
-                "그 사이 브릿지가 밀려 있었을 수 있어요. 오래된 지시라면 최신 상황 기준으로 다시 한 번 보내주세요."
+                self.tr('⚠️ 지연 수신: 약 {v0}분 전({v1} KST)에 보내신 메시지를 지금 받았어요. 그 사이 브릿지가 밀려 있었을 수 있어요. 오래된 지시라면 최신 상황 기준으로 다시 한 번 보내주세요.', v0=minutes, v1=clock)
             )
         except Exception as exc:  # noqa: BLE001
             log("QUEUE", f"late delivery alert failed: {exc}")
@@ -10821,9 +11526,7 @@ class Bridge:
         )
         try:
             self.telegram.send(
-                "⚠️ 유령 세션 감지: 화면은 쉬는데 뒤에서 다른 세션이 기록을 계속 써서 "
-                "메시지 주입이 막혀 있었어요. 화면 세션으로 다시 연결합니다 — "
-                "밀린 메시지는 곧 전달됩니다."
+                self.tr('⚠️ 유령 세션 감지: 화면은 쉬는데 뒤에서 다른 세션이 기록을 계속 써서 메시지 주입이 막혀 있었어요. 화면 세션으로 다시 연결합니다 — 밀린 메시지는 곧 전달됩니다.')
             )
         except Exception as exc:  # noqa: BLE001
             log("BUSY", f"stuck self-heal notice failed: {exc}")
@@ -10857,7 +11560,12 @@ class Bridge:
             screen = self.repl.capture_pane(80)
         except Exception:  # noqa: BLE001
             return
-        if not (screen_has_approval_wait(screen) or screen_has_hook_block(screen)):
+        self.refresh_approval_cards(screen)
+        if parse_ask_question(screen) or not (
+            screen_has_approval_wait(screen) or screen_has_hook_block(screen)
+        ):
+            # T-261004-016: 질문 화면은 질문 카드가 맡는다 — 「Yes」 선택지가 승인창으로
+            # 오인돼 '승인 프롬프트 대기' 문구가 겹쳐 나가지 않게 한다.
             # 승인/블록 해소 — episode 리셋 (다음 재발 시 재알림).
             self.approval_stall_since = 0.0
             self.approval_stall_notified = False
@@ -10889,7 +11597,7 @@ class Bridge:
         if self.send_pane_choice_card(screen):
             return
         gist = summarize_approval_prompt(screen)
-        message = "⚠️ 승인 프롬프트 대기 중 — 화면 확인이 필요해요."
+        message = _flow_progress.recovery_notice("approval_local", tr=self.tr)
         if gist:
             message += f"\n{gist}"
         try:
@@ -10908,17 +11616,38 @@ class Bridge:
         parsed = parse_pane_choice(screen)
         if not parsed or not choice_buttons_allowed(parsed["kind"]):
             return False
+        if parsed.get("expires_in") == 0:
+            return False
+        body = choice_card_text(parsed, translate=self.tr)
+        tracked = parsed["kind"] in {"approval", "computer_use"}
+        if tracked:
+            for card in getattr(self, "approval_cards", []):
+                if card["signature"] == parsed["signature"] and not card.get("completion"):
+                    return True
         try:
-            self.telegram.call(
+            response = self.telegram.call(
                 "sendMessage",
                 chat_id=self.config.chat_id,
                 text=getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
-                    choice_card_text(parsed)
+                    body
                 ),
                 reply_markup=json.dumps(
                     {"inline_keyboard": choice_keyboard(parsed)}, ensure_ascii=False
                 ),
+                **({"_computer_use_card": parsed} if parsed["kind"] == "computer_use" else {}),
             )
+            if tracked:
+                result = response.get("result") if isinstance(response, dict) else None
+                if not isinstance(result, dict) or response.get("ok") is not True or type(result.get("message_id")) is not int or result["message_id"] <= 0:
+                    raise RuntimeError("approval card delivery was not confirmed")
+                card = {
+                    "message_id": result["message_id"], "chat_id": str(self.config.chat_id),
+                    "signature": parsed["signature"], "kind": parsed["kind"], "body": body.rsplit("\n\n", 1)[0],
+                    "session_id": self.session_binding.session_id if self.session_binding else None,
+                    "expires_at": time.time() + (300 if parsed["kind"] == "computer_use" else parsed["expires_in"]) if parsed["kind"] == "computer_use" or parsed.get("expires_in") is not None else None,
+                }
+                self.approval_cards = [*getattr(self, "approval_cards", []), card][-32:]
+                self.persist_state()
         except Exception as exc:  # noqa: BLE001
             log("BUSY", f"choice card send failed: {exc}")
             return False
@@ -10929,20 +11658,125 @@ class Bridge:
         )
         return True
 
+    def finish_approval_card(self, card: dict[str, Any], text: str, outcome: str) -> None:
+        card.update(completion=text, outcome=outcome, edited=False, retry_at=0)
+        self.persist_state()
+        log("CHOICE", f"approval outcome={outcome} message_id={card['message_id']} sig={card['signature']}")
+
+    def refresh_approval_cards(self, screen: str | None = None) -> None:
+        """Retry only the card edit. A key write is never retried here."""
+        if not getattr(self, "approval_cards", []):
+            return
+        parsed = parse_pane_choice(screen) if screen is not None else None
+        now = time.time()
+        for card in getattr(self, "approval_cards", []):
+            changed = screen is not None and (
+                not parsed or parsed["signature"] != card["signature"]
+                or card.get("session_id") != (self.session_binding.session_id if self.session_binding else None)
+                or (card.get("expires_at") is not None and parsed.get("expires_in") is not None
+                    and parsed["expires_in"] > card["expires_at"] - now + 2)
+            )
+            expired = card.get("expires_at") is not None and now >= card["expires_at"]
+            if changed and not card.get("observed_closed"):
+                card["observed_closed"] = True
+                self.approval_stall_notified = False
+            if not card.get("completion") and (changed or expired):
+                self.finish_approval_card(card, self.tr('승인창이 닫혔거나 만료됐어요. 입력하지 않았어요.'), "expired")
+            if not card.get("completion") or card.get("edited") or now < card.get("retry_at", 0):
+                continue
+            try:
+                self.telegram.last_send_error = ""
+                response = self.telegram.call(
+                    "editMessageText", chat_id=self.config.chat_id, message_id=card["message_id"],
+                    text=getattr(self.telegram, "with_emoji_prefix", lambda value, **_kw: value)(
+                        card["body"][:2700] + "\n\n" + card["completion"], keep_completion_check=True,
+                    ),
+                    reply_markup=json.dumps({"inline_keyboard": []}),
+                    _request_timeout=10, _attempts=1, _wait_on_flood=False, _question_completion=True,
+                )
+                result = response.get("result") if isinstance(response, dict) else None
+                if not isinstance(result, dict) or response.get("ok") is not True or result.get("message_id") != card["message_id"]:
+                    raise RuntimeError(self.telegram.last_send_error or "approval card edit was not confirmed")
+            except Exception as exc:  # noqa: BLE001
+                if "message is not modified" not in str(exc).lower():
+                    card["retry_at"] = time.time() + 30
+                    log("CHOICE", f"approval card edit pending message_id={card['message_id']} error={type(exc).__name__}")
+                    self.persist_state()
+                    continue
+            card["edited"] = True
+            log("CHOICE", f"approval card updated message_id={card['message_id']} outcome={card.get('outcome', 'expired')}")
+            self.persist_state()
+
+    def apply_approval_choice(self, parsed, number: int, message_id: int | None) -> str:
+        with self.lock:
+            card = next((c for c in getattr(self, "approval_cards", []) if c["message_id"] == message_id), None)
+            if message_id is not None and (not card or card["signature"] != parsed["signature"]):
+                return self.tr('이전 승인 버튼입니다. 새 카드에서 선택해 주세요.')
+            if parsed["kind"] == "computer_use" and (not card or card.get("kind") != "computer_use"):
+                return self.tr('이전 승인 버튼입니다. 새 카드에서 선택해 주세요.')
+            if card and card.get("completion"):
+                return self.tr('이미 처리한 버튼입니다. 카드의 결과를 확인해 주세요.')
+            binding = getattr(self, "session_binding", None)
+            if card and card.get("session_id") != (binding.session_id if binding else None):
+                return self.tr('세션이 바뀌어서 입력하지 않았어요.')
+            now = time.time()
+            remaining = parsed.get("expires_in")
+            expires_at = card.get("expires_at") if card else (now + remaining if remaining is not None else None)
+            if remaining == 0 or (expires_at is not None and now >= expires_at):
+                return self.tr('승인창이 만료돼서 입력하지 않았어요.')
+            if card and expires_at is not None and remaining is not None and remaining > expires_at - now + 2:
+                return self.tr('새 승인창으로 바뀌어서 입력하지 않았어요.')
+            method = "send_computer_use_choice_if_matches" if parsed["kind"] == "computer_use" else "send_approval_choice_if_matches"
+            send = getattr(self.repl, method, None)
+            if not callable(send):
+                return self.tr('이 노드에서는 승인 입력을 확인할 수 없어요.')
+            if card:
+                # Persist before the write: a crash/timeout cannot replay the key.
+                self.finish_approval_card(card, self.tr('입력 전송 여부를 확인하지 못했어요. 다시 입력하지 않았어요.'), "unknown")
+            try:
+                outcome = send(parsed["signature"], number, expires_at)
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"approval outcome=unknown message_id={message_id} error={type(exc).__name__}")
+                return self.tr('입력 전송 여부를 확인하지 못했어요. 다시 입력하지 않았어요.')
+            if outcome == "sent":
+                label = dict(parsed["options"])[number]
+                receipt = "✅ " + self.tr('입력 전송: {number}. {label}', number=number, label=label[:200])
+                receipt += "\n" + self.tr('명령 실행 결과는 Claude 응답에서 확인해 주세요.')
+                toast = self.tr('{v0}번 입력을 보냈어요', v0=number)
+            else:
+                receipt = self.tr('승인창이 바뀌었거나 만료돼서 입력하지 않았어요.')
+                toast = receipt
+            if card:
+                self.finish_approval_card(card, receipt, outcome)
+            log("CHOICE", f"approval outcome={outcome} number={number} message_id={message_id} sig={parsed['signature']}")
+            return toast
+
     def handle_pane_choice_callback(self, callback) -> bool:
         """버튼 탭 → pane 에 숫자 1자 주입. 화면이 그새 바뀌었으면 주입하지 않는다."""
         data = str(callback.get("data") or "")
-        if not data.startswith(CHOICE_CALLBACK + "::"):
+        computer_use = data.startswith(COMPUTER_USE_CALLBACK + "::")
+        if not computer_use and not data.startswith(CHOICE_CALLBACK + "::"):
             return False
         chat = (callback.get("message") or {}).get("chat") or {}
         if str(chat.get("id")) != str(self.config.chat_id):
             return True
         parts = data.split("::")
-        toast = "적용 중…"
-        if len(parts) != 3 or not parts[2].isdigit():
-            toast = "버튼 값을 못 읽었어요"
+        toast = self.tr('적용 중…')
+        message_id = (callback.get("message") or {}).get("message_id")
+        if type(message_id) is not int or message_id <= 0:
+            toast = self.tr('버튼의 원래 메시지를 확인하지 못했어요')
+        elif len(parts) != 3 or not parts[2].isdigit():
+            toast = self.tr('버튼 값을 못 읽었어요')
         else:
-            toast = self.apply_pane_choice(parts[1], int(parts[2]))
+            toast = self.apply_pane_choice(
+                parts[1], int(parts[2]), message_id=(callback.get("message") or {}).get("message_id"),
+                **({"expected_kind": "computer_use"} if computer_use else {}),
+            )
+        message_id = (callback.get("message") or {}).get("message_id")
+        card = next((c for c in getattr(self, "approval_cards", []) if c["message_id"] == message_id), None)
+        if card and not card.get("completion"):
+            self.finish_approval_card(card, toast, "not_sent")
+        log("CHOICE", f"callback handled message_id={message_id} outcome={card.get('outcome') if card else 'untracked'}")
         try:
             self.telegram.call(
                 "answerCallbackQuery",
@@ -10951,41 +11785,282 @@ class Bridge:
             )
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"answerCallbackQuery failed: {exc}")
+        self.refresh_approval_cards()
         return True
 
-    def apply_pane_choice(self, signature: str, number: int) -> str:
+    def apply_pane_choice(self, signature: str, number: int, message_id: int | None = None, expected_kind: str | None = None) -> str:
         if not repl_supports_pane_features(self.repl):
-            return "이 노드에서는 화면 선택을 못 보내요"
+            return self.tr('이 노드에서는 화면 선택을 못 보내요')
         if not (1 <= number <= CHOICE_MAX_OPTIONS):
-            return "그 번호는 보낼 수 없어요"
+            return self.tr('그 번호는 보낼 수 없어요')
         try:
             screen = self.repl.capture_pane(80)
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"capture before inject failed: {exc}")
-            return "지금 화면을 못 읽었어요"
-        parsed = parse_pane_choice(screen)
+            return self.tr('지금 화면을 못 읽었어요')
+        parsed = parse_pane_choice(screen) or parse_ask_question(screen)
         # ★핵심 안전축 = 카드를 만든 그 화면이 **아직 그대로** 일 때만 주입한다.
         #   확인창이 이미 답해졌거나 다른 창으로 바뀐 뒤 누른 탭이 엉뚱한 선택을
         #   확정시키는 길을 막는다. 서명은 제목+선택지 라벨에서 나오므로 커서만
         #   움직인 리드로우는 같은 서명으로 통과한다.
         if not parsed:
-            return "그 선택창이 이미 닫혔어요"
+            return self.tr('그 선택창이 이미 닫혔어요')
+        if (parsed["kind"] == "computer_use") != (expected_kind == "computer_use"):
+            return self.tr('이전 승인 버튼입니다. 새 카드에서 선택해 주세요.')
         if parsed["signature"] != signature:
-            return "화면이 바뀌었어요 — 새 카드에서 골라주세요"
-        if number > len(parsed["options"]):
-            return "그 번호가 지금 화면엔 없어요"
+            return self.tr('화면이 바뀌었어요 — 새 카드에서 골라주세요')
+        if number not in {num for num, _ in parsed["options"]}:
+            return self.tr('그 번호가 지금 화면엔 없어요')
+        if parsed["kind"] in {"approval", "computer_use"}:
+            if not choice_buttons_allowed(parsed["kind"]):
+                return self.tr('이 화면은 폰에서 고르지 않도록 설정돼 있어요')
+            return self.apply_approval_choice(parsed, number, message_id)
+        card = self.question_card
+        if parsed["kind"] == "question" and message_id is not None and (
+            not card or card.get("message_id") != message_id
+        ):
+            return self.tr('이전 질문의 버튼입니다. 최신 질문을 확인해주세요.')
+        if card and card.get("signature") == signature and card.get("submitted"):
+            return self.tr('답변 결과를 확인 중이에요')
         if not choice_buttons_allowed(parsed["kind"]):
-            return "이 화면은 폰에서 고르지 않도록 설정돼 있어요"
+            return self.tr('이 화면은 폰에서 고르지 않도록 설정돼 있어요')
         send = getattr(self.repl, "send_choice_key", None)
         if not callable(send):
-            return "이 노드에서는 화면 선택을 못 보내요"
+            return self.tr('이 노드에서는 화면 선택을 못 보내요')
         try:
             send(str(number))
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"inject failed: {exc}")
-            return "터미널에 못 보냈어요"
+            return self.tr('터미널에 못 보냈어요')
         log("CHOICE", f"injected number={number} sig={signature}")
-        return f"{number}번을 골랐어요"
+        if card and card.get("signature") == signature:
+            card["submitted"] = True
+            self.persist_state()
+        return self.tr('{v0}번을 골랐어요', v0=number)
+
+    def question_card_capability(self) -> dict[str, Any]:
+        """Advertise readiness only after both inbound polling and pane capture work."""
+        now = time.time()
+        poll_age = now - getattr(self, "last_poll_heartbeat_at", 0.0)
+        capture_age = time.monotonic() - self.question_capture_ok_at
+        ready = (
+            bool_env("CLB_ASKUSER_CARDS_ENABLED", False)
+            and not self.config.voice_only
+            and repl_supports_pane_features(self.repl)
+            and choice_buttons_allowed("question")
+            and callable(getattr(self.repl, "cancel_question_if_matches", None))
+            and 0 <= poll_age <= 15
+            and 0 <= capture_age <= 8
+        )
+        return {"protocol": "single-choice-v1", "ready": bool(ready), "observed_at": now}
+
+    # ── 질문 화면(AskUserQuestion) → 폰 카드·직접 입력 답 (T-261004-016) ─────────────
+    def observe_question_record(self, record: dict[str, Any]) -> None:
+        """Only a matching native tool result can put a success check on a card."""
+        binding = self.session_binding
+        if not binding or record.get("isSidechain") or record.get("sessionId") not in {None, binding.session_id}:
+            return
+        message = record.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            return
+        result = record.get("toolUseResult")
+        answers = result.get("answers", {}) if isinstance(result, dict) else {}
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if record.get("type") == "assistant" and block.get("type") == "tool_use" and block.get("name") == "AskUserQuestion":
+                self.question_tool = {
+                    "tool_id": block.get("id"), "session_id": binding.session_id,
+                    "questions": (block.get("input") or {}).get("questions", []),
+                }
+                if self.question_card and self.question_card.get("tool_id") != block.get("id"):
+                    self.question_card = None
+                    self.question_pending_sig = ""
+            if record.get("type") != "user" or block.get("type") != "tool_result":
+                continue
+            for card in self.question_receipts:
+                if not card.get("tool_id") or card["tool_id"] != block.get("tool_use_id") or card.get("session_id") != binding.session_id:
+                    continue
+                answer = answers.get(card["title"]) if isinstance(answers, dict) else None
+                if not block.get("is_error") and isinstance(answer, str) and answer.strip():
+                    card["completion"] = "✅ " + self.tr('선택: {answer}', answer=answer[:2000])
+                else:
+                    card["completion"] = self.tr('그 선택창이 이미 닫혔어요')
+                card["retry_at"] = 0
+        self.refresh_question_cards()
+
+    def refresh_question_cards(self) -> None:
+        """Retry edits of the original message, never the terminal answer."""
+        for card in list(self.question_receipts):
+            if not card.get("completion") or time.time() < card.get("retry_at", 0):
+                continue
+            text = f"❓ {card['title'][:1500]}\n\n{card['completion']}"
+            try:
+                self.telegram.last_send_error = ""
+                response = self.telegram.call(
+                    "editMessageText", chat_id=self.config.chat_id,
+                    message_id=card["message_id"],
+                    text=getattr(self.telegram, "with_emoji_prefix", lambda value, **_kwargs: value)(
+                        text, keep_completion_check=True,
+                    ),
+                    reply_markup=json.dumps({"inline_keyboard": []}),
+                    _request_timeout=10, _attempts=1, _wait_on_flood=False,
+                    _question_completion=True,
+                )
+                result = response.get("result") if isinstance(response, dict) else None
+                if not isinstance(result, dict) or response.get("ok") is not True or result.get("message_id") != card["message_id"]:
+                    raise RuntimeError(self.telegram.last_send_error or "question card edit was not confirmed")
+            except Exception as exc:  # noqa: BLE001
+                if "message is not modified" not in str(exc).lower():
+                    card["retry_at"] = time.time() + 30
+                    log("CHOICE", f"question card completion edit failed: {type(exc).__name__}")
+                    self.persist_state()
+                    continue
+            self.question_receipts = [item for item in self.question_receipts if item is not card]
+            # Keep the active episode until the screen changes, preventing a stale
+            # last frame from creating a second card after the result arrives.
+            log("CHOICE", f"question card completed message_id={card['message_id']}")
+            self.persist_state()
+
+    def maybe_send_question_card(self, min_interval: float = 2.0) -> None:
+        """질문 화면이 두 번 연속 같은 모양으로 보이면 카드 1장을 보낸다.
+
+        질문(episode = 머리표+질문문)당 1장이다. 터미널에서 직접 입력칸에 글자를 치면
+        선택지 글자가 매 키마다 바뀌므로, 서명이 아니라 episode 로 중복을 막는다.
+        """
+        if not repl_supports_pane_features(self.repl):
+            return
+        now = time.monotonic()
+        if now - self.question_checked_at < min_interval:
+            return
+        self.question_checked_at = now
+        self.refresh_question_cards()
+        try:
+            screen = self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            return
+        self.question_capture_ok_at = time.monotonic()
+        parsed = parse_ask_question(screen)
+        if not parsed:
+            self.question_card = None
+            self.question_pending_sig = ""
+            return
+        episode = parsed["header"] + "|" + parsed["title"]
+        for card in self.question_receipts:
+            if (
+                card.get("episode") == episode and not card.get("completion")
+                and card.get("tool_id") == (self.question_tool or {}).get("tool_id")
+            ):
+                self.question_card = card
+                break
+        if self.question_card and self.question_card.get("episode") == episode:
+            self.question_card["signature"] = parsed["signature"]
+            return
+        if self.question_pending_sig != parsed["signature"]:
+            # 반쯤 그려진 화면에 카드를 만들지 않는다 — 다음 확인에서도 같아야 보낸다.
+            self.question_pending_sig = parsed["signature"]
+            return
+        params: dict[str, Any] = {
+            "chat_id": self.config.chat_id,
+            "text": getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
+                ask_question_card_text(parsed, translate=self.tr)
+            ),
+        }
+        if not parsed["multi"] and choice_buttons_allowed(parsed["kind"]):
+            params["reply_markup"] = json.dumps(
+                {"inline_keyboard": choice_keyboard(parsed)}, ensure_ascii=False
+            )
+        try:
+            response = self.telegram.call("sendMessage", **params)
+            if not isinstance(response, dict) or response.get("ok") is not True:
+                raise RuntimeError("question card delivery was not confirmed")
+        except Exception as exc:  # noqa: BLE001
+            cancel = getattr(self.repl, "cancel_question_if_matches", None)
+            cancelled = False
+            if callable(cancel):
+                try:
+                    cancelled = bool(cancel(parsed["signature"]))
+                except Exception:  # noqa: BLE001
+                    pass
+            log("CHOICE", f"question card send failed: {type(exc).__name__}; cancelled={cancelled}")
+            return
+        self.question_card = {
+            "episode": episode,
+            "signature": parsed["signature"],
+            "freeform": parsed["freeform"],
+            "title": parsed["title"],
+            "message_id": (response.get("result") or {}).get("message_id"),
+            "session_id": self.session_binding.session_id if getattr(self, "session_binding", None) else None,
+        }
+        tool = self.question_tool or {}
+        for question in tool.get("questions", []):
+            title = question.get("question", "")
+            if title and title.startswith(parsed["title"]):
+                self.question_card.update(title=title, tool_id=tool.get("tool_id"))
+                break
+        if isinstance(self.question_card["message_id"], int):
+            self.question_receipts = [*self.question_receipts, self.question_card]
+            self.persist_state()
+        log(
+            "CHOICE",
+            f"question card sent options={len(parsed['options'])} freeform={parsed['freeform']} "
+            f"multi={parsed['multi']} sig={parsed['signature']}",
+        )
+
+    def maybe_answer_open_question(self, update: dict[str, Any]) -> bool:
+        """질문 카드가 열려 있을 때 온 글 = 직접 입력 답. 처리했으면 True.
+
+        화면을 다시 읽어 같은 질문이 그대로일 때만 넣는다. 아니면 False 로 돌려
+        종전대로 큐에 쌓는다(글이 사라지지 않게).
+        """
+        card = self.question_card
+        if not card or not card.get("freeform") or not repl_supports_pane_features(self.repl):
+            return False
+        message = update.get("message") or {}
+        chat = message.get("chat") or {}
+        if str(chat.get("id")) != str(self.config.chat_id):
+            return False
+        raw = message.get("text")
+        if not isinstance(raw, str) or not raw.strip() or raw.lstrip().startswith("/"):
+            return False
+        answer = ask_question_answer_text(raw)
+        typer = getattr(self.repl, "type_question_text", None)
+        pick = getattr(self.repl, "send_choice_key", None)
+        if not answer or not callable(typer) or not callable(pick):
+            return False
+        try:
+            parsed = parse_ask_question(self.repl.capture_pane(80))
+        except Exception:  # noqa: BLE001
+            return False
+        if (
+            not parsed
+            or parsed["header"] + "|" + parsed["title"] != card.get("episode")
+            or parsed["freeform"] != card.get("freeform")
+        ):
+            return False
+        try:
+            pick(str(parsed["freeform"]))
+            time.sleep(0.6)
+            typer(answer)
+            time.sleep(0.4)
+            typed = parse_ask_question(self.repl.capture_pane(80))
+            labels = [label for _, label in (typed or {}).get("options", [])]
+            if not typed or not any(label.startswith(answer[:40]) for label in labels):
+                log("CHOICE", "freeform not visible after typing — not submitting")
+                self.telegram.send(self.tr('직접 입력 답이 화면에 안 보여서 제출하지 않았어요. 터미널을 확인해 주세요.'))
+                return True
+            self.repl.submit_prompt("Enter")
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"freeform answer failed: {exc}")
+            return False
+        log("CHOICE", f"freeform answered len={len(answer)} sig={parsed['signature']}")
+        self.question_card = None
+        try:
+            self.telegram.send(self.tr('직접 입력 답을 보냈어요.'))
+        except Exception as exc:  # noqa: BLE001
+            log("TGERR", f"freeform ack failed: {type(exc).__name__}")
+        return True
 
     def dismiss_feedback_survey_if_pending(self) -> str:
         """Dismiss an exact Claude feedback card once, only for a waiting queue."""
@@ -11068,7 +12143,7 @@ class Bridge:
         if not pending_ids or self.usage_limit_notice_sent:
             return
         hint = usage_limit_reset_hint()
-        text = USAGE_LIMIT_NOTICE_TEXT + (f" (한도 리셋 {hint})" if hint else "")
+        text = self.tr(USAGE_LIMIT_NOTICE_TEXT) + (self.tr(" (한도 리셋 {hint})", hint=hint) if hint else "")
         self.telegram.send(text)
         self.usage_limit_notice_sent = True
 
@@ -11190,20 +12265,20 @@ class Bridge:
         cut = len(raw) > len(preview)
         body = f"“{preview}{'…' if cut else ''}”"
         if cut:
-            body += f" (앞 {self.STALE_NOTICE_PREVIEW_CHARS}자만 표시했어요)"
+            body += self.tr(" (앞 {count}자만 표시했어요)", count=self.STALE_NOTICE_PREVIEW_CHARS)
         if not preview:
-            body = "(본문을 복원하지 못했어요)"
+            body = self.tr("(본문을 복원하지 못했어요)")
 
         # 앞서 「대기 안내」가 나갔을 수 있으므로 정정임이 읽혀야 한다.
         # 사용자 1:1 DM 규격 = 맨 앞 장식 이모지 없이 자연어 산문.
         lines = [
-            f"조금 전 보내신 메시지가 결국 처리되지 못하고 버려졌어요. 대기 중이라고 알려드렸다면 그 안내를 정정합니다.",
+            self.tr("조금 전 보내신 메시지가 결국 처리되지 못하고 버려졌어요. 대기 중이라고 알려드렸다면 그 안내를 정정합니다."),
             body,
-            f"이유는 {self.stale_release_reason_phrase(reason)}예요. 같은 내용을 다시 보내주시면 처리됩니다.",
+            self.tr("이유는 {reason}예요. 같은 내용을 다시 보내주시면 처리됩니다.", reason=self.stale_release_reason_phrase(reason) if self.language_code() != "en" else reason),
         ]
         backlog = self.stale_release_suppressed
         if backlog:
-            lines.append(f"그 사이 같은 이유로 {backlog}건이 더 버려졌어요.")
+            lines.append(self.tr("그 사이 같은 이유로 {count}건이 더 버려졌어요.", count=backlog))
             self.stale_release_suppressed = 0
 
         self.stale_release_notice_times.append(now)
@@ -11229,8 +12304,7 @@ class Bridge:
         self.stale_release_notice_times = [*window, now]
         try:
             self.telegram.send(
-                f"앞서 알려드린 것 말고도 {backlog}건이 더 처리되지 못하고 버려졌어요. "
-                "개별 안내는 묶었습니다. 필요한 내용은 다시 보내주세요."
+                self.tr('앞서 알려드린 것 말고도 {v0}건이 더 처리되지 못하고 버려졌어요. 개별 안내는 묶었습니다. 필요한 내용은 다시 보내주세요.', v0=backlog)
             )
         except Exception as exc:  # noqa: BLE001
             self.stale_release_suppressed += backlog  # 발신 실패 시 건수를 되돌린다
@@ -11249,31 +12323,19 @@ class Bridge:
             else:
                 log("QUEUE", f"stuck pending age={age}s update={item.update_id}")
             marker = chr(0x2460 + index - 1) if index <= 20 else f"{index}."
-            details.append(f"{marker}{age}초째 “{preview}…”")
+            details.append(self.tr("{marker}{age}초째 “{preview}…”", marker=marker, age=age, preview=preview))
 
         if len(items) == 1:
             age = int(now - items[0].received_at)
             preview = sanitize_text(items[0].text)[:40]
             if busy_injected:
-                message = (
-                    f"⏳ 대기 안내: 메시지는 이미 세션 입력큐에 실렸고, "
-                    f"진행 중인 턴이 끝나면 처리돼요 ({age}초째, “{preview}…”)."
-                )
+                message = self.tr("⏳ 대기 안내: 메시지는 이미 세션 입력큐에 실렸고, 진행 중인 턴이 끝나면 처리돼요 ({age}초째, “{preview}…”).", age=age, preview=preview)
             else:
-                message = (
-                    f"⚠️ 큐 정체: 받은 메시지가 {age}초째 노드에 주입되지 못하고 대기중이에요 "
-                    f"(“{preview}…”). 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요."
-                )
+                message = self.tr("⚠️ 큐 정체: 받은 메시지가 {age}초째 노드에 주입되지 못하고 대기중이에요 (“{preview}…”). 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요.", age=age, preview=preview)
         elif busy_injected:
-            message = (
-                f"⏳ 대기 안내: {len(items)}건이 세션 입력큐에서 턴 종료 대기 중이에요 — "
-                f"{' '.join(details)}"
-            )
+            message = self.tr("⏳ 대기 안내: {count}건이 세션 입력큐에서 턴 종료 대기 중이에요 — {details}", count=len(items), details=' '.join(details))
         else:
-            message = (
-                f"⚠️ 큐 정체: {len(items)}건이 노드에 주입되지 못하고 대기 중이에요 — "
-                f"{' '.join(details)}. 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요."
-            )
+            message = self.tr("⚠️ 큐 정체: {count}건이 노드에 주입되지 못하고 대기 중이에요 — {details}. 세션이 풀리면 자동 전달되지만, 급한 지시면 상태를 확인해 주세요.", count=len(items), details=' '.join(details))
 
         try:
             self.telegram.send(message)
@@ -11450,7 +12512,7 @@ class Bridge:
                         continue
                     if not expected_hash:
                         expected_hash = prompt_sha256(self.sidecar_visible_prompt(item))
-                    if any(prompt_sha256(body) == expected_hash for body in bodies):
+                    if any(expected_hash in transcript_prompt_hashes(body) for body in bodies):
                         return record
         except OSError:
             return None
@@ -11495,8 +12557,7 @@ class Bridge:
             )
             try:
                 self.telegram.send(
-                    "⚠️ 브릿지 전달 실패: 대기(파킹) 한도가 지나도 세션이 비지 않아 지시를 "
-                    "전달하지 못했어요. 최신 상황 기준으로 다시 보내주세요."
+                    self.tr('⚠️ 브릿지 전달 실패: 대기(파킹) 한도가 지나도 세션이 비지 않아 지시를 전달하지 못했어요. 최신 상황 기준으로 다시 보내주세요.')
                 )
             except Exception as exc:  # noqa: BLE001
                 log("QUEUE", f"park expiry notice failed: {exc}")
@@ -11544,7 +12605,7 @@ class Bridge:
                     self.pending = [p for p in self.pending if p.queue_id != promoted.queue_id]
                     self.pending.append(promoted)
             try:
-                self.telegram.send("⏳ 브릿지: 세션 턴이 끝나 대기하던 지시를 이어서 전달해요.")
+                self.telegram.send(self.tr('⏳ 브릿지: 세션 턴이 끝나 대기하던 지시를 이어서 전달해요.'))
             except Exception as exc:  # noqa: BLE001
                 log("QUEUE", f"park redeliver notice failed: {exc}")
             log("QUEUE", f"parked directive requeued after idle queue={parked_item.queue_id}")
@@ -11599,7 +12660,7 @@ class Bridge:
             )
             try:
                 self.telegram.send(
-                    "ℹ️ 브릿지: 이전 지시가 이미 세션에 소비된 것으로 확인돼 자동 재시도를 취소했어요."
+                    self.tr('ℹ️ 브릿지: 이전 지시가 이미 세션에 소비된 것으로 확인돼 자동 재시도를 취소했어요.')
                 )
             except Exception as exc:  # noqa: BLE001
                 log("QUEUE", f"terminal consumed notice failed: {exc}")
@@ -11655,7 +12716,7 @@ class Bridge:
             )
             try:
                 self.telegram.send(
-                    f"ℹ️ 브릿지 {label}: 이후 도착한 최신 입력이 있어 이전 지시의 자동 재시도는 건너뛰었어요."
+                    self.tr('ℹ️ 브릿지 {v0}: 이후 도착한 최신 입력이 있어 이전 지시의 자동 재시도는 건너뛰었어요.', v0=label)
                 )
             except Exception as exc:  # noqa: BLE001
                 log("QUEUE", f"terminal supersede notice failed: {exc}")
@@ -11688,8 +12749,7 @@ class Bridge:
                 self.persist_state()
                 try:
                     self.telegram.send(
-                        f"⏳ 브릿지 {label}: 세션이 긴 턴을 도는 중이라 지시를 아직 전달하지 못했어요. "
-                        f"턴이 끝나면 자동으로 다시 전달할게요 (대기 한도 {int(park_ttl // 60)}분)."
+                        self.tr('⏳ 브릿지 {v0}: 세션이 긴 턴을 도는 중이라 지시를 아직 전달하지 못했어요. 턴이 끝나면 자동으로 다시 전달할게요 (대기 한도 {v1}분).', v0=label, v1=int(park_ttl // 60))
                     )
                 except Exception as exc:  # noqa: BLE001
                     log("QUEUE", f"terminal park notice failed: {exc}")
@@ -11701,8 +12761,7 @@ class Bridge:
                 return None
             try:
                 self.telegram.send(
-                    f"⚠️ 브릿지 {label}: 지시를 노드에 전달하지 못했고 자동 재시도 소진 "
-                    f"({retry_count}/{retry_max}) 상태예요. 최신 상황 기준으로 다시 보내주세요."
+                    self.tr('⚠️ 브릿지 {v0}: 지시를 노드에 전달하지 못했고 자동 재시도 소진 ({v1}/{v2}) 상태예요. 최신 상황 기준으로 다시 보내주세요.', v0=label, v1=retry_count, v2=retry_max)
                 )
             except Exception as exc:  # noqa: BLE001
                 log("QUEUE", f"terminal exhaustion notice failed: {exc}")
@@ -11748,7 +12807,7 @@ class Bridge:
                 self.pending.append(retry_item)
         try:
             self.telegram.send(
-                f"⚠️ 브릿지 {label}: 지시 전달이 중단돼 유실 방지로 자동 재시도 {next_retry}/{retry_max} 회차를 큐에 넣었어요."
+                self.tr('⚠️ 브릿지 {v0}: 지시 전달이 중단돼 유실 방지로 자동 재시도 {v1}/{v2} 회차를 큐에 넣었어요.', v0=label, v1=next_retry, v2=retry_max)
             )
         except Exception as exc:  # noqa: BLE001
             log("QUEUE", f"terminal retry notice failed: {exc}")
@@ -11756,10 +12815,8 @@ class Bridge:
         return retry_item
 
     # T-260728-043 — 미등록 chat 대장. 폐기는 종전대로 하되 식별 한 줄은 남긴다.
-    #   로그 폭주 금지가 불변 조건이라(그룹방은 사람들이 계속 떠든다) chat 단위 쿨다운을
-    #   두고, 사용자 폰 표면화는 chat 당 **평생 1회**로 durable 하게 잠근다(재기동 무관).
-    #   대장 파일이 죽어도 조용히 넘어가지 않는다 — 실패를 로그로 드러내고, 메모리 dedup 으로
-    #   폭주만은 막는다(기록 없는 폐기로 되돌아가지 않는 것이 이 티켓의 요구다).
+    #   chat 단위 로그 쿨다운과 수신 횟수는 유지한다. 미등록 입력으로 등록된
+    #   사용자 DM에 알림을 보내지 않는다 (T-260923-016).
     UNKNOWN_CHAT_STATE_NAME = "clb-unknown-chats.json"
 
     def _unknown_chat_state_path(self) -> Path:
@@ -11789,7 +12846,7 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             if not getattr(self, "_unknown_chat_state_warned", False):
                 self._unknown_chat_state_warned = True
-                log("QUEUE", f"unknown chat 대장 쓰기 실패 — 표면화 dedup 이 재기동을 못 넘긴다 path={path} err={exc}")
+                log("QUEUE", f"unknown chat 대장 쓰기 실패 — 수신 기록이 재기동을 못 넘긴다 path={path} err={exc}")
 
     def note_unknown_chat(self, update: dict[str, Any], reason: str) -> None:
         ident = unknown_chat_identity(update)
@@ -11809,9 +12866,6 @@ class Bridge:
         seen = int(entry.get("count") or 0) + 1
         last_logged = float(entry.get("last_logged") or 0.0)
         should_log = last_logged <= 0.0 or (now - last_logged) >= cooldown
-        should_notify = not entry.get("notified") and str(
-            os.environ.get("CLB_UNKNOWN_CHAT_NOTIFY", "1")
-        ).strip() not in {"0", "false", "no"}
 
         if should_log:
             who = ident["from_id"]
@@ -11824,22 +12878,12 @@ class Bridge:
                 f"title={ident['chat_title']!r} from={who} seen={seen}",
             )
 
-        if should_notify:
-            title = f" ({ident['chat_title']})" if ident["chat_title"] else ""
-            try:
-                self.telegram.send(
-                    f"등록되지 않은 방에서 메시지를 받아 버렸습니다 — chat_id={chat_id} "
-                    f"[{ident['chat_type']}]{title}. 이 방을 쓰려면 chat_id 를 등록해 주세요."
-                )
-            except Exception as exc:  # noqa: BLE001
-                log("QUEUE", f"unknown chat 표면화 실패 chat_id={chat_id} err={exc}")
-
         state[chat_id] = {
             "first_seen": entry.get("first_seen") or now,
             "last_seen": now,
             "last_logged": now if should_log else last_logged,
             "count": seen,
-            "notified": bool(entry.get("notified")) or should_notify,
+            "notified": bool(entry.get("notified")),
             "chat_type": ident["chat_type"],
             "chat_title": ident["chat_title"],
         }
@@ -11864,9 +12908,14 @@ class Bridge:
                 return
             self.note_unknown_chat(update, "chat_not_registered")
             return
+        language = getattr(self, "language", None)
+        language_reply = language.command(message.get("text") or "") if language else None
+        if language_reply is not None:
+            self.telegram.send(language_reply)
+            return
         has_location = isinstance(message.get("location"), dict) or isinstance(message.get("venue"), dict)
         if has_location and not location_prompt_enabled():
-            self.telegram.send("위치 공유 처리가 꺼져 있습니다 (CLB_LOCATION_PROMPT=0).")
+            self.telegram.send(self.tr('위치 공유 처리가 꺼져 있습니다 (CLB_LOCATION_PROMPT=0).'))
             return
         update_id = int(update["update_id"])
         retry_key = message_update_key(update, self.token_hash)
@@ -11884,7 +12933,7 @@ class Bridge:
             if caption_text:
                 self.media_retry.pop(retry_key, None)
                 media_retry_completion = "media_retry_caption_fallback"
-                self.telegram.send(f"media 처리 실패: {detail}. caption만 전달합니다.")
+                self.telegram.send(self.tr('media 처리 실패: {v0}. caption만 전달합니다.', v0=detail))
                 text = caption_text
             else:
                 # T-260705-56 (3): 재전송 요구 전에 1회 자동 재시도 — transient 다운로드
@@ -11900,15 +12949,15 @@ class Bridge:
                     # offset 전진보다 먼저 fsync 되는 durable queue 에 원 update 를 기록한다.
                     self.persist_media_retry(update, retry_key, attempts + 1, retry_at)
                     log("QUEUE", f"media download failed; auto-requeue in {int(delay)}s update={update_id}")
-                    self.telegram.send(f"media 내려받기 실패: {detail}. {int(delay)}초 뒤 자동 재시도할게요.")
+                    self.telegram.send(self.tr('media 내려받기 실패: {v0}. {v1}초 뒤 자동 재시도할게요.', v0=detail, v1=int(delay)))
                     return
                 self.media_retry.pop(retry_key, None)
                 self.finish_media_retry(update, retry_key, "media_retry_failed")
-                self.telegram.send(f"media 처리 실패: {detail}. 다시 보내주시면 재시도합니다.")
+                self.telegram.send(self.tr('media 처리 실패: {v0}. 다시 보내주시면 재시도합니다.', v0=detail))
                 return
         text = sanitize_text(text)
         if not text:
-            self.telegram.send("처리할 텍스트나 media caption이 없습니다.")
+            self.telegram.send(self.tr('처리할 텍스트나 media caption이 없습니다.'))
             return
         hold_response = release_hold_response(text)
         if hold_response:
@@ -11916,7 +12965,7 @@ class Bridge:
             return
         command = slash_token(text)
         if command in BRIDGE_HEALTH_SLASH_COMMANDS:
-            self.telegram.send("claude-telegram-bridge running")
+            self.telegram.send(self.tr('claude-telegram-bridge running'))
             return
         if command == BRIDGE_STATUS_SLASH_COMMAND:
             self.handle_status_command()
@@ -11972,7 +13021,7 @@ class Bridge:
             return
         state = self.busy_state()
         if state != "idle":
-            self.telegram.send(f"claude bridge status: {state} (턴 진행 중 — 컨텍스트 캡처 생략)")
+            self.telegram.send(self.tr('claude bridge status: {v0} (턴 진행 중 — 컨텍스트 캡처 생략)', v0=state))
             return
         try:
             self.telegram.send_typing()
@@ -11995,7 +13044,7 @@ class Bridge:
             log("INJECT", "/status rich mirrored")
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"/status capture failed: {exc}")
-            self.telegram.send(f"claude bridge status: idle (컨텍스트 캡처 실패: {exc})")
+            self.telegram.send(self.tr('claude bridge status: idle (컨텍스트 캡처 실패: {v0})', v0=exc))
 
     def defer_native_pane_command(self, item: "QueueItem", command_token: str) -> None:
         self.telegram.send(NATIVE_PANE_DEFER_TEXT)
@@ -12043,7 +13092,7 @@ class Bridge:
                 # T-260704-38 F6-c: 세션이 긴 턴 작업 중이라 타임아웃 — 작업중 프레임
                 # 덤프(작업 노드 'Frolicking...' 케이스) 대신 1줄 안내만 보낸다.
                 self.telegram.send(
-                    f"⏳ claude 세션이 다른 작업을 실행 중이라 {command_token} 화면을 못 잡았어요 — 유휴 때 다시 시도해주세요."
+                    self.tr('⏳ claude 세션이 다른 작업을 실행 중이라 {v0} 화면을 못 잡았어요 — 유휴 때 다시 시도해주세요.', v0=command_token)
                 )
                 self.queue.append_status(
                     item,
@@ -12084,7 +13133,7 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("INJECT", f"{command_token} capture failed: {exc}")
             self.queue.append_status(item, "failed", error=str(exc))
-            self.telegram.send(f"claude bridge {command_token} failed: {exc}")
+            self.telegram.send(self.tr('claude bridge {v0} failed: {v1}', v0=command_token, v1=exc))
 
     def current_session_model(self) -> str:
         try:
@@ -12275,13 +13324,14 @@ class Bridge:
         current: str,
         selected: bool = False,
         evidence: str = "",
+        language: str = "",
     ) -> str:
-        label = current or MODEL_STATUS_UNAVAILABLE
+        label = current or translate(MODEL_STATUS_UNAVAILABLE, language)
         if confirmed:
-            action = "모델 선택 적용" if selected else "모델 적용"
-            evidence_line = f"\n착지 확인: {evidence}" if evidence else ""
-            return f"✅ {action}: {alias}{evidence_line}\n현재 세션 모델: {label}"
-        return f"⚠️ 모델 전환 확인 실패: {alias}\n현재 세션 모델: {label}"
+            action = translate("모델 선택 적용" if selected else "모델 적용", language)
+            evidence_line = translate("\n착지 확인: {evidence}", language, evidence=evidence) if evidence else ""
+            return translate("✅ {action}: {alias}{evidence_line}\n현재 세션 모델: {label}", language, action=action, alias=alias, evidence_line=evidence_line, label=label)
+        return translate("⚠️ 모델 전환 확인 실패: {alias}\n현재 세션 모델: {label}", language, alias=alias, label=label)
 
     def handle_model_command(self, item: "QueueItem") -> None:
         # /model 인터셉트 (T-260703-17 프리즈 실사고 재발방지): bare 는 선택지 키보드,
@@ -12304,10 +13354,10 @@ class Bridge:
             except Exception as exc:  # noqa: BLE001
                 log("INJECT", f"/model arg apply failed: {exc}")
                 self.queue.append_status(item, "failed", error=str(exc))
-                self.telegram.send(f"claude bridge /model 적용 실패: {exc}")
+                self.telegram.send(self.tr('claude bridge /model 적용 실패: {v0}', v0=exc))
                 return
             confirmed, current = self.wait_for_session_model(alias)
-            self.telegram.send(self.model_apply_notice(alias, confirmed, current))
+            self.telegram.send(self.model_apply_notice(alias, confirmed, current, language=self.language_code()))
             self.queue.append_status(
                 item,
                 "injected",
@@ -12319,7 +13369,7 @@ class Bridge:
             log("INJECT", f"/model arg={alias} {result} model={current or 'unknown'} update={item.update_id}")
             return
         current = self.current_session_model()
-        current_label = current or MODEL_STATUS_UNAVAILABLE
+        current_label = current or self.tr(MODEL_STATUS_UNAVAILABLE)
         buttons = [
             [
                 {
@@ -12335,7 +13385,7 @@ class Bridge:
         self.telegram.call(
             "sendMessage",
             chat_id=self.config.chat_id,
-            text=prefix(f"현재 세션 모델: {current_label}\n바꿀 모델을 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"),
+            text=prefix(self.tr("현재 세션 모델: {value}\n바꿀 모델을 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):", value=current_label)),
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
         self.queue.append_status(item, "sent", slash_command=MODEL_SLASH_COMMAND)
@@ -12400,16 +13450,12 @@ class Bridge:
             time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
 
     @staticmethod
-    def effort_apply_notice(level: str, confirmed: bool, current: str, selected: bool = False) -> str:
-        label = current or "(세션 상태줄에서 확인 불가)"
+    def effort_apply_notice(level: str, confirmed: bool, current: str, selected: bool = False, language: str = "") -> str:
+        label = current or translate("(세션 상태줄에서 확인 불가)", language)
         if confirmed:
-            action = "사고강도 선택 적용" if selected else "사고강도 적용"
-            return f"✅ {action}: {level}\n현재 세션 사고강도: {label}"
-        return (
-            f"⚠️ 사고강도 전환 확인 실패: {level}\n"
-            f"현재 세션 사고강도: {label}\n"
-            f"(주입은 나갔을 수 있어요 — 상태줄로 확인해 주세요)"
-        )
+            action = translate("사고강도 선택 적용" if selected else "사고강도 적용", language)
+            return translate("✅ {action}: {level}\n현재 세션 사고강도: {label}", language, action=action, level=level, label=label)
+        return translate('⚠️ 사고강도 전환 확인 실패: {level}\n현재 세션 사고강도: {label}\n(주입은 나갔을 수 있어요 — 상태줄로 확인해 주세요)', language, level=level, label=label)
 
     def handle_effort_command(self, item: "QueueItem") -> None:
         if not repl_supports_pane_features(self.repl):
@@ -12429,10 +13475,10 @@ class Bridge:
             except Exception as exc:  # noqa: BLE001
                 log("INJECT", f"/effort arg apply failed: {exc}")
                 self.queue.append_status(item, "failed", error=str(exc))
-                self.telegram.send(f"claude bridge /effort 적용 실패: {exc}")
+                self.telegram.send(self.tr('claude bridge /effort 적용 실패: {v0}', v0=exc))
                 return
             confirmed, current = self.wait_for_session_effort(level)
-            self.telegram.send(self.effort_apply_notice(level, confirmed, current))
+            self.telegram.send(self.effort_apply_notice(level, confirmed, current, language=self.language_code()))
             self.queue.append_status(
                 item,
                 "injected",
@@ -12444,7 +13490,7 @@ class Bridge:
             log("INJECT", f"/effort arg={level} {result} effort={current or 'unknown'} update={item.update_id}")
             return
         current = self.current_session_effort()
-        current_label = current or "(세션 상태줄에서 확인 불가)"
+        current_label = current or self.tr("(세션 상태줄에서 확인 불가)")
         buttons = [
             [
                 {
@@ -12459,8 +13505,7 @@ class Bridge:
             "sendMessage",
             chat_id=self.config.chat_id,
             text=prefix(
-                f"현재 세션 사고강도: {current_label}\n"
-                f"바꿀 사고강도를 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):"
+                self.tr("현재 세션 사고강도: {value}\n바꿀 사고강도를 골라주세요 — 선택 즉시 적용돼요 (선택창 없이):", value=current_label)
             ),
             reply_markup=json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
         )
@@ -12491,14 +13536,14 @@ class Bridge:
         if not submitted:
             current = self.current_session_effort()
             self._emit_model_notice(
-                prefix(self.effort_apply_notice(level, False, current, selected=True)),
+                prefix(self.effort_apply_notice(level, False, current, selected=True, language=self.language_code())),
                 menu_message_id,
             )
             log("INJECT", f"/effort choice={level} failed reason=composer_not_landed")
             return
         confirmed, current = self.wait_for_session_effort(level)
         self._emit_model_notice(
-            prefix(self.effort_apply_notice(level, confirmed, current, selected=True)),
+            prefix(self.effort_apply_notice(level, confirmed, current, selected=True, language=self.language_code())),
             menu_message_id,
         )
         result = "applied" if confirmed else "unverified"
@@ -12546,13 +13591,13 @@ class Bridge:
         if not submitted:
             current = self.current_session_model()
             self._emit_model_notice(
-                prefix(self.model_apply_notice(alias, False, current, selected=True)),
+                prefix(self.model_apply_notice(alias, False, current, selected=True, language=self.language_code())),
                 menu_message_id,
             )
             log("INJECT", f"/model choice={alias} failed reason=composer_not_landed")
             return
         confirmed, current, evidence = self.wait_for_model_choice_landing(alias, checkpoint)
-        text = prefix(self.model_apply_notice(alias, confirmed, current, selected=True, evidence=evidence))
+        text = prefix(self.model_apply_notice(alias, confirmed, current, selected=True, evidence=evidence, language=self.language_code()))
         self._emit_model_notice(text, menu_message_id)
         if confirmed:
             log("INJECT", f"/model choice={alias} applied evidence={evidence} model={current or 'unknown'}")
@@ -12884,6 +13929,11 @@ class Bridge:
         repaste_dedup_record: dict[str, Any] | None = None
         repaste_evidence = ""
         with self.lock:
+            idle_without_work = not self.active_turn and not self.pending
+        if idle_without_work and self.has_background_typing_work():
+            # T-261008-009: 턴은 끝났지만 그 턴이 띄운 백그라운드 작업이 아직 돈다.
+            self.ensure_typing()
+        with self.lock:
             if self.active_turn or not self.pending:
                 return
             if self.pending[0].auto_origin and self.suggested_auto_disabled_locked():
@@ -13064,6 +14114,12 @@ class Bridge:
                 )
                 return
             prompt = escape_unsafe_slash(sanitize_text(inject_text))
+            # A fast /clear can rebind in jsonl_loop before paste returns.
+            # Keep the pre-submit identity, but arm only after a successful paste.
+            binding_before_submit = getattr(self, "session_binding", None)
+            transcript_before_submit = (
+                str(binding_before_submit.transcript_path) if binding_before_submit is not None else ""
+            )
             try:
                 if not self.paste_idle_item(item, prompt, allow_untracked_auto=True):
                     return
@@ -13080,6 +14136,8 @@ class Bridge:
                 **self.terminal_retry_status_extra(item),
             )
             self.queue.append_status(item, "sent", slash_command=command_token)
+            if command_token in SESSION_CLEAR_SLASH_COMMANDS:
+                self.start_clear_watch(transcript_before_submit)
             self.persist_state()
             self.write_egress_sidecar()
             # /exit·/quit 는 세션을 종료시키므로 watchdog 자가복구를 앞당겨 트리거 (graceful 재기동).
@@ -13152,8 +14210,7 @@ class Bridge:
         try:
             preview = sanitize_text(item.text, limit=80)
             self.telegram.send(
-                "⚠️ 브릿지 제출 실패: 지시를 Claude Code composer에 붙였지만 제출 확인이 안 돼 "
-                f"자동 재시도를 중단했어요. 최신 상황 기준으로 다시 보내주세요. (“{preview}…”)"
+                self.tr('⚠️ 브릿지 제출 실패: 지시를 Claude Code composer에 붙였지만 제출 확인이 안 돼 자동 재시도를 중단했어요. 최신 상황 기준으로 다시 보내주세요. (“{v0}…”)', v0=preview)
             )
         except Exception as exc:  # noqa: BLE001
             log("QUEUE", f"submit confirmation failure notice failed: {exc}")
@@ -13468,6 +14525,89 @@ class Bridge:
             self.parent_map[uuid] = parent if isinstance(parent, str) else None
             if len(self.parent_map) > 1000:
                 self.parent_map = dict(list(self.parent_map.items())[-700:])
+
+    def reply_chain_contains(self, parent: str | None, ancestor: str | None) -> bool:
+        seen = set()
+        while parent and parent not in seen:
+            if parent == ancestor:
+                return True
+            seen.add(parent)
+            parent = self.parent_map.get(parent)
+        return False
+
+    def observe_reply_continuation(self, record: dict[str, Any]) -> None:
+        """A native Stop-hook retry remains a reply to its completed user turn."""
+        origin = getattr(self, "completed_reply", None)
+        if not origin or not self.session_binding or origin.get("session_id") != self.session_binding.session_id:
+            self.completed_reply = None
+            return
+        message = record.get("message") or {}
+        if record.get("type") != "user" or message.get("role") != "user" or record.get("isSidechain"):
+            return
+        text = content_text(message.get("content")).strip()
+        if record.get("isMeta") is True and text.startswith("Stop hook feedback:"):
+            uuid = record.get("uuid")
+            if isinstance(uuid, str) and uuid and self.reply_chain_contains(record.get("parentUuid"), origin["last_final_uuid"]):
+                origin["hook_uuid"] = uuid
+                self.persist_state()
+        elif not record.get("isMeta") and (
+            text or (isinstance(message.get("content"), list) and any(
+                isinstance(block, dict) and block.get("type") != "tool_result"
+                for block in message["content"]
+            ))
+        ):
+            # A new human/directive/task-notification boundary must not inherit it.
+            self.completed_reply = None
+            self.persist_state()
+
+    def deliver_reply_continuation(self, record: dict[str, Any]) -> bool:
+        origin = getattr(self, "completed_reply", None)
+        message = record.get("message") or {}
+        if (not origin or self.active_turn or not self.session_binding
+                or origin.get("session_id") != self.session_binding.session_id
+                or record.get("isSidechain") is not False
+                or not origin.get("hook_uuid")
+                or not self.reply_chain_contains(record.get("parentUuid"), origin["hook_uuid"])):
+            return False
+        if message.get("stop_reason") != "end_turn":
+            return False
+        answer = sanitize_text(content_text(message.get("content")), limit=AMBIENT_FINAL_LIMIT)
+        uuid = record.get("uuid")
+        if not answer or not isinstance(uuid, str) or not uuid:
+            return False
+        answer_sha = hashlib.sha256(answer.encode()).hexdigest()
+        key = f"stop-hook:{origin['session_id']}:{uuid}:{answer_sha}"
+        self.stop_typing()
+        self.finish_ambient_response()
+        self.close_ambient_flow_card("reply_continuation")
+        if self.outbox.contains(key) or answer_sha == origin.get("answer_sha"):
+            log("SEND", "skip duplicate Stop-hook reply continuation")
+            return True
+        # Preserve uncertainty before sending: transcript replay cannot duplicate it.
+        self.outbox.mark_sending(key, 1)
+        surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        body = suggested_reply_messages(answer, False, surface)[0]
+        messages = copy_content_bubble_messages(body, surface)
+        try:
+            ids = self.telegram.send(messages[0], reply_to_message_id=origin["message_id"]) if messages[0] else []
+            if ids is not None:
+                for bubble in messages[1:]:
+                    sent = self.telegram.send_copy_content(bubble, code=True, reply_to_message_id=origin["message_id"])
+                    if not sent:
+                        ids = None
+                        break
+                    ids.extend(sent)
+        except Exception as exc:  # noqa: BLE001
+            ids = None
+            log("SEND", f"Stop-hook reply continuation unconfirmed error={type(exc).__name__}")
+        if ids and all(type(mid) is int and mid > 0 for mid in ids):
+            self.outbox.mark_sent(key, ids)
+            origin.update(last_final_uuid=uuid, answer_sha=answer_sha)
+            self.persist_state()
+            log("SEND", f"sent Stop-hook reply continuation assistant={uuid} message_id={ids[0]}")
+        else:
+            log("SEND", f"send-unconfirmed Stop-hook reply continuation assistant={uuid}")
+        return True
 
     def ancestor_matches_active_turn(self, assistant_parent_uuid: str | None) -> ActiveTurn | None:
         active = self.active_turn
@@ -13819,7 +14959,7 @@ class Bridge:
             # body. A busy-inject over active A leaves B in pending; correlate
             # that exact body with evidence-free busy items before falling back
             # to the active turn. Otherwise B is later demoted and re-pasted.
-            content_hash = prompt_sha256(content)
+            content_hashes = transcript_prompt_hashes(content)
             with self.lock:
                 active = self.active_turn
                 busy_candidates: list[QueueItem] = []
@@ -13837,12 +14977,12 @@ class Bridge:
                 )
             for candidate in busy_candidates:
                 expected = self.sidecar_visible_prompt(candidate)
-                if content_hash == prompt_sha256(expected):
+                if prompt_sha256(expected) in content_hashes:
                     nonce = candidate.nonce
                     break
             if not nonce and active and seen_at + 2.0 >= active.injected_at:
                 expected = self.sidecar_visible_prompt(self.queue_item_for_active(active))
-                if content_hash == prompt_sha256(expected):
+                if prompt_sha256(expected) in content_hashes:
                     nonce = active.nonce
         if not nonce:
             return False
@@ -14109,6 +15249,7 @@ class Bridge:
         copy_content_bubbles = copy_content_messages[1:]
         copy_payload_messages = split_copy_payload_messages(delivered_answer)
         reply_to_message_id = active.message_id if active.message_id > 0 and active.source != "voice" else None
+        reply_origin = {"_user_reply_to_message_id": reply_to_message_id} if reply_to_message_id else {}
         self.outbox.mark_sending(key, active.send_attempts)
         terminal_send_failure = False
         try:
@@ -14119,6 +15260,7 @@ class Bridge:
                     part_ids = self.telegram.send(
                         message,
                         reply_to_message_id=reply_to_message_id if not used_reply else None,
+                        **reply_origin,
                     )
                     used_reply = True
                     if part_ids is None:
@@ -14131,7 +15273,8 @@ class Bridge:
                 sent_ids = []
             if sent_ids is not None:
                 for bubble in copy_content_bubbles:
-                    bubble_ids = self.telegram.send_copy_content(bubble, code=True)
+                    copy_reply = {"reply_to_message_id": reply_to_message_id} if reply_to_message_id else {}
+                    bubble_ids = self.telegram.send_copy_content(bubble, code=True, **copy_reply)
                     if bubble_ids is None:
                         sent_ids = None
                         send_error = "copy-content bubble send failed"
@@ -14144,11 +15287,19 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             send_error = str(exc)
             sent_ids = None
+        unconfirmed_delivery = bool(sent_ids) and not isinstance(self.telegram, NullTelegramClient) and any(
+            type(message_id) is not int or message_id <= 0 for message_id in sent_ids
+        )
+        if unconfirmed_delivery:
+            send_error = "telegram send returned no confirmed message ids"
+            sent_ids = None
         if sent_ids == []:
             send_error = "telegram send returned no message ids"
             sent_ids = None
         item = self.queue_item_for_active(active)
         if sent_ids is None:
+            policy_drop = getattr(self.telegram, "last_send_error", "") == CLAUDE_OPS_OUTBOUND_DROP
+            terminal_send_failure = terminal_send_failure or policy_drop
             self.outbox.forget(key)
             with self.lock:
                 attempts = active.send_attempts
@@ -14163,7 +15314,7 @@ class Bridge:
                     send_error = getattr(self.telegram, "last_send_error", "") or send_error
                 send_error = redact_secret_fragments(send_error)
                 log("SEND", f"telegram send failed after {attempts} attempts: {send_error}; releasing active turn")
-                relay_landed = self.relay_final_answer_via_other_node_bot(
+                relay_landed = False if unconfirmed_delivery or policy_drop else self.relay_final_answer_via_other_node_bot(
                     answer, attempts=attempts, send_error=send_error
                 )
                 self.queue.append_status(
@@ -14174,6 +15325,7 @@ class Bridge:
                     attempts=attempts,
                     relay_landed=relay_landed,
                 )
+                self.close_flow_card(active, "failed")
                 self.stop_typing()
                 self.persist_state()
                 self.write_egress_sidecar()
@@ -14226,9 +15378,9 @@ class Bridge:
             write_voice_answer(active, assistant_uuid=assistant_uuid, answer=delivered_answer)
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"voice answer sidecar write failed (non-fatal): {exc}")
-        # 🧠 reasoning mirror — sent once, right after the deduped final answer
-        # (sibling of codex-repl-telegram-bridge's 🧠 코덱스 사고). Empty/no-thinking
-        # turns produce no block. Failures here never affect answer delivery.
+        # 🧠 reasoning mirror — flush once after the deduped final answer so pending
+        # is cleared on this path and the release path. T-261006-018: no separate
+        # Telegram message. Failures here never affect answer delivery.
         if copy_payload_messages:
             active.pending_reasoning = None  # 복붙 콘텐츠 turn 은 🧠 미러 skip
         else:
@@ -14247,6 +15399,12 @@ class Bridge:
             attempts=active.send_attempts,
         )
         log("SEND", f"sent final nonce={active.nonce} assistant={assistant_uuid}")
+        if (self.session_binding and active.user_uuid and type(active.message_id) is int
+                and active.message_id > 0 and active.source != "voice"):
+            self.completed_reply = {
+                "session_id": self.session_binding.session_id, "message_id": active.message_id,
+                "last_final_uuid": assistant_uuid, "answer_sha": hashlib.sha256(answer.encode()).hexdigest(),
+            }
         self.finish_active_turn("sent", active)
 
     def retry_pending_send(self) -> None:
@@ -14265,6 +15423,24 @@ class Bridge:
         self.persist_state()
         self.send_claimed_active_answer(active, assistant_uuid, answer, key)
 
+    def stop_button_kwargs(self, *, create: bool = False, close: bool = False) -> dict:
+        buttons = getattr(self, 'stop_buttons', None)
+        if buttons is None:
+            return {}
+        try:
+            return buttons.prepare() if create else buttons.markup(close=close)
+        except Exception:
+            log('FLOW', 'stop button binding unavailable; progress delivery continues')
+            return {}
+
+    def stop_button_sent(self, message_id: int) -> None:
+        buttons = getattr(self, 'stop_buttons', None)
+        if buttons is not None:
+            try:
+                buttons.sent(message_id)
+            except Exception:
+                log('FLOW', 'stop card receipt unavailable; callback will remain invalid')
+
     def process_record(self, record: dict[str, Any]) -> None:
         binding = self.session_binding
         if not binding:
@@ -14272,9 +15448,31 @@ class Bridge:
         if record.get("sessionId") not in {binding.session_id, None}:
             return
         self.update_parent_map(record)
+        self.observe_reply_continuation(record)
+        if self.maybe_confirm_terminal_clear(record, binding):
+            return
         record_type = record.get("type")
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = message.get("content")
+
+        # Native cancellation is a lifecycle event, not another human prompt.
+        # Modern Claude keeps promptId and identifies it with interruptedMessageId.
+        native_interrupt = (
+            record_type == "user" and message.get("role") == "user"
+            and not record.get("isSidechain") and not record.get("isMeta")
+            and (not record.get("promptId") or record.get("interruptedMessageId"))
+            and content_text(content).strip() in {
+                "[Request interrupted by user]", "[Request interrupted by user for tool use]",
+            }
+        )
+        if native_interrupt:
+            active = self.ancestor_matches_active_turn(record.get("parentUuid"))
+            if active:
+                self.finish_active_turn("interrupt", active)
+                log("TURN", f"native interruption confirmed nonce={active.nonce}")
+            return
+
+        self.observe_question_record(record)
 
         if record_type == "queue-operation":
             self.remember_native_queue_enqueue(record)
@@ -14360,6 +15558,9 @@ class Bridge:
                 #   때는 빠진 갈래가 있어도 픽스처가 걸릴 자리가 없었다.
                 kind = ambient_final_direct_deliver_kind(content_text(content))
                 self.ambient_final_direct_deliver = bool(kind)
+                # T-261007-022: 새 재진입마다 카드 표시를 리셋 — 아래 mirror_ambient_directive
+                #   가 실제 발신에 성공했을 때만 다시 True 가 된다.
+                self.ambient_directive_card_visible = False
                 # ⚠️ 제거 금지 (DO NOT REMOVE) — 이 1줄이 없어서 8/18 유실 7턴이 무증상이었다.
                 #   ambient 턴당 1줄이라 폴링 주기와 무관하게 상한이 턴 수다(도배 아님).
                 log(
@@ -14385,6 +15586,8 @@ class Bridge:
             return
 
         if record_type != "assistant" or message.get("role") != "assistant":
+            return
+        if self.deliver_reply_continuation(record):
             return
         active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
         if not active:
@@ -14484,6 +15687,20 @@ class Bridge:
                 summary = korean_gate_filter_fragment(content_tool_summary(content))
                 if summary:
                     candidate = f"{active.flow_body}\n{summary}".strip() if active.flow_body else summary
+                    # T-261007-011: 한도를 넘기면 새 카드를 내기 전에 이전 카드의 중지 버튼을
+                    # 걷고, 진행이 다음 장으로 이어졌다고 표시한다. 그 편집이 실패하면
+                    # 종료 때 다시 시도한다. 중지 버튼 소유권은 새 카드의 prepare 가 맡는다.
+                    rotating = (
+                        bool(active.flow_message_id)
+                        and bool(active.flow_body)
+                        and len(candidate) > FLOW_MIRROR_LIMIT
+                    )
+                    if rotating:
+                        previous_id = active.flow_message_id
+                        previous_body = active.flow_body
+                        retired = self._retire_rotated_flow_card(active, previous_id, previous_body)
+                        self._remember_rotated_flow_card(active, previous_id, previous_body, retired)
+                        active.flow_message_id = 0
                     if not active.flow_message_id or len(candidate) > FLOW_MIRROR_LIMIT:
                         # first card of the turn, or overflow -> start a fresh card
                         active.flow_body = summary
@@ -14494,13 +15711,17 @@ class Bridge:
                                     node=self.config.node,
                                     emoji=self.config.emoji,
                                     **flow_card_title_kwargs(active),
-                                )
+                                ),
+                                _user_reply_to_message_id=active.message_id if active.source != "voice" else None,
+                                **self.stop_button_kwargs(create=True),
                             )
-                            active.flow_message_id = ids[0] if ids else 0
+                            confirmed = bool(ids) and all(type(mid) is int and mid > 0 for mid in ids)
+                            active.flow_message_id = ids[0] if confirmed else 0
+                            self.stop_button_sent(active.flow_message_id)
                             # T-260727-076: 하트비트 기준점. 도구 이벤트가 낸 렌더도 '갱신'
                             # 이므로, 다음 하트비트는 여기서부터 45초를 센다.
                             active.flow_last_render_at = time.time()
-                            if ids:
+                            if confirmed:
                                 log("SEND", f"sent flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                             else:
                                 log("SEND", f"send-unconfirmed flow mirror nonce={active.nonce}")
@@ -14510,7 +15731,7 @@ class Bridge:
                         # same turn -> grow the existing card in place
                         active.flow_body = candidate
                         try:
-                            self.telegram.edit(
+                            updated = self.telegram.edit(
                                 active.flow_message_id,
                                 format_flow_mirror(
                                     active.flow_body,
@@ -14518,9 +15739,12 @@ class Bridge:
                                     emoji=self.config.emoji,
                                     **flow_card_title_kwargs(active),
                                 ),
+                                _flow_origin_message_id=active.message_id if active.source != "voice" else None,
+                                **self.stop_button_kwargs(),
                             )
                             active.flow_last_render_at = time.time()  # T-260727-076 하트비트 기준점
-                            log("SEND", f"edited flow mirror nonce={active.nonce} mid={active.flow_message_id}")
+                            result = "edited" if updated is True else "edit-unconfirmed"
+                            log("SEND", f"{result} flow mirror nonce={active.nonce} mid={active.flow_message_id}")
                         except Exception as exc:  # noqa: BLE001
                             log("SEND", f"flow mirror edit failed (non-fatal): {exc}")
             return
@@ -14640,7 +15864,8 @@ class Bridge:
         #   (실측 2026-08-01: 원장 브릿지발 카드 0건 · 단위 재현 sent=0).
         #   ★수리 순서 주의 = 호출부만 고치면 여기서 다시 막힌다. 실제로 그렇게 한 번
         #   막혔고 픽스처가 그것을 잡았다(거동으로 재라는 이유).
-        body = format_ambient_directive(content_text(content))
+        raw_text = content_text(content)
+        body = format_task_notification_card(raw_text) or format_ambient_directive(raw_text)
         if not body:
             return
         # 새 bout 시작 → flow 카드 묶음 경계 리셋(받은지시→작업흐름→노드결과 한 묶음).
@@ -14652,6 +15877,8 @@ class Bridge:
             self.ambient_directive_message_id = ids[0] if ids else 0
             self.ambient_directive_body = body
             if ids:
+                # T-261007-022: 카드가 실제로 보일 때만 입력중 대상.
+                self.ambient_directive_card_visible = True
                 log("SEND", f"sent ambient directive mid={self.ambient_directive_message_id}")
             else:
                 log("SEND", "send-unconfirmed ambient directive")
@@ -14871,8 +16098,8 @@ class Bridge:
         if anchor and alt3_narrative_enabled():
             # alt3 (spec v0.2 §6, T-260702-37 PR-B): 받은지시 카드 edit-통합 모델 폐기 →
             # 결과는 받은지시 루트에 native reply (같은 chat·같은 봇이라 §5-3 충족).
-            # 본문은 R-C1 자연어 그대로(✅ chrome 없음) — 연결은 reply 인용이 표현한다.
-            # reply send 실패 시 폴백 = 기존 ✅ 카드 send (결과 1장 보장).
+            # 본문은 R-C1 자연어 그대로(자동 제목 없음) — 연결은 reply 인용이 표현한다.
+            # reply send 실패 시 폴백도 같은 본문 send (결과 1장 보장).
             try:
                 if not text and copy_content_bubbles:
                     delivered = True
@@ -14895,7 +16122,7 @@ class Bridge:
             self.ambient_directive_body = ""
         elif anchor:
             # ⚙️ T-260630-48 — 받은지시 앵커 카드를 결과까지 포함한 1장으로 in-place 통합
-            # (새 ✅ 카드 X). 받은지시→노드결과 2장 중복 제거. edit 실패 시 폴백으로 새 카드 send
+            # (자동 제목 없음). 받은지시→결과 2장 중복 제거. edit 실패 시 폴백으로 본문 send
             # (앵커 매칭/edit 실패해도 결과는 1장 보장 — 0장도 2장폭발도 아님).
             unified = f"{self.ambient_directive_body}\n\n{format_ambient_final(text, limit=AMBIENT_FINAL_LIMIT)}"
             try:
@@ -15012,7 +16239,10 @@ class Bridge:
             current = self.active_turn
             if not current or current.nonce != nonce or current.flow_closed:
                 return False
-            self.telegram.edit(active.flow_message_id, body)
+            if self.telegram.edit(active.flow_message_id, body,
+                                  _flow_origin_message_id=active.message_id if active.source != "voice" else None,
+                                  **self.stop_button_kwargs()) is not True:
+                raise RuntimeError("flow heartbeat edit unconfirmed")
         except Exception as exc:  # noqa: BLE001
             active.flow_heartbeat_failures += 1
             log(
@@ -15033,6 +16263,88 @@ class Bridge:
         )
         return True
 
+    def _edit_flow_message(self, message_id: int, text: str, markup: dict[str, str]) -> bool:
+        try:
+            ok = self.telegram.edit(message_id, text, _flow_completion=True, **markup)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"flow mirror edit failed (non-fatal) mid={message_id}: {exc}")
+            ok = False
+        with self.lock:
+            pending = list(getattr(self, "pending_flow_closures", []))
+            previous = next((card for card in pending if card["message_id"] == message_id), {})
+            pending = [card for card in pending if card["message_id"] != message_id]
+            if ok is not True:
+                attempts = int(previous.get("attempts", 0)) + 1
+                pending.append({"message_id": message_id, "body": text, "attempts": attempts,
+                                "chat_id": str(self.config.chat_id),
+                                "next_attempt_at": time.time() + min(300, 15 * 2 ** min(attempts - 1, 5))})
+            self.pending_flow_closures = pending
+            # Releasing active_turn cannot discard this bridge-owned cleanup queue.
+            self.persist_state()
+        if ok is not True:
+            log("SEND", f"flow mirror edit unconfirmed mid={message_id}")
+            return False
+        return True
+
+    def retry_pending_flow_closures(self, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        for card in list(getattr(self, "pending_flow_closures", [])):
+            if now >= card["next_attempt_at"]:
+                self._edit_flow_message(card["message_id"], card["body"], _empty_flow_keyboard())
+                break  # One bounded retry per watch iteration, with per-card backoff.
+
+    def _render_continued_flow(self, active: ActiveTurn, body: str) -> str:
+        return format_flow_mirror(
+            body,
+            node=self.config.node,
+            emoji=self.config.emoji,
+            **flow_card_title_kwargs(active),
+            done_label=FLOW_CARD_CONTINUED_LABEL,
+        )
+
+    def _retire_rotated_flow_card(self, active: ActiveTurn, message_id: int, body: str) -> bool:
+        rendered = self._render_continued_flow(active, body)
+        if not rendered or not message_id:
+            return False
+        # 빈 키보드만 보낸다. markup(close=True)는 현재 카드 소유권을 닫으므로
+        # 다음 장의 prepare()보다 먼저 부르면 새 중지 버튼이 열리지 않는다.
+        return self._edit_flow_message(message_id, rendered, _empty_flow_keyboard())
+
+    def _remember_rotated_flow_card(
+        self, active: ActiveTurn, message_id: int, body: str, retired: bool,
+    ) -> None:
+        if retired or not message_id or not body:
+            return
+        for card in active.flow_rotated_cards:
+            if int(card.get("message_id") or 0) == int(message_id):
+                card["body"] = body
+                card["retired"] = False
+                return
+        active.flow_rotated_cards.append({
+            "message_id": int(message_id),
+            "body": body,
+            "retired": False,
+        })
+        if len(active.flow_rotated_cards) > FLOW_ROTATED_CARD_CAP:
+            active.flow_rotated_cards = active.flow_rotated_cards[-FLOW_ROTATED_CARD_CAP:]
+
+    def _retry_rotated_flow_cards(self, active: ActiveTurn) -> bool:
+        remaining: list[dict[str, Any]] = []
+        for card in list(active.flow_rotated_cards):
+            if card.get("retired"):
+                continue
+            message_id = int(card.get("message_id") or 0)
+            body = str(card.get("body") or "")
+            if message_id and body and self._retire_rotated_flow_card(active, message_id, body):
+                continue
+            remaining.append({
+                "message_id": message_id,
+                "body": body,
+                "retired": False,
+            })
+        active.flow_rotated_cards = remaining[-FLOW_ROTATED_CARD_CAP:]
+        return not active.flow_rotated_cards
+
     def close_flow_card(self, active: ActiveTurn, status: str) -> bool:
         # ⚙️ flow 카드 종료 edit (T-260721-022) — 턴이 끝나도 카드가 '진행중 · 현재: ▶ 실행'
         # 으로 굳어 고아로 남던 회귀(2026-07-21 21:41 사용자 제보, 51분 잔류) 차단.
@@ -15045,9 +16357,13 @@ class Bridge:
         # 그쪽이 active_turn 을 먼저 해제해 버려 finish_active_turn 은 'skip stale finish' 로
         # 조기 return → 카드가 한 번도 안 닫혔다(재기동 후 'closed flow mirror' 0건). 양쪽에서
         # 부르되 edit 은 1회만 나가야 한다.
+        #
+        # T-261007-011: edit 이 False 를 반환하거나 예외를 내면 flow_closed 를 세우지 않는다.
+        # 성공 로그도 그때는 남기지 않아, 다음 종료 호출이 같은 카드를 다시 닫을 수 있다.
+        # 넘침으로 남은 이전 카드도 같은 종료에서 이어짐 표시를 재시도한다.
         if active.flow_closed or not active.flow_message_id or not active.flow_body:
             return False
-        active.flow_closed = True
+        rotated_ok = self._retry_rotated_flow_cards(active)
         try:
             started = active.injected_at or active.sent_at or 0.0
             body = format_flow_mirror(
@@ -15060,10 +16376,31 @@ class Bridge:
             )
             if not body:
                 return False
-            self.telegram.edit(active.flow_message_id, body)
+            notice = _flow_progress.recovery_notice(status, tr=self.tr)
+            text = body + ("\n\n" + notice if notice else "")
+            if self.stop_buttons:
+                self.stop_buttons.retire(active.nonce, active.flow_message_id)
+            # Both terminal paths detach active_turn before closing its card.
+            # Remove the keyboard by this card's ID, even after a newer turn starts.
+            ok = self._edit_flow_message(active.flow_message_id, text, _empty_flow_keyboard())
         except Exception as exc:  # noqa: BLE001
             log("SEND", f"flow mirror close failed (non-fatal): {exc}")
             return False
+        if ok is not True:
+            log(
+                "SEND",
+                f"flow mirror close unconfirmed nonce={active.nonce} "
+                f"mid={active.flow_message_id} status={status}",
+            )
+            return False
+        if not rotated_ok:
+            log(
+                "SEND",
+                f"flow mirror close partial nonce={active.nonce} "
+                f"mid={active.flow_message_id} status={status}",
+            )
+            return False
+        active.flow_closed = True
         log("SEND", f"closed flow mirror nonce={active.nonce} mid={active.flow_message_id} status={status}")
         return True
 
@@ -15211,10 +16548,79 @@ class Bridge:
             },
         )
 
+    def maybe_confirm_terminal_clear(self, record: dict[str, Any], binding: Any) -> bool:
+        """Require a live rotation plus linked native command/completion records."""
+        transition = getattr(self, "terminal_clear_transition", None)
+        if not transition or transition["transcript"] != str(binding.transcript_path):
+            return False
+        if time.time() - transition["observed_at"] >= CLEAR_WATCH_TIMEOUT_SEC:
+            self.terminal_clear_transition = None
+            return False
+        if (
+            record.get("sessionId") != binding.session_id
+            or record.get("isSidechain") or record.get("isMeta") or record.get("promptId")
+            or (record_timestamp_seconds(record) or 0) < transition["observed_at"] - SESSION_ROTATION_LOOKBACK_SECONDS
+        ):
+            return False
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        if record.get("type") == "user" and message.get("role") == "user":
+            command = re.fullmatch(
+                r"<command-name>/(clear|new)</command-name>\s*"
+                r"<command-message>\1</command-message>\s*<command-args>\s*</command-args>",
+                content_text(message.get("content")).strip(),
+            )
+            if command and record.get("uuid"):
+                transition["command_uuid"] = record["uuid"]
+                return True
+        if (
+            record.get("type") == "system" and record.get("subtype") == "local_command"
+            and transition["command_uuid"]
+            and record.get("parentUuid") == transition["command_uuid"]
+        ):
+            self.terminal_clear_transition = None
+            self.start_clear_watch(transition["previous"])
+            self.maybe_confirm_pending_clear(binding)
+            return True
+        return False
+
+    def start_clear_watch(self, transcript_before_submit: str | None = None) -> None:
+        if transcript_before_submit is None:
+            binding = getattr(self, "session_binding", None)
+            transcript_before_submit = str(binding.transcript_path) if binding is not None else ""
+        self.clear_watch = {
+            "started": time.monotonic(),
+            "transcript": transcript_before_submit,
+        }
+
+    def maybe_confirm_pending_clear(self, binding: Any) -> None:
+        """T-261004-016: /clear 뒤 새 transcript 로 갈아타면 완료, 90초 넘으면 미확인 1통."""
+        watch = getattr(self, "clear_watch", None)
+        if not watch:
+            return
+        current = str(binding.transcript_path) if binding is not None else ""
+        if current and current != watch.get("transcript"):
+            if current == getattr(self, "clear_notice_transcript", ""):
+                self.clear_watch = None
+                return
+            self.clear_notice_transcript = current
+            message = CLEAR_SLASH_COMPLETE
+        elif time.monotonic() - float(watch.get("started", 0.0)) >= CLEAR_WATCH_TIMEOUT_SEC:
+            message = CLEAR_SLASH_TIMEOUT
+        else:
+            return
+        self.clear_watch = None
+        log("SESSION", f"clear watch → {message}")
+        try:
+            self.telegram.send(message)
+        except Exception as exc:  # noqa: BLE001 - 알림 실패가 감시 루프를 죽이지 않는다.
+            log("TGERR", f"clear notice failed: {type(exc).__name__}")
+
     def jsonl_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                self.retry_pending_flow_closures()
                 binding = self.ensure_session_binding()
+                self.maybe_confirm_pending_clear(binding)
                 path = binding.transcript_path
                 if not path.exists():
                     self.retry_pending_send()
@@ -15236,6 +16642,8 @@ class Bridge:
                     self.retry_pending_send()
                     self.maybe_heartbeat_flow_card()
                     self.maybe_render_progress_board()
+                    # T-261004-016: 질문 화면은 도구 응답 대기 = transcript 침묵 구간에 뜬다.
+                    self.maybe_send_question_card()
                     self.stop_event.wait(0.5)
                     continue
                 cursor = self.session_pos
@@ -15258,6 +16666,7 @@ class Bridge:
                     if isinstance(record, dict):
                         self.process_record(record)
                         self.observe_progress_signals(record)
+                        self.observe_background_typing(record)
                     self.session_pos = line_end
                     self.persist_state()
                 self.last_transcript_mtime = path.stat().st_mtime
@@ -15290,7 +16699,7 @@ class Bridge:
         self.telegram.send_update_button(
             message,
             f"{SELF_UPDATE_BREAK_CALLBACK}::{latest}",
-            button_text="⚠️ 보호 설정 우회 동의",
+            button_text=self.tr('⚠️ 보호 설정 우회 동의'),
         )
 
     def handle_self_update_callback(self, callback: dict[str, Any]) -> bool:
@@ -15313,13 +16722,14 @@ class Bridge:
             self.telegram.call(
                 "answerCallbackQuery",
                 callback_query_id=callback_query_id,
-                text=callback_text,
+                text=self.tr(callback_text),
             )
         latest = data.split("::", 1)[1]
         result = perform_self_update(
             latest,
             notify=self.telegram.send,
             allow_break_system_packages=is_break_consent,
+            language=self.language_code(),
         )
         if result.status == "pep668_consent_required":
             self.send_self_update_break_consent(latest, result.message)
@@ -15331,7 +16741,7 @@ class Bridge:
             return
         if bool_env(f"{SELF_UPDATE_PREFIX}_AUTO_UPDATE", False):
             # 자동 경로만 중복 알림을 죽인다 — 버튼(사람)은 늘 답을 받는다.
-            result = perform_self_update(latest, notify=self.telegram.send, quiet_repeat=True)
+            result = perform_self_update(latest, notify=self.telegram.send, quiet_repeat=True, language=self.language_code())
             if result.status == "pep668_consent_required":
                 # ⚠️ 동의 버튼은 중복 억제 대상이 아니다. 이건 알림이 아니라 **행동 수단**이라,
                 #    한 번 띄운 뒤 침묵하면 사람이 누를 문이 사라져 업데이트가 영구히 막힌다
@@ -15342,7 +16752,7 @@ class Bridge:
         current = _self_update_installed_version() or "?"
         try:
             self.telegram.send_update_button(
-                f"\U0001f195 새 버전 v{latest} 가 출시됐어요! (현재 v{current})\n업데이트하려면 아래 버튼을 누르세요.",
+                self.tr('🆕 새 버전 v{v0} 가 출시됐어요! (현재 v{v1})\n업데이트하려면 아래 버튼을 누르세요.', v0=latest, v1=current),
                 f"{SELF_UPDATE_CALLBACK}::{latest}",
             )
         except Exception as exc:  # noqa: BLE001
@@ -15401,6 +16811,9 @@ class Bridge:
                     data = str(cb.get("data") or "")
                     offset = update_id + 1
                     write_text_atomic(self.config.offset_file, offset)
+                    buttons = getattr(self, 'stop_buttons', None)
+                    if buttons is not None and buttons.callback(cb):
+                        continue
                     if self.handle_self_update_callback(cb):
                         continue
                     if self.handle_suggested_callback(cb):
@@ -15420,9 +16833,14 @@ class Bridge:
                         if str(cb_chat.get("id")) == str(self.config.chat_id):
                             # 토스트는 결과(적용/거부/대기) 확정 전에 뜨므로 중립 문구 — 실제 결과는
                             # 적용부가 메뉴 메시지를 edit 해서 durable 하게 알린다 (T-260703-23).
-                            self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text="확인 중…")
+                            self.telegram.call("answerCallbackQuery", callback_query_id=cb.get("id"), text=self.tr('확인 중…'))
                             menu_message_id = (cb.get("message") or {}).get("message_id")
                             getattr(self, apply_name)(data.split("::", 1)[1], menu_message_id=menu_message_id)
+                    continue
+                # T-261004-016: 질문 카드가 열려 있으면 글 = 직접 입력 답 (코덱스 동형).
+                if self.maybe_answer_open_question(update):
+                    offset = update_id + 1
+                    write_text_atomic(self.config.offset_file, offset)
                     continue
                 self.enqueue_update(update)
                 offset = update_id + 1
@@ -15448,12 +16866,21 @@ class Bridge:
         ]
         for thread in threads:
             thread.start()
+        control = None
+        if os.environ.get('AGENT_CONTROL_ENABLED') == '1':
+            try:
+                from agent_control_adapters import start_control
+                control = start_control(self.config.node, 'claude', self, globals())
+            except ImportError:
+                log('CONTROL', 'optional control module unavailable; bridge preserved')
         try:
             if self.config.voice_only:
                 self.voice_loop()
             else:
                 self.telegram_loop()
         finally:
+            if control:
+                control.close()
             self.stop_event.set()
             self.stop_typing()
             self.release_lock()
