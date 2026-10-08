@@ -5,10 +5,73 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
 class PublicExportTest(unittest.TestCase):
+    def load_delivery_bridge(self):
+        path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
+        spec = importlib.util.spec_from_file_location("claude_public_delivery", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_app_permission_cards_bind_context_and_use_separate_callbacks(self):
+        mod = self.load_delivery_bridge()
+        screen = "\n".join([
+            "────────────────────────────────────────",
+            "Computer Use wants to control these apps", "Inspect the test page.",
+            "● Browser", "● Mail", "4 other apps will be hidden while Claude works.",
+            "❯ Deny, and tell Claude what to do differently", "(esc)",
+            "  Allow for this session (2 apps)", "Enter to confirm · Esc to cancel",
+        ])
+        parsed = mod.parse_pane_choice(screen)
+        self.assertEqual(parsed["kind"], "computer_use")
+        self.assertEqual(len(parsed["options"]), 2)
+        for row in mod.choice_keyboard(parsed):
+            self.assertTrue(row[0]["callback_data"].startswith("clb-computer-use::"))
+        moved = screen.replace("❯ Deny", "  Deny").replace("  Allow", "❯ Allow")
+        self.assertEqual(parsed["signature"], mod.parse_pane_choice(moved)["signature"])
+        changed = screen.replace("● Browser", "● Calendar")
+        self.assertNotEqual(parsed["signature"], mod.parse_pane_choice(changed)["signature"])
+
+    def test_send_requires_a_positive_confirmed_message_id(self):
+        mod = self.load_delivery_bridge()
+        client = mod.TelegramClient("token", "1234", "", 4096)
+        for message_id in (0, -1, True, None):
+            client.call = mock.Mock(return_value={"ok": True, "result": {"message_id": message_id}})
+            self.assertIsNone(client.send("Test reply"))
+            self.assertIsNone(client.send_copy_content("Test content", code=True))
+
+    def test_stop_hook_final_keeps_reply_origin_and_is_not_replayed(self):
+        mod = self.load_delivery_bridge()
+        with tempfile.TemporaryDirectory() as td:
+            bridge = mod.Bridge.__new__(mod.Bridge)
+            bridge.config = SimpleNamespace(chat_id="1234")
+            bridge.session_binding = SimpleNamespace(session_id="test-session")
+            bridge.active_turn = None
+            bridge.completed_reply = {"session_id": "test-session", "message_id": 42,
+                                      "last_final_uuid": "first-final", "answer_sha": "previous"}
+            bridge.parent_map = {"hook": "first-final"}
+            bridge.outbox = mod.Outbox(Path(td) / "outbox.json")
+            bridge.telegram = SimpleNamespace(send=mock.Mock(return_value=[123]))
+            for method in ("persist_state", "stop_typing", "finish_ambient_response", "close_ambient_flow_card"):
+                setattr(bridge, method, mock.Mock())
+            bridge.observe_reply_continuation({"type": "user", "uuid": "hook", "parentUuid": "first-final",
+                "isMeta": True, "isSidechain": False,
+                "message": {"role": "user", "content": "Stop hook feedback:\nFinish cleanup."}})
+            final = {"uuid": "next-final", "parentUuid": "hook", "isSidechain": False,
+                     "message": {"stop_reason": "end_turn", "content": "Cleanup finished."}}
+            self.assertTrue(bridge.deliver_reply_continuation(final))
+            bridge.telegram.send.assert_called_once_with("Cleanup finished.", reply_to_message_id=42)
+            self.assertTrue(bridge.deliver_reply_continuation(final))
+            self.assertEqual(bridge.telegram.send.call_count, 1)
+            bridge.observe_reply_continuation({"type": "user", "isMeta": False,
+                                              "message": {"role": "user", "content": "A new request"}})
+            self.assertFalse(bridge.deliver_reply_continuation(final))
+
     def test_imports_public_bridge(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
         spec = importlib.util.spec_from_file_location("claude_telegram_bridge", path)
@@ -25,6 +88,7 @@ class PublicExportTest(unittest.TestCase):
         self.assertIsNone(mod.release_hold_response("출시 멈춰 memoyo"))
         # T-260701-68: stripped mesh layer must leave working no-op stubs
         self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}))
+        self.assertFalse(mod.mesh_cutover_applies("sendMessage", {}))
         # T-260718-031: internal call sites pass bot_token=... — the stub must
         # accept it, and the surviving except/raise sites need the exception type.
         self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}, bot_token="tok"))

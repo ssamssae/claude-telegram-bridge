@@ -183,6 +183,94 @@ class TypingLivenessTest(unittest.TestCase):
         bridge.ensure_typing.assert_called_once_with()
         bridge.stop_typing.assert_not_called()
 
+    def _drain_bridge(self, mod, *, direct_deliver, card_visible):
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        bridge.pending = []
+        bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = direct_deliver
+        bridge.ambient_directive_card_visible = card_visible
+        bridge.suggested_loop_runtime_enabled = True
+        bridge.config = SimpleNamespace(suggested_loop_kill_path=Path("/nonexistent"))
+        bridge.repl = SimpleNamespace(supports_pane_features=True)
+        bridge.drop_pending_suggested_auto = mock.Mock()
+        bridge.session_clear_pending = mock.Mock(return_value=False)
+        bridge.dismiss_feedback_survey_if_pending = mock.Mock(return_value="none")
+        bridge.busy_state = mock.Mock(return_value="generating")
+        bridge.try_busy_inject = mock.Mock(return_value=False)
+        bridge.ensure_typing = mock.Mock()
+        bridge.stop_typing = mock.Mock()
+        bridge.exhaust_parked = []
+        bridge.last_nonidle_seen_at = 0.0
+        return bridge
+
+    def test_drain_busy_keeps_typing_for_ambient_with_visible_directive_card(self):
+        """T-261007-022: 받은지시 카드가 텔레그램에 올라간 ambient 턴은 최종답변
+        직접발신 대상이 아니어도 busy 구간에서 입력중을 켠다 (실측 2026-10-07 macOS 노드 —
+        다른 엔진이 주입한 지시 카드는 떴는데 18분 작업 내내 입력중 무표시).
+
+        ★변이 프로브 = ambient_typing_eligible() 에서 ambient_directive_card_visible
+        갈래를 빼면 이 테스트가 FAIL 한다."""
+        mod = load_bridge_module()
+        bridge = self._drain_bridge(mod, direct_deliver=False, card_visible=True)
+
+        bridge.drain_queue()
+
+        bridge.ensure_typing.assert_called_once_with()
+        bridge.stop_typing.assert_not_called()
+
+    def test_card_visible_ambient_turn_self_exits_when_screen_is_idle(self):
+        """T-261007-022 무회귀: 카드가 보여도 화면이 쉬고 있으면 입력중 생존 판정은
+        False — T-260829-029 유령 입력중 방지 장치가 그대로 걸린다."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        bridge.pending = []
+        bridge.ambient_response_active = True
+        bridge.ambient_final_direct_deliver = False
+        bridge.ambient_directive_card_visible = True
+        bridge.session_has_foreground_response = mock.Mock(return_value=False)
+        bridge.has_passive_background_work = mock.Mock(return_value=False)
+
+        self.assertTrue(bridge.has_typing_tracked_work())
+        self.assertFalse(bridge.has_live_typing_work())
+
+    def test_directive_card_send_marks_typing_visibility(self):
+        """T-261007-022: 카드 발신 성공 때만 True, 실패면 False."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.ambient_directive_card_visible = False
+        bridge.reset_ambient_flow = mock.Mock()
+        bridge.telegram = SimpleNamespace(send=mock.Mock(return_value=[123]))
+        with mock.patch.object(mod, "format_ambient_directive", return_value="📥 지시"):
+            bridge.mirror_ambient_directive("작업해")
+        self.assertTrue(bridge.ambient_directive_card_visible)
+
+        failing = mod.Bridge.__new__(mod.Bridge)
+        failing.ambient_directive_card_visible = False
+        failing.reset_ambient_flow = mock.Mock()
+        failing.telegram = SimpleNamespace(send=mock.Mock(side_effect=RuntimeError("boom")))
+        with mock.patch.object(mod, "format_ambient_directive", return_value="📥 지시"):
+            failing.mirror_ambient_directive("작업해")
+        self.assertFalse(failing.ambient_directive_card_visible)
+
+    def test_finish_ambient_response_clears_card_visibility(self):
+        """T-261007-022: 턴 종료 뒤 카드 표시가 남아 다음 무카드 재진입을 켜지 않게."""
+        mod = load_bridge_module()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.lock = threading.RLock()
+        bridge.typing_lock = threading.Lock()
+        bridge.typing_stop = None
+        bridge.ambient_response_active = True
+        bridge.ambient_directive_card_visible = True
+
+        bridge.finish_ambient_response()
+
+        self.assertFalse(bridge.ambient_directive_card_visible)
+        self.assertFalse(bridge.ambient_typing_eligible())
+
     def test_top_level_end_turn_explicitly_stops_ambient_typing(self):
         mod = load_bridge_module()
         bridge = mod.Bridge.__new__(mod.Bridge)

@@ -52,6 +52,9 @@ class SetupError(RuntimeError):
     """Expected setup error shown without a traceback."""
 
 
+from bridge_i18n import translate
+
+
 @dataclass(frozen=True)
 class SettingsChange:
     changed: bool
@@ -78,6 +81,7 @@ class SetupOptions:
     transport: str = "tmux"
     conpty_state_path: Path | None = None
     create_session: bool = False
+    language: str = "en"
 
 
 ApiCall = Callable[..., dict[str, Any] | None]
@@ -312,13 +316,13 @@ def wait_for_chat_id(
     raise SetupError("Timed out waiting for /start in the bot chat")
 
 
-def send_test_message(token: str, chat_id: str, api_call: ApiCall = telegram_call) -> bool:
+def send_test_message(token: str, chat_id: str, api_call: ApiCall = telegram_call, *, language: str = "en") -> bool:
     payload = api_call(
         token,
         "sendMessage",
         timeout=30,
         chat_id=chat_id,
-        text="Claude Telegram Bridge setup complete. Send /ping, then a normal Claude prompt.",
+        text=translate("Claude Telegram Bridge setup complete. Send /ping, then a normal Claude prompt.", language),
     )
     return bool(payload and payload.get("ok"))
 
@@ -347,7 +351,10 @@ def write_private_config(
     chat_id: str,
     transport: str = "tmux",
     conpty_state_path: Path | None = None,
+    language: str = "en",
 ) -> None:
+    if language not in {"en", "ko"}:
+        raise SetupError("language must be en or ko")
     write_text_atomic(token_file, json.dumps({"token": token}) + "\n", mode=0o600)
     write_text_atomic(registry_file, json.dumps(token_registry(token), indent=2) + "\n", mode=0o600)
     config_lines = [
@@ -356,6 +363,7 @@ def write_private_config(
             f"CLB_TOKEN_REGISTRY={shell_quote(registry_file)}",
             f"CLB_CHAT_ID={shell_quote(chat_id)}",
             f"CLB_STATE_DIR={shell_quote(state_dir)}",
+            f"CLB_LANGUAGE={shell_quote(language)}",
             f"CLB_REPL_TRANSPORT={transport}",
             "SUGGESTED_REPLY_BUBBLE=1",
     ]
@@ -892,6 +900,7 @@ def setup_bridge(
         chat_id=chat_id,
         transport=transport,
         conpty_state_path=options.conpty_state_path,
+        language=options.language,
     )
     ok(f"wrote private config: {options.config_file}")
     ok(f"wrote token files: {options.token_file}, {options.registry_file}")
@@ -925,7 +934,7 @@ def setup_bridge(
 
     setup_step(6, "Send a setup-complete test message")
     if options.send_test:
-        if send_test_message(token, chat_id, api_call=api_call):
+        if send_test_message(token, chat_id, api_call=api_call, language=options.language):
             ok("sent setup-complete test message")
         else:
             warn("test message failed; run doctor")
@@ -1191,6 +1200,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--state-dir", type=expand_path, default=default_state_dir())
     setup_parser.add_argument("--token")
     setup_parser.add_argument("--chat-id")
+    setup_parser.add_argument("--language", choices=("en", "ko"), default="en", help="language for bridge messages and buttons")
     setup_parser.add_argument("--wait-timeout", type=int, default=180)
     setup_parser.add_argument("--no-service", action="store_true")
     setup_parser.add_argument("--no-start", action="store_true")
@@ -1296,6 +1306,7 @@ def main(argv: list[str] | None = None) -> int:
                     transport=args.transport,
                     conpty_state_path=args.conpty_state,
                     create_session=args.create_session,
+                    language=args.language,
                 )
             )
         if args.command == "doctor":

@@ -130,7 +130,7 @@ class ClaudeSelfUpdateFeedbackTest(unittest.TestCase):
         }
         seen: dict[str, object] = {}
 
-        def fake_update(latest: str, *, notify=None, allow_break_system_packages=False):
+        def fake_update(latest: str, *, notify=None, allow_break_system_packages=False, language=""):
             seen["latest"] = latest
             seen["notify"] = notify
             seen["allow_break"] = allow_break_system_packages
@@ -166,7 +166,7 @@ class ClaudeSelfUpdateFeedbackTest(unittest.TestCase):
         }
         seen: dict[str, object] = {}
 
-        def fake_update(latest: str, *, notify=None, allow_break_system_packages=False):
+        def fake_update(latest: str, *, notify=None, allow_break_system_packages=False, language=""):
             seen["latest"] = latest
             seen["notify"] = notify
             seen["allow_break"] = allow_break_system_packages
