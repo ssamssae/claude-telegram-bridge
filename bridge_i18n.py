@@ -297,6 +297,21 @@ _message('This request has already ended.', '이미 종료된 요청입니다.')
 _message('Stop requested. Waiting for confirmation.', '중단 요청을 전달했습니다. 확인 중입니다.')
 _message('Response ended without any text.', '응답이 종료됐지만 본문이 없습니다.')
 _message('Response ended · elapsed {elapsed}', '응답 종료 · 소요 {elapsed}')
+# Claude 입력큐 대기 메시지 「지금 반영」 버튼 (T-261009-003).
+_message('🤖️ Send now · {count}', '🤖️ 지금 반영 · {count}개')
+_message('{count} message(s) are waiting in the input queue. They go in when the current step ends. Send now delivers them right away; a reply being written may be cut off.', '메시지 {count}개가 입력큐에서 기다리고 있어요. 지금 단계가 끝나면 자동으로 들어가요. 지금 반영을 누르면 바로 들어가지만, 답을 쓰던 중이면 그 답은 끊길 수 있어요.')
+_message('The waiting messages went in.', '기다리던 메시지가 모두 들어갔어요.')
+_message('The input queue wait ended. Messages that could not be processed are reported separately.', '입력큐 대기가 끝났어요. 처리되지 못한 메시지는 따로 알려드려요.')
+_message('Sent now: {count} message(s) went in.', '지금 반영 완료: 메시지 {count}개가 들어갔어요.')
+_message('Could not confirm that {count} message(s) went in after Send now. Nothing is resent; check the local screen.', '지금 반영한 메시지 {count}개가 들어갔는지 확인하지 못했어요. 다시 보내지 않아요. 화면을 확인해 주세요.')
+_message('Send now requested ({count}). Checking delivery.', '지금 반영을 요청했어요 ({count}개). 들어갔는지 확인하고 있어요.')
+_message('Send now was already requested. Check the result first.', '이미 지금 반영을 요청했어요. 결과를 먼저 확인하세요.')
+_message('Send now requested. Checking delivery.', '지금 반영을 요청했어요. 확인 중이에요.')
+_message('Send now delivery is unconfirmed. Check the local screen; do not retry.', '전달 여부를 확인하지 못했어요. 다시 누르지 말고 화면을 확인하세요.')
+_message('Not sent: there is text in the input box.', '입력창에 쓰던 글이 있어 보내지 않았어요.')
+_message('Not sent: the input box is not visible. Check the local screen.', '입력창이 보이지 않아 보내지 않았어요. 화면을 확인하세요.')
+_message('Nothing is running now. The messages go in automatically.', '지금 실행 중인 작업이 없어요. 곧 자동으로 들어가요.')
+_message('No waiting messages. They already went in.', '기다리는 메시지가 없어요. 이미 들어갔어요.')
 
 def normalize_language(value: object) -> str:
     code = re.split(r'[-_.]', str(value or '').strip().lower(), maxsplit=1)[0]

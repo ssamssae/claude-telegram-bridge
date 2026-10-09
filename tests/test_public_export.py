@@ -45,6 +45,58 @@ class PublicExportTest(unittest.TestCase):
             self.assertIsNone(client.send("Test reply"))
             self.assertIsNone(client.send_copy_content("Test content", code=True))
 
+    def test_approval_card_completes_after_late_record_without_private_speaker(self):
+        mod = self.load_delivery_bridge()
+        title = "Publish the prepared release?"
+        screen = "\n".join([
+            "────────────────────────────────────────", "☐ Approval", "", title, "",
+            "❯ 1. Publish", "  2. Cancel", "  3. Type something.",
+            "────────────────────────────────────────", "  4. Chat about this", "",
+            "Enter to select · ↑/↓ to navigate · Esc to cancel",
+        ])
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.config = SimpleNamespace(chat_id="1234")
+        bridge.session_binding = SimpleNamespace(session_id="test-session")
+        bridge.repl = SimpleNamespace(supports_pane_features=True,
+                                      capture_pane=mock.Mock(return_value=screen))
+        bridge.telegram = SimpleNamespace(
+            call=mock.Mock(return_value={"ok": True, "result": {"message_id": 42}}),
+            with_emoji_prefix=lambda text, **kwargs: text,
+        )
+        bridge.persist_state = mock.Mock()
+        bridge.question_card = None
+        bridge.question_tool = None
+        bridge.question_receipts = []
+        bridge.question_pending_sig = ""
+        bridge.question_checked_at = 0
+        with mock.patch.object(mod.subprocess, "Popen") as spawn:
+            bridge.maybe_send_question_card(min_interval=0)
+            bridge.maybe_send_question_card(min_interval=0)
+            self.assertEqual(bridge.question_card["message_id"], 42)
+            self.assertIsNone(bridge.question_card.get("completion"))
+            bridge.observe_question_record({
+                "type": "assistant", "sessionId": "test-session",
+                "message": {"content": [{"type": "tool_use", "name": "AskUserQuestion",
+                    "id": "approval-tool", "input": {"questions": [{
+                        "question": title, "header": "Approval", "multiSelect": False,
+                    }]}}]},
+            })
+            result = {
+                "type": "user", "sessionId": "test-session",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "approval-tool"}]},
+                "toolUseResult": {"answers": {title: "Publish"}},
+            }
+            bridge.observe_question_record(result)
+            bridge.observe_question_record(result)
+            edits = [call for call in bridge.telegram.call.call_args_list
+                     if call.args[0] == "editMessageText"]
+            self.assertEqual(len(edits), 1)
+            self.assertEqual(edits[0].kwargs["message_id"], 42)
+            self.assertIn("✅", edits[0].kwargs["text"])
+            self.assertIn("Publish", edits[0].kwargs["text"])
+            self.assertEqual(edits[0].kwargs["reply_markup"], '{"inline_keyboard": []}')
+            spawn.assert_not_called()
+
     def test_stop_hook_final_keeps_reply_origin_and_is_not_replayed(self):
         mod = self.load_delivery_bridge()
         with tempfile.TemporaryDirectory() as td:
