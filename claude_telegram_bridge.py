@@ -1400,63 +1400,11 @@ def apply_suggested_reply_confirmation(
         log("SEND", "suggested reply confirmation failed (non-fatal)")
 
 
-# T-260730-062 — 사용자 직접 지시 2026-07-30 15:1x·16:1x KST 「이 카드에서 눈깔 앞에
-# 이모지 제거」/「눈깔 아직도 나온다」. 카드 자체는 남긴다(00:15 요청 T-260730-002 를
-# 되돌리지 않는다) — 없애는 것은 ★표시 문자뿐이다.
-#
-# ★왜 그냥 지우지 않고 접미사로 바꿨나 = 이 회전자는 애니메이션이 전제다. 프레임에서
-# 이모지·화살표만 빼면 4프레임이 ★전부 같은 문자열이 되고, 텔레그램 editMessageText 는
-# 본문이 직전과 동일하면 400(message is not modified)을 낸다. 그러면 위 루프의
-# `if not edit_activity(...)` 가 회전을 죽이고(:826 로그) 카드가 첫 프레임에서 얼어붙는다 —
-# 얼어붙은 카드는 죽은 작업과 화면상 같아서 T-260730-002 가 고치려던 결함이 되살아난다.
-# 그래서 이모지 대신 ★텍스트만으로 프레임을 다르게 만든다. 가운뎃점(U+00B7)은 이모지가
-# 아니라 문장부호다.
-#
-# 불변식 = 인접 프레임이 항상 다르다(순환 포함: 마지막 → 처음). 여기에 항목을 더하거나
-# 순서를 바꿀 때 이 성질이 깨지면 위 400 경로가 그대로 재발한다 —
-# test_eye_activity_frames_have_no_emoji_and_never_repeat 가 그것을 지킨다.
-EYE_ACTIVITY_SUFFIXES = ("", "·", "··", "···")
-# 한 바퀴 = 이 대기 상수 + 편집 1회 왕복시간. 왕복은 상수를 깎아도 안 줄어드는 고정비다
-# (편집마다 mesh-send.sh 서브프로세스를 새로 띄워 routes·env 를 다시 읽고 HTTPS 왕복).
-# 실측 1.387 / 1.329 / 1.316 초 (mesh-send.sh 라이브 편집 3회, T-260729-052).
-# 지속시간 계산과 테스트 불변식이 이 고정비를 빼먹으면 모형이 관측과 어긋난다 —
-# 1.5 를 "절반이니 2배" 로 읽었다가 실제로는 1.33배였던 것이 그 사고다.
-EYE_ACTIVITY_EDIT_ROUNDTRIP_SECONDS = 1.33
-# 회전 간격. 1.5 -> 0.67 (사용자 GO 2026-07-29 18:08 KST 제어 노드 DM 인용:
-# "카드 회전은 0.67초로 내리고 버티는 시간 줄어드는 건 그냥 감수할게", T-260729-052).
-# 0.67 + 1.33 = 2.0초/바퀴 = 원 요청인 4.00초 대비 정확히 2배. 1.5 로는 3.00초(1.33배)에
-# 그친다는 것이 라이브 자연대조로 확정됐다 (화살표 카드 326장, 4프레임 sha256 역산 분리).
-# 레이트리밋 근거 = 같은 재집계에서 화살표 성공 편집 9,778건 중 실패 2건(0.02%)이고
-# 429 는 mesh-ledger 27일(07-02~07-29) 전체에서 0건. 분당 30회로 텔레그램 사설챗
-# 권고(초당 1회 = 분당 60회) 안이다. 더 낮추려면 429 재측정이 선행이다.
-EYE_ACTIVITY_EDIT_MIN_SECONDS = 0.67
-# 상한은 이번 범위 밖 — 사용자가 상한 인상 없이 지속시간 단축을 명시 수용했다
-# (243초 -> 160초 = 80 x 2.0). 예산 소진이지 조기 종료가 아니다.
-EYE_ACTIVITY_MAX_EDITS = 80
-# ── 지속 국면 (T-260730-002, 사용자 직접 지시 2026-07-30 00:15 KST) ──────────────
-# 빠른 국면이 예산을 다 쓰면 종전에는 회전이 그 자리에서 얼어붙었다. 얼어붙은 화살표는
-# 죽은 작업과 화면상 완전히 같아서, 사용자 시점에선 "오래 걸리는 중" 과 "멈춤" 이 구별되지
-# 않았다. 이 결함은 위 :220-221 주석이 이미 자백하고 있었다("2분 넘는 침묵엔 살아있음
-# 신호가 구조적으로 0"). 그래서 예산 뒤에 느린 지속 국면을 붙인다 — 켜짐/꺼짐이 아니라
-# **갱신되는** 표시여야 멈춘 것과 구별된다는 것이 이 요청의 핵심이다.
-#
-# 45초 = FLOW_HEARTBEAT_SECONDS 승계다. 여기서 새 숫자를 발명하지 않는다 — 그 값은 카드당
-# ~1.3회/분이라 편집 레이트리밋 대비 충분히 보수적이라고 이미 판정돼 라이브에 있다
-# (T-260727-076). 빠른 국면(분당 30회)의 1/22 이라 지속 국면이 레이트 축을 새로 열지 않는다.
-EYE_ACTIVITY_SUSTAIN_SECONDS = 45.0
-# ⚠️ 상한이 이 기능의 안전핀이다. 지속이 무한이면 **죽은 턴이 영원히 살아 보이는** 정반대
-# 사고가 되고, 그건 원 증상보다 나쁘다 (FLOW_HEARTBEAT_MAX_TICKS 주석과 같은 논지).
-# 40틱 x 45초 = 30분. 상한을 넘기면 갱신을 멈추고 카드를 얼린다 — 얼어붙은 카드는 정직하다.
-EYE_ACTIVITY_SUSTAIN_MAX_TICKS = 40
-# 일반(비추천) 턴은 이 시간이 지난 뒤에야 카드를 띄운다. 짧은 턴까지 카드를 만들면 표시가
-# 상시가 되어 정보량이 0 이 된다 — "도는 중" 이 의미를 가지려면 안 도는 동안엔 없어야 한다.
-#
-# 60초를 고른 근거: 그 아래 구간은 typing 인디케이터가 이미 덮는다(4초마다 재발사되는
-# 라이브 신호다). 카드가 추가로 값을 갖는 지점은 typing 만으로 불안해지는 구간이고, 그건
-# 분 단위다. 20초로 잡으면 보통 턴 대부분에 카드가 떠서 "긴 턴" 이라는 의미 자체가 없어진다.
-# 동시에 빠른 국면이 얼어붙는 160초보다는 충분히 앞이라 지속 국면 검증에도 늦지 않다.
-# ★이 값은 사용자 취향으로 조정 가능한 유일한 손잡이다 — 카드가 너무 잦거나 너무 늦으면
-#   여기만 바꾼다(픽스처는 정확한 값이 아니라 하한을 단언하므로 조정에 안 깨진다).
+# T-261009-023: match Codex's static activity notice; cosmetic edits are disabled.
+EYE_ACTIVITY_SUFFIXES = ("",)
+EYE_ACTIVITY_EDIT_MIN_SECONDS = 3.0
+EYE_ACTIVITY_MAX_EDITS = 0
+# Keep the existing delay so short ordinary turns do not create an extra notice.
 EYE_ACTIVITY_LONGTURN_DELAY_SECONDS = 60.0
 
 
@@ -1464,7 +1412,8 @@ def eye_activity_frames(label: str, enabled: bool, surface: str) -> list[str]:
     if not enabled or surface != "aniki_dm":
         return []
     clean_label = " ".join((label or "응답 처리 중").split())[:80] or "응답 처리 중"
-    return [f"{clean_label}{suffix}" for suffix in EYE_ACTIVITY_SUFFIXES]
+    # T-261009-023: keep the activity label still, without cycling dots.
+    return [clean_label]
 
 
 def start_eye_activity_loop(
@@ -1472,7 +1421,6 @@ def start_eye_activity_loop(
     stop_event: threading.Event,
     frames: list[str],
     reply_to_message_id: int = 0,
-    is_alive: Any = None,
     initial_delay_seconds: float = 0.0,
 ) -> threading.Thread | None:
     send_activity = getattr(telegram, "send_activity_indicator", None)
@@ -1497,65 +1445,8 @@ def start_eye_activity_loop(
             log("ACTIVITY", "eyes start skipped: send failed")
             return
         try:
-            frame_index = 1
-            edits = 0
-            sustain_due = False
-            while edits < EYE_ACTIVITY_MAX_EDITS:
-                if stop_event.wait(EYE_ACTIVITY_EDIT_MIN_SECONDS):
-                    break
-                try:
-                    if not edit_activity(message_id, frames[frame_index % len(frames)]):
-                        # 조용한 죽음 방지 (T-260729-052) — 사유는 edit_activity_indicator 가,
-                        # 어디까지 돌았는지는 여기가 남긴다.
-                        # T-260830-002: 종전엔 여기서 회전이 통째로 죽었다. 이 거절의 주류가
-                        # 발신 예산 소진이다 — 빠른 회전(~분당 30편집)이 발신 예산(분당 12,
-                        # T-260808-021)을 앞질러 「edit rejected after 19 edits」로 카드가
-                        # 죽고(2026-08-30 01:51 제어 노드 실측), 이후 긴 턴 내내 typing 만 남아
-                        # 멈춤과 구별이 안 됐다. 죽는 대신 45초 지속 국면으로 강등한다 —
-                        # 갱신되는 표시여야 멈춤과 구별된다는 원 설계(T-260730-002)와 같은
-                        # 논지고, 지속 국면(분당 ~1.3편집)은 예산 리필(분당 12) 안이다.
-                        # 메시지 자체가 죽은 거절(삭제·불변 400)은 지속 국면 첫 편집도
-                        # 거절되므로 그쪽 break 로 한 틱 만에 정직하게 끝난다.
-                        log("ACTIVITY", f"eyes rotation demoted to sustain: edit rejected after {edits} edits")
-                        sustain_due = True
-                        break
-                except Exception as exc:  # noqa: BLE001
-                    log("ACTIVITY", f"eyes edit skipped: {exc}")
-                    break
-                edits += 1
-                frame_index += 1
-            else:
-                # 예산 소진 = 일이 아직 안 끝났다는 뜻이다. 여기서 얼리면 죽은 작업과
-                # 구별이 안 되므로, 레이트에 안전한 느린 국면으로 넘겨 계속 갱신한다.
-                # (stop_event·예외로 빠진 경우는 여기 오지 않는다.)
-                sustain_due = True
-            if sustain_due and not stop_event.is_set():
-                ticks = 0
-                while ticks < EYE_ACTIVITY_SUSTAIN_MAX_TICKS:
-                    if stop_event.wait(EYE_ACTIVITY_SUSTAIN_SECONDS):
-                        break
-                    if is_alive is not None:
-                        try:
-                            still_working = bool(is_alive())
-                        except Exception:  # noqa: BLE001
-                            # probe 실패는 소등 사유가 아니다 — 기존 typing 루프 계약과 동일한
-                            # fail-open. 긴 턴을 오탐으로 꺼버리는 쪽이 더 나쁘다.
-                            still_working = True
-                        if not still_working:
-                            # ★거짓 생존 신호 차단. 죽었는데 계속 돌면 지금보다 나쁘다.
-                            log("ACTIVITY", f"eyes sustain stopped: no live work after {ticks} sustain ticks")
-                            break
-                    try:
-                        if not edit_activity(message_id, frames[frame_index % len(frames)]):
-                            log("ACTIVITY", f"eyes sustain stopped: edit rejected after {ticks} sustain ticks")
-                            break
-                    except Exception as exc:  # noqa: BLE001
-                        log("ACTIVITY", f"eyes sustain skipped: {exc}")
-                        break
-                    ticks += 1
-                    frame_index += 1
-            if not stop_event.is_set():
-                stop_event.wait()
+            # Match Codex: keep one notice until the typing lifecycle ends.
+            stop_event.wait()
         finally:
             try:
                 if not delete_activity(message_id):
@@ -10400,14 +10291,11 @@ class Bridge:
         activity_frames, activity_reply_to, activity_delay = self.eye_activity_context()
 
         def loop() -> None:
-            # is_alive = 타이핑 루프가 이미 쓰는 생존 판정을 그대로 재사용한다. 새 판정축을
-            # 만들지 않는다 — 지속 국면이 죽은 턴에서 계속 돌면 거짓 생존 신호가 된다.
             start_eye_activity_loop(
                 self.telegram,
                 stop_event,
                 activity_frames,
                 activity_reply_to,
-                is_alive=self.has_live_typing_work,
                 initial_delay_seconds=activity_delay,
             )
             deadline = time.monotonic() + max_seconds if max_seconds else None
@@ -10475,7 +10363,8 @@ class Bridge:
         suggested = item.source in {"suggested_reply_auto", "suggested_reply_confirmed"}
         label = "추천작업 진행 중" if suggested else "응답 처리 중"
         delay = 0.0 if suggested else EYE_ACTIVITY_LONGTURN_DELAY_SECONDS
-        return eye_activity_frames(label, enabled, surface), int(item.message_id or 0), delay
+        # Match Codex's unquoted activity notice; final-answer reply targets stay separate.
+        return eye_activity_frames(label, enabled, surface), 0, delay
 
     def ambient_typing_eligible(self) -> bool:
         # T-260829-029: ambient 턴은 최종답변이 이 챗에 실제로 착지하는 종류

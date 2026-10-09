@@ -3,6 +3,7 @@ import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,44 @@ class PublicExportTest(unittest.TestCase):
             client.call = mock.Mock(return_value={"ok": True, "result": {"message_id": message_id}})
             self.assertIsNone(client.send("Test reply"))
             self.assertIsNone(client.send_copy_content("Test content", code=True))
+
+    def test_activity_notice_stays_still_until_the_turn_ends(self):
+        mod = self.load_delivery_bridge()
+        bridge = mod.Bridge.__new__(mod.Bridge)
+        bridge.config = SimpleNamespace(chat_id="1234", activity_eyes_enabled=True)
+        bridge.lock = threading.RLock()
+        bridge.active_turn = None
+        for source, label in (("telegram", "응답 처리 중"),
+                              ("suggested_reply_confirmed", "추천작업 진행 중")):
+            with self.subTest(source=source):
+                bridge.pending = [SimpleNamespace(source=source, message_id=42)]
+                with mock.patch.object(mod, "priority_lane_active", return_value=False):
+                    frames, reply_to, _delay = bridge.eye_activity_context()
+                self.assertEqual(frames, [label])
+                self.assertEqual(reply_to, 0)
+                sent = threading.Event()
+                stop = threading.Event()
+                def send(text, reply_to=None):
+                    sent.set()
+                    return 123
+                client = SimpleNamespace(send_activity_indicator=mock.Mock(side_effect=send),
+                                         edit_activity_indicator=mock.Mock(),
+                                         delete_activity_indicator=mock.Mock(return_value=True))
+                with mock.patch.object(mod, "EYE_ACTIVITY_EDIT_MIN_SECONDS", 0.002), \
+                     mock.patch.object(mod, "EYE_ACTIVITY_MAX_EDITS", 2):
+                    worker = mod.start_eye_activity_loop(client, stop, frames, reply_to)
+                    try:
+                        self.assertTrue(sent.wait(1))
+                        worker.join(0.04)
+                        self.assertTrue(worker.is_alive())
+                        client.edit_activity_indicator.assert_not_called()
+                        client.delete_activity_indicator.assert_not_called()
+                    finally:
+                        stop.set()
+                        worker.join(1)
+                self.assertFalse(worker.is_alive())
+                client.send_activity_indicator.assert_called_once_with(label, None)
+                client.delete_activity_indicator.assert_called_once_with(123)
 
     def test_approval_card_completes_after_late_record_without_private_speaker(self):
         mod = self.load_delivery_bridge()
