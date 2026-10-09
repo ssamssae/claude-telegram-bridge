@@ -79,6 +79,26 @@ python3 -m twine check dist/claude-telegram-bridge/pypi-dist/*
 
 Expected result: `twine check` reports `PASSED` for both the sdist and the wheel.
 
+Install the wheel in a clean environment and verify that the adjacent runtime
+resources are present. The confirmation-dialog table and composer helper are
+required at runtime; a successful module import alone does not check them.
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import claude_telegram_bridge as bridge
+root = Path(bridge.__file__).resolve().parent
+for relative in (
+    "composer-clear.sh",
+    "lib/interstitial-patterns.tsv",
+    "hooks/claude-telegram-bridge-session-start.sh",
+    "hooks/claude-telegram-bridge-pretool-block.sh",
+):
+    assert (root / relative).is_file(), relative
+assert bridge.INTERSTITIAL_TABLE_PATH.is_file()
+PY
+```
+
 7. Public release (PyPI upload). Only after every check above passes AND the
 intended maintainer explicitly accepts the operational risk. Requires the
 maintainer's PyPI API token. Confirm the name is free/owned, upload, then verify
