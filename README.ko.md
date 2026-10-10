@@ -1,6 +1,6 @@
 # Claude Telegram Bridge
 
-[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://ssamssae.github.io/claude-telegram-bridge/) · [Web verification](docs/feature-map.md)
+[English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/claude-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
 텔레그램의 본인 전용 봇으로 컴퓨터의 Claude에 메시지를 보내고 답변을 받습니다.
 브릿지 언어는 한국어·영어 중 고를 수 있습니다. AI 답변의 언어와 모델 설정은 별개입니다.
