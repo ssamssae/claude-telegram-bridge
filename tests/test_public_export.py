@@ -1,6 +1,8 @@
 import dataclasses
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,6 +13,20 @@ from unittest import mock
 
 
 class PublicExportTest(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX hook; use WSL for tmux")
+    def test_packaged_question_hook_preserves_full_question_without_approving(self):
+        mod = self.load_delivery_bridge()
+        hook = Path(__file__).resolve().parents[1] / "hooks" / "claude-askq-sidecar.sh"
+        questions = [{"question": "A long question\nwith its complete second line", "options": [{"label": "Yes"}, {"label": "No"}]}]
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(os.environ, {"CLB_ASKQ_SIDECAR_DIR": directory}):
+                result = subprocess.run(["bash", str(hook)], input=json.dumps({"tool_name": "AskUserQuestion", "session_id": "test-session", "tool_use_id": "question-1", "tool_input": {"questions": questions}}), text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                record = mod.read_askq_sidecar("test-session")
+                self.assertEqual(record["questions"], questions)
+                self.assertEqual(record["tool_id"], "question-1")
+
     def load_delivery_bridge(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
         spec = importlib.util.spec_from_file_location("claude_public_delivery", path)

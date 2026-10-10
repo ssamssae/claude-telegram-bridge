@@ -28,3 +28,9 @@ Public hosting is a separate verification step: after publishing, repeat the lan
 390px 화면에서 메뉴·본문이 잘리지 않는지 확인하고, 공개 게시 후에도 실제 HTTPS 주소에서 같은 순서로 확인합니다.
 로컬 확인만으로 공개 게시나 설치된 브릿지 동작을 완료로 판단하지 않습니다.
 탭 아이콘과 상단 회사마크 배너가 현재 −β 로고인지 확인합니다. 배너를 클릭하면 같은 탭에서 https://kangdaejong.com/ 홈페이지로 이동해야 합니다.
+
+## Release 0.14.6 verification
+
+Public export and regression suite: 38 tests (1 environment-specific skip). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+For full pending question cards, register the bundled `hooks/claude-askq-sidecar.sh` using the README instructions. The hook captures question text without returning a permission decision. Package installation does not change Claude settings.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
