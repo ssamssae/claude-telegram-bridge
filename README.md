@@ -723,3 +723,25 @@ your prompts, AI answers, option text and model identifiers remain unchanged.
 For the initial setting, use `CLB_LANGUAGE=en` or `CLB_LANGUAGE=ko`.
 The setup wizard also accepts `setup --language ko`.
 See [language settings and verification](docs/i18n.md) for precedence and coverage.
+
+## Full question cards on narrow terminals
+
+Claude Code can write `AskUserQuestion` to its transcript only after the question
+has been answered. For the bridge to show the complete question while it is
+pending, register the bundled `hooks/claude-askq-sidecar.sh` as a `PreToolUse`
+hook for `AskUserQuestion` in your Claude settings. Add this entry to the existing
+`hooks.PreToolUse` array; preserve your other hooks:
+
+```json
+{
+  "matcher": "AskUserQuestion",
+  "hooks": [{"type": "command", "command": "/absolute/path/to/hooks/claude-askq-sidecar.sh"}]
+}
+```
+
+Use the hook path in your source checkout or installed package directory. This
+POSIX helper requires `bash` and `python3`; use WSL for a Windows tmux session.
+It captures the question without granting permission or answering it. The hook
+and bridge use the same default question directory. If you set
+`CLB_ASKQ_SIDECAR_DIR`, set the same value for both processes. Package installation
+does not register this optional hook or restart an existing session.

@@ -11,6 +11,7 @@ RUNTIME_RESOURCES = (
     "lib/interstitial-patterns.tsv",
     "hooks/claude-telegram-bridge-session-start.sh",
     "hooks/claude-telegram-bridge-pretool-block.sh",
+    "hooks/claude-askq-sidecar.sh",
 )
 
 
