@@ -48,6 +48,7 @@ from typing import Any, Callable, Protocol, runtime_checkable
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_flow_progress as _flow_progress  # noqa: E402
+import claude_go_card  # noqa: E402
 from bridge_i18n import Language, translate  # noqa: E402
 
 try:
@@ -709,9 +710,19 @@ HOOK_BLOCK_RE = re.compile(
     re.IGNORECASE,
 )
 ACTIVE_SPINNER_RE = re.compile(
-    r"(?im)^\s*[✶✻✳*]\s*"
-    r"(?:working|germinating|thinking|running|processing|cogitating|"
+    r"(?im)^\s*[✶✻✳✢✽*]\s*"
+    r"(?:working|forming|germinating|thinking|running|processing|cogitating|"
     r"churning|cooking|brewing|baking)\b",
+)
+# T-261011-050: 현행 Claude Code(2.1.295, 2026-10-11 제어 노드 실측)는 글리프 ·✢✳✶✻✽ 를
+# 돌리며 임의 동사 + 말줄임표(「✽ Moonwalking… (23m 8s · thought for 53s)」)로 진행 중을
+# 그린다. 위 닫힌 동사 목록만 보면 대부분의 동사가 idle 로 읽혀 900s 를 넘긴 산 턴이
+# active_turn_idle_timeout 으로 stale-release 되고 stop_typing() 이 「입력 중」을 끈다.
+# 그래서 「글리프 + 영단어 + …」 형태도 진행 중으로 본다. 완료 footer(「✻ Cogitated for
+# 14m」)는 과거형이고 말줄임표가 없어 그대로 idle 이다. send-now 빠른 경로는 이 확장을
+# 쓰지 않는다(send_now_screen_ready 참조).
+ACTIVE_ROTATING_SPINNER_RE = re.compile(
+    r"(?im)^\s*[·✶✻✳✢✽*]\s*[A-Za-z][A-Za-z'-]*…",
 )
 ACTIVE_INTERRUPT_RE = re.compile(
     r"(?i)\b(?:esc\s+to\s+inter\s*rupt|inter\s*rupt\s+to\s+stop|still\s+thinking)\b",
@@ -1769,7 +1780,10 @@ def send_now_composer_has_draft(ansi_screen: str) -> bool:
 
 
 def send_now_screen_ready(screen: str) -> bool:
-    if screen_has_active_work(screen):
+    # T-261011-050: the general detector now knows rotating activity words, but
+    # that alone does not prove the native send-now hint is on screen. Keep this
+    # fast path legacy-only so current spinners still go through the hint check.
+    if screen_has_active_work(screen, rotating_words=False):
         return True
     # Current Claude uses rotating activity words/glyphs the older general
     # detector does not know. The native send-now hint plus the live spinner
@@ -3872,7 +3886,7 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
     """Recover one clipped native question only from an exact bound tool and UI tail."""
     if (
         hint_idx != len(lines) - 1
-        or not (ASKQ_FULL_HINT_RE if full_header else ASKQ_CLIPPED_HINT_RE).fullmatch(lines[hint_idx].strip())
+        or not ASKQ_FULL_HINT_RE.fullmatch(lines[hint_idx].strip())
         or not isinstance(question_tool, dict) or not session_id
         or question_tool.get("session_id") != session_id or question_tool.get("completed")
         or not isinstance(question_tool.get("tool_id"), str) or not question_tool["tool_id"]
@@ -3909,7 +3923,7 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
                 return None
     expected = [" ".join(option["label"].split()) for option in native_options]
     freeform_label = "Type something."
-    if full_header and len(rows) == len(native_options) + 2:
+    if len(rows) == len(native_options) + 2:
         freeform_label = rows[-2][1]
         if not freeform_label or ASKQ_MULTI_MARK_RE.match(freeform_label):
             return None
@@ -3945,13 +3959,43 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
         return None
     parsed.update(
         title=title, recovered=True, native_tool_id=question_tool["tool_id"], native_session_id=session_id,
-        freeform=parsed["freeform"] if full_header else None,
+        freeform=len(native_options) + 1,
+        freeform_text="" if ASKQ_FREEFORM_RE.fullmatch(freeform_label) else freeform_label,
         descriptions={idx: option["description"] for idx, option in enumerate(native_options, 1)
                       if isinstance(option.get("description"), str) and option["description"]},
     )
     payload = json.dumps(question, sort_keys=True, ensure_ascii=False)
     parsed["native_fingerprint"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return parsed
+
+
+def fold_ask_question_freeform(lines):
+    """Fold only the selected input's indented rows before its native divider."""
+    for idx, raw in enumerate(lines):
+        matched = CHOICE_OPTION_RE.match(raw)
+        if not matched or not matched.group(1):
+            continue
+        number, column = int(matched.group(2)), matched.start(3)
+        parts = [matched.group(3).strip()]
+        end = idx + 1
+        while end < len(lines) and lines[end].startswith(" " * column) and lines[end].strip():
+            parts.append(lines[end][column:].strip())
+            end += 1
+        if len(parts) < 2 or end >= len(lines) or not CHOICE_RULE_RE.fullmatch(lines[end]):
+            continue
+        chat_idx = end + 1
+        while chat_idx < len(lines) and not lines[chat_idx].strip():
+            chat_idx += 1
+        chat = CHOICE_OPTION_RE.match(lines[chat_idx]) if chat_idx < len(lines) else None
+        if (not chat or chat.group(1) or int(chat.group(2)) != number + 1
+                or chat.start(3) != column or not ASKQ_CHAT_RE.fullmatch(chat.group(3))):
+            continue
+        tail = [line.strip() for line in lines[chat_idx + 1:] if line.strip()]
+        if len(tail) != 1 or not ASKQ_FULL_HINT_RE.fullmatch(tail[0]):
+            continue
+        folded = lines[:idx] + [raw[:column] + " ".join(parts)] + lines[end:]
+        return folded, number, parts
+    return None
 
 
 def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
@@ -3962,6 +4006,22 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
         lines.pop()
     if not lines:
         return None
+    # Narrow fullscreen terminals wrap the extra Vim hint after freeform focus.
+    # Fold only an exact native footer at the screen end, never arbitrary text.
+    for count in (2, 3):
+        if len(lines) >= count:
+            footer = " ".join(line.strip() for line in lines[-count:])
+            if ASKQ_FULL_HINT_RE.fullmatch(footer):
+                lines[-count:] = [footer]
+                break
+    wrapped = fold_ask_question_freeform(lines)
+    if wrapped:
+        folded, number, parts = wrapped
+        parsed = parse_ask_question("\n".join(folded), question_tool=question_tool, session_id=session_id)
+        if not parsed or parsed["multi"] or parsed["selected"] != number:
+            return None
+        parsed.update(freeform=number, freeform_text=" ".join(parts), freeform_lines=parts)
+        return parsed
     hint_idx = -1
     for idx in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
         if ASKQ_HINT_RE.search(lines[idx]):
@@ -4082,6 +4142,20 @@ def ask_question_answer_text(text: str) -> str:
     """직접 입력 답 = 한 줄·제어문자 제거·길이 상한. 입력칸은 한 줄짜리다."""
     cleaned = "".join(ch for ch in (text or "") if ch.isprintable() or ch in "\n\t")
     return " ".join(cleaned.split())[:ASKQ_TEXT_MAX]
+
+
+def ask_question_answer_visible(parsed, number: int, answer: str) -> bool:
+    """Match every character; only a rendered line boundary may hide a space."""
+    if not parsed:
+        return False
+    parts = parsed.get("freeform_lines")
+    if parts:
+        return parsed.get("freeform") == number and re.fullmatch(
+            " ?".join(re.escape(part) for part in parts), answer) is not None
+    value = parsed.get("freeform_text")
+    if value is None:
+        value = next((label for index, label in parsed.get("options", []) if index == number), None)
+    return value == answer
 
 
 def interstitial_blocked_text(command: str, arg: str = "") -> str:
@@ -4243,6 +4317,82 @@ def background_typing_max_seconds() -> float:
         return 1800.0
 
 
+def completed_background_agent_tools(
+    transcript: Path, session_id: str, tool_ids: set[str],
+) -> set[str]:
+    """Read native, session-owned completion evidence when a notification is lost.
+
+    Metadata binds the launch tool to an agent. Its mtime fences a resumed agent's
+    previous end_turn. Missing, changing or partial records are not completion.
+    This only reconciles display state; it never replays an answer or notification.
+    """
+    folder = transcript.parent / transcript.stem / "subagents"
+    completed: set[str] = set()
+    if not tool_ids or folder.is_symlink() or folder.parent.is_symlink():
+        return completed
+
+    def version(path: Path) -> tuple[int, int, int, int]:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    for meta_path in folder.glob("agent-*.meta.json"):
+        match = re.fullmatch(r"agent-([A-Za-z0-9_-]{1,128})\.meta\.json", meta_path.name)
+        if not match or meta_path.is_symlink():
+            continue
+        try:
+            meta_version = version(meta_path)
+            with meta_path.open("rb") as handle:
+                raw_meta = handle.read(16385)
+            if len(raw_meta) > 16384:
+                continue
+            meta = json.loads(raw_meta)
+            tid = meta.get("toolUseId") if isinstance(meta, dict) else None
+            if not isinstance(tid, str) or tid not in tool_ids:
+                continue
+            agent_id = match.group(1)
+            path = folder / f"agent-{agent_id}.jsonl"
+            if path.is_symlink():
+                continue
+            before = version(path)
+            with path.open("rb") as handle:
+                # Bound each read even when the agent has a large tool history.
+                start = max(0, before[2] - 131072)
+                handle.seek(start)
+                tail = handle.read(131072)
+                if start:
+                    tail = tail.partition(b"\n")[2]  # Drop the partial first line.
+            if not tail.endswith(b"\n"):
+                continue
+            finished = False
+            for raw in reversed(tail.splitlines()):
+                if not raw.strip():
+                    continue
+                record = json.loads(raw)
+                if not isinstance(record, dict):
+                    break
+                if record.get("type") not in {"user", "assistant"}:
+                    continue
+                message = record.get("message")
+                at = record_timestamp_seconds(record)
+                finished = (
+                    record.get("type") == "assistant"
+                    and record.get("isSidechain") is True
+                    and record.get("sessionId") == session_id
+                    and record.get("agentId") == agent_id
+                    and isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and message.get("stop_reason") == "end_turn"
+                    and at is not None
+                    and meta_version[3] / 1e9 <= at <= time.time()
+                )
+                break
+            if finished and before == version(path) and meta_version == version(meta_path):
+                completed.add(tid)
+        except (OSError, ValueError, TypeError):
+            continue
+    return completed
+
+
 def progress_board_enabled() -> bool:
     """Same precedence as flow_mirror_enabled(): env override, else flag file.
     Default OFF — a 5-node shared codebase means most nodes never set the flag."""
@@ -4301,6 +4451,47 @@ _TASK_NOTIFICATION_RE = re.compile(
     r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>([^<]+)</status>(?:.*?<summary>([^<]*)</summary>)?",
     re.DOTALL,
 )
+
+
+# T-261011-023: 백그라운드 작업의 끝을 알리는 완료 알림 → [(tool_use_id, 저장할 상태)].
+#   ① 턴 도중 끝난 작업의 알림은 user 문자열이 아니라 type=attachment /
+#   attachment.type=queued_command / commandMode=task-notification 으로 남는다(2026-10-11
+#   4노드 transcript 실측 — 작업 노드 12:29:07·12:30:46). 사람이 바쁜 턴에 보낸 입력도
+#   queued_command 지만 commandMode=prompt 라서 섞이지 않는다.
+#   ② Claude 가 멈추거나 백그라운드 시간 상한에 걸린 작업은 status=killed 로 온다(제어 노드·작업 노드
+#   실측). 저장은 기존 어휘인 cancelled 로 한다.
+#   판정은 user 문자열 경로(bind_background_flow_notification)와 같게 엄격히 — 블록 하나라도
+#   어긋나면 전부 버린다. tool-use-id·status 가 없는 Monitor 이벤트 알림도 여기서 빠진다.
+_TASK_ENDING_STATUS = {"completed": "completed", "failed": "failed",
+                       "cancelled": "cancelled", "killed": "cancelled"}
+
+
+def task_notification_endings(record: dict[str, Any]) -> list[tuple[str, str]]:
+    if record.get("isSidechain") or record.get("isMeta"):
+        return []
+    if record.get("type") == "attachment":
+        attachment = record.get("attachment")
+        if (not isinstance(attachment, dict) or attachment.get("type") != "queued_command"
+                or attachment.get("commandMode") != "task-notification"):
+            return []
+        text = attachment.get("prompt")
+    else:
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        if record.get("type") != "user" or message.get("role") != "user":
+            return []
+        text = message.get("content")
+    if not isinstance(text, str) or not re.fullmatch(
+            r"\s*(?:<task-notification>.*?</task-notification>\s*)+", text, re.DOTALL):
+        return []
+    endings = []
+    for block in re.findall(r"<task-notification>(.*?)</task-notification>", text, re.DOTALL):
+        match = _TASK_NOTIFICATION_RE.search(block)
+        status = _TASK_ENDING_STATUS.get(match.group(2).strip().lower()) if match else None
+        if status is None:
+            return []
+        endings.append((match.group(1).strip(), status))
+    return endings
+
 
 # T-260812-029: 제어 노드 *-directive.sh 가 워커 REPL 에 주입하는 턴은 텔레그램 nonce 도
 #   <task-notification> 마커도 없어 위 정규식만으로는 "마커 없는 순수 ambient(cron·
@@ -5066,7 +5257,7 @@ def screen_has_feedback_survey(screen: str) -> bool:
     return True
 
 
-def screen_has_active_work(screen: str) -> bool:
+def screen_has_active_work(screen: str, *, rotating_words: bool = True) -> bool:
     region = strip_ansi_control(screen_status_region(screen))
     # Claude's completed footer can wrap "1 shell still running" as a physical
     # line containing only "running" in very narrow panes. That is an idle prompt
@@ -5079,6 +5270,13 @@ def screen_has_active_work(screen: str) -> bool:
     # logical view as a second pass.
     joined = " ".join(region.splitlines())
     if ACTIVE_SPINNER_RE.search(joined) or ACTIVE_INTERRUPT_RE.search(joined):
+        return True
+    # T-261011-050: current spinner = rotating glyph + arbitrary word + ellipsis.
+    # Callers that must prove the native send-now hint instead pass
+    # rotating_words=False to keep the legacy-only fast path.
+    if rotating_words and (
+        ACTIVE_ROTATING_SPINNER_RE.search(region) or ACTIVE_ROTATING_SPINNER_RE.search(joined)
+    ):
         return True
     # T-260709-73: current Claude Code foreground tools render a glyph-less
     # "Running…" plus a ctrl+b "run in background" affordance. S5's spinner
@@ -5170,6 +5368,19 @@ def copy_payload_dedup_key(text: str) -> str:
         return ""
     digest = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
     return f"copy_payload:{digest}"
+
+
+def is_native_interruption(record: dict[str, Any]) -> bool:
+    message = record.get("message")
+    return bool(
+        record.get("type") == "user" and isinstance(message, dict)
+        and message.get("role") == "user"
+        and not record.get("isSidechain") and not record.get("isMeta")
+        and (not record.get("promptId") or record.get("interruptedMessageId"))
+        and content_text(message.get("content")).strip() in {
+            "[Request interrupted by user]", "[Request interrupted by user for tool use]",
+        }
+    )
 
 
 def record_timestamp_seconds(record: dict[str, Any]) -> float | None:
@@ -6900,6 +7111,37 @@ class TmuxClaudeTransport:
             raise ValueError("type_question_text accepts one printable line")
         with self.composer_lock():
             self.tmux("send-keys", "-t", self.resolve_pane_target(), "-l", text)
+
+    def answer_question_if_matches(self, card, answer: str, *, parser) -> str:
+        """Keep focus, literal input and exact readback under one writer lock."""
+        if not answer or len(answer) > ASKQ_TEXT_MAX or not all(ch.isprintable() for ch in answer):
+            return "invalid"
+        number = card.get("freeform")
+        if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
+            return "invalid"
+
+        def same(parsed):
+            return bool(parsed and parsed["header"] + "|" + parsed["title"] == card.get("episode"))
+
+        with self.composer_lock():
+            before = parser(self.capture_pane(80))
+            if not same(before) or before.get("freeform") != number or before.get("freeform_text"):
+                return "changed"
+            target = self.resolve_pane_target()
+            self.tmux("send-keys", "-t", target, str(number))
+            time.sleep(0.6)
+            focused = parser(self.capture_pane(80))
+            if (not same(focused) or focused.get("selected") != number
+                    or focused.get("freeform") != number or focused.get("freeform_text")):
+                return "changed"
+            self.tmux("send-keys", "-t", target, "-l", answer)
+            time.sleep(0.4)
+            typed = parser(self.capture_pane(80))
+            if (not same(typed) or typed.get("selected") != number
+                    or not ask_question_answer_visible(typed, number, answer)):
+                return "unconfirmed"
+            self.tmux("send-keys", "-t", target, "Enter")
+            return "sent"
 
     def send_approval_choice_if_matches(self, signature: str, number: int, expires_at: float | None) -> str:
         """Recheck the approval under the same lock as its key writes."""
@@ -10096,6 +10338,7 @@ class Bridge:
             "question_receipts": list(self.question_receipts),
             "approval_cards": list(getattr(self, "approval_cards", [])),
             "completed_reply": getattr(self, "completed_reply", None),
+            "go_question_card": getattr(self, "go_question_card", None),
             "background_flows": getattr(self, "background_flows", {}),
             "background_flow_boundaries": dict(list(getattr(self, "background_flow_boundaries", {}).items())[-500:]),
             "public_progress_origin": getattr(self, "public_progress_origin", None),
@@ -10239,6 +10482,8 @@ class Bridge:
         self.restore_question_state(state or {})
         self.restore_approval_cards(state or {})
         self.restore_completed_reply((state or {}).get("completed_reply"))
+        go_card = (state or {}).get("go_question_card")
+        self.go_question_card = go_card if isinstance(go_card, dict) else None
         self.restore_background_flows(state or {})
         origin = (state or {}).get("public_progress_origin")
         self.public_progress_origin = (
@@ -10617,26 +10862,61 @@ class Bridge:
                         tasks.pop(key, None)
             for key in [k for k, started in tasks.items() if now - started >= cap]:
                 tasks.pop(key, None)
-            if tasks:
-                return True
             # The existing flow ledger also owns nested tasks and survives a
             # bridge reconnect. Only confirmed work in this chat/session counts.
             binding = getattr(self, "session_binding", None)
             if not binding:
-                return False
-            return any(
+                return bool(tasks)
+            owned_flows = [flow for flow in flows if (
                 flow.get("session_id") == binding.session_id
                 and flow.get("chat_id") == str(self.config.chat_id)
                 and not flow.get("cancelled")
-                and 0 <= now - flow.get("updated_at", 0) < cap
+            )]
+            tool_ids = set(tasks) | {
+                tid for flow in owned_flows for tid, status in flow.get("tools", {}).items()
+                if status == "running"
+            }
+            # T-261010-050: a native agent can finish without delivering its
+            # task-notification. Reconcile the durable and ephemeral indicators
+            # together, including legacy state loaded after a bridge restart.
+            check_key = (str(binding.transcript_path), binding.session_id, frozenset(tool_ids))
+            checked_at = time.monotonic()
+            if tool_ids and (
+                check_key != getattr(self, "background_completion_check_key", None)
+                or checked_at - getattr(self, "background_completion_checked_at", 0.0) >= 5.0
+            ):
+                self.background_completion_check_key = check_key
+                self.background_completion_checked_at = checked_at
+                completed = completed_background_agent_tools(
+                    binding.transcript_path, binding.session_id, tool_ids,
+                )
+                if completed:
+                    for tid in completed:
+                        tasks.pop(tid, None)
+                        for flow in owned_flows:
+                            if flow.get("tools", {}).get(tid) == "running":
+                                flow["tools"][tid] = "completed"
+                    # Keep updated_at unchanged: repairing one sibling must not
+                    # extend another task's existing typing safety window.
+                    self.persist_state()
+                    log("TYPE", f"reconciled completed background agents count={len(completed)}")
+            return bool(tasks) or any(
+                0 <= now - flow.get("updated_at", 0) < cap
                 and "running" in flow.get("tools", {}).values()
-                for flow in flows
+                for flow in owned_flows
             )
 
     def observe_background_typing(self, record: dict[str, Any]) -> None:
         """T-261008-009: 텔레그램 턴의 백그라운드 작업 시작·끝을 transcript 에서 추적한다."""
         if (not hasattr(self, "background_typing_tasks")
                 or record.get("isSidechain") or record.get("isMeta")):
+            return
+        # T-261011-023: 턴 도중에 끝난 작업은 attachment 레코드로 끝을 알린다.
+        endings = task_notification_endings(record)
+        if endings:
+            with self.lock:
+                for tid, _ in endings:
+                    self.background_typing_tasks.pop(tid, None)
             return
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = message.get("content")
@@ -11208,7 +11488,48 @@ class Bridge:
         except OSError:
             return False
         window = self.RELEASE_TRANSCRIPT_QUIET_SECONDS if quiet_seconds is None else quiet_seconds
-        return (time.time() - mtime) < window
+        if (time.time() - mtime) >= window:
+            return False
+        # An explicit native cancellation is a terminal boundary. Once its tracked
+        # turn is gone, ancillary writes (notably away_summary) must not renew the
+        # destructive-command quiet window. New/unknown activity remains busy.
+        return self.active_turn is not None or not self.transcript_ends_with_interruption()
+
+    def transcript_ends_with_interruption(self) -> bool:
+        binding = self.session_binding
+        if binding is None:
+            return False
+        try:
+            with binding.transcript_path.open("rb") as stream:
+                before = os.fstat(stream.fileno())
+                start = max(0, before.st_size - self.TRANSCRIPT_OPEN_TOOL_TAIL_BYTES)
+                stream.seek(start)
+                raw = stream.read()
+                after = os.fstat(stream.fileno())
+        except OSError:
+            return False
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            return False
+        if not raw.endswith(b"\n"):
+            return False
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        if start:
+            lines = lines[1:]
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(record, dict):
+                return False
+            if record.get("type") in {"last-prompt", "ai-title", "mode", "atis-latch", "pr-link"}:
+                continue
+            if record.get("type") == "system" and record.get("subtype") == "away_summary":
+                continue
+            return record.get("sessionId") == binding.session_id and is_native_interruption(record)
+        return False
 
     def active_turn_session_transcript_lost(self) -> bool:
         # T-260709-72: 확정 배달 stale release 의 재큐 여부 판별 — 바인딩된 세션
@@ -12589,6 +12910,15 @@ class Bridge:
         )
 
     def parse_question_screen(self, screen: str, *, expected_native=None):
+        if expected_native:
+            binding = getattr(self, "session_binding", None)
+            if expected_native.get("session_id") and (not binding or expected_native["session_id"] != binding.session_id):
+                return None
+            tool = self.question_tool or {}
+            if expected_native.get("tool_id") and (
+                tool.get("tool_id") != expected_native["tool_id"] or tool.get("completed")
+            ):
+                return None
         if expected_native and not self.question_native_identity_matches(expected_native):
             return None
         binding = getattr(self, "session_binding", None)
@@ -12922,7 +13252,7 @@ class Bridge:
         종전대로 큐에 쌓는다(글이 사라지지 않게).
         """
         card = self.question_card
-        if not card or not card.get("freeform") or not repl_supports_pane_features(self.repl):
+        if not card or card.get("submitted") or not card.get("freeform") or not repl_supports_pane_features(self.repl):
             return False
         message = update.get("message") or {}
         chat = message.get("chat") or {}
@@ -12946,24 +13276,47 @@ class Bridge:
             or parsed["freeform"] != card.get("freeform")
         ):
             return False
+        atomic = getattr(self.repl, "answer_question_if_matches", None)
+        if callable(atomic):
+            try:
+                result = atomic(card, answer, parser=lambda screen: self.parse_question_screen(
+                    screen, expected_native=card))
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"freeform transaction failed: {type(exc).__name__}")
+                result = "unconfirmed"
+            if result == "sent":
+                card["submitted"] = True
+                self.question_card = None
+                try:
+                    self.persist_state()
+                except Exception as exc:  # noqa: BLE001
+                    log("CHOICE", f"freeform submitted state write failed: {type(exc).__name__}")
+            notice = ('직접 입력 답을 보냈어요.' if result == "sent" else
+                      '질문이나 입력 내용이 바뀌어 제출하지 않았어요. 터미널을 확인해 주세요.')
+            try:
+                self.telegram.send(self.tr(notice))
+            except Exception as exc:  # noqa: BLE001
+                log("TGERR", f"freeform notice failed: {type(exc).__name__}")
+            return True
         try:
             pick(str(parsed["freeform"]))
             time.sleep(0.6)
             typer(answer)
             time.sleep(0.4)
             typed = self.parse_question_screen(self.repl.capture_pane(80), expected_native=card)
-            labels = [label for _, label in (typed or {}).get("options", [])]
-            if not typed or not any(label.startswith(answer[:40]) for label in labels):
+            if not ask_question_answer_visible(typed, parsed["freeform"], answer):
                 log("CHOICE", "freeform not visible after typing — not submitting")
                 self.telegram.send(self.tr('직접 입력 답이 화면에 안 보여서 제출하지 않았어요. 터미널을 확인해 주세요.'))
                 return True
             self.repl.submit_prompt("Enter")
         except Exception as exc:  # noqa: BLE001
-            log("CHOICE", f"freeform answer failed: {exc}")
-            return False
+            log("CHOICE", f"freeform answer failed: {type(exc).__name__}")
+            return True
         log("CHOICE", f"freeform answered len={len(answer)} sig={parsed['signature']}")
+        card["submitted"] = True
         self.question_card = None
         try:
+            self.persist_state()
             self.telegram.send(self.tr('직접 입력 답을 보냈어요.'))
         except Exception as exc:  # noqa: BLE001
             log("TGERR", f"freeform ack failed: {type(exc).__name__}")
@@ -13806,7 +14159,7 @@ class Bridge:
         }
         self._save_unknown_chats(state)
 
-    def enqueue_update(self, update: dict[str, Any]) -> None:
+    def enqueue_update(self, update: dict[str, Any]) -> QueueItem | None:
         if "edited_message" in update:
             log("QUEUE", f"ignore edited_message update={update.get('update_id')}")
             return
@@ -13931,6 +14284,7 @@ class Bridge:
         log("QUEUE", f"enqueued update={update_id} queue={queue_id[:10]}")
         self.ensure_typing()
         self.maybe_alert_late_delivery(item)
+        return item
 
     def handle_status_command(self) -> None:
         # codex /status 패리티 (T-260703-01 확장): bridge 상태 한 줄 → 상태 + 컨텍스트 요약 바.
@@ -16327,6 +16681,15 @@ class Bridge:
             }
         self.finish_active_turn("sent", active)
 
+        self.maybe_send_go_card(answer, assistant_uuid, sent_ids[-1])
+
+    def maybe_send_go_card(self, answer: str, assistant_uuid: str, message_id: int) -> None:
+        try:
+            if claude_go_card.send_card(self, answer, assistant_uuid, message_id):
+                log("CHOICE", "GO request card sent")
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"GO request card unconfirmed: {type(exc).__name__}")
+
     def retry_pending_send(self) -> None:
         claim = self.claim_retry_send_attempt()
         if isinstance(claim, tuple) and claim and claim[0] == "outbox_sent":
@@ -16459,6 +16822,32 @@ class Bridge:
                 else:
                     flow["tools"].pop(tid, None)
 
+    def close_background_flow_tools(self, record: dict[str, Any]) -> None:
+        """T-261011-023: 완료 알림으로 끝난 작업의 running 을 닫는다.
+
+        턴 도중 끝난 작업(attachment)과 killed 는 카드 재사용 경로가 받지 않는다.
+        여기서는 상태만 바꾼다 — 카드·최종답 배달은 기존 경로 몫이다. updated_at 은
+        그대로 둬서 아직 도는 형제 작업의 입력 중 상한을 늘리지 않는다(T-261010-050 규칙).
+        """
+        binding = self.session_binding
+        endings = task_notification_endings(record)
+        if not binding or not endings:
+            return
+        changed = 0
+        with self.lock:
+            for flow in getattr(self, "background_flows", {}).values():
+                if (flow.get("session_id") != binding.session_id
+                        or flow.get("chat_id") != str(self.config.chat_id)):
+                    continue
+                for tid, status in endings:
+                    if flow["tools"].get(tid) == "running":
+                        flow["tools"][tid] = status
+                        changed += 1
+        if changed:
+            self.persist_state()
+            log("FLOW", f"background tools ended notification={record.get('uuid')} "
+                        f"type={record.get('type')} count={changed}")
+
     def bind_background_flow_notification(self, record: dict[str, Any]) -> bool:
         content = (record.get("message") or {}).get("content")
         uuid = record.get("uuid")
@@ -16522,6 +16911,13 @@ class Bridge:
             return False
         message = record.get("message") or {}
         content = message.get("content")
+        # T-261011-047: Claude can emit end_turn on a reasoning block before
+        # the separate text answer. Keep the response and its typing/card open.
+        if isinstance(content, list) and content and all(
+            isinstance(item, dict) and item.get("type") in {"thinking", "redacted_thinking"}
+            for item in content
+        ):
+            return True
         summary = korean_gate_filter_fragment(content_tool_summary(content))
         if summary:
             flow["body"] = append_flow_steps(flow["body"], summary)
@@ -16713,25 +17109,22 @@ class Bridge:
         if self.maybe_confirm_terminal_clear(record, binding):
             return
         record_type = record.get("type")
+        if record_type in {"user", "assistant"}:
+            try:
+                claude_go_card.expire_if_changed(self)
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"GO request expiry pending: {type(exc).__name__}")
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = message.get("content")
         self.flush_public_progress_before_tool(record)
 
         # Native cancellation is a lifecycle event, not another human prompt.
         # Modern Claude keeps promptId and identifies it with interruptedMessageId.
-        native_interrupt = (
-            record_type == "user" and message.get("role") == "user"
-            and not record.get("isSidechain") and not record.get("isMeta")
-            and (not record.get("promptId") or record.get("interruptedMessageId"))
-            and content_text(content).strip() in {
-                "[Request interrupted by user]", "[Request interrupted by user for tool use]",
-            }
-        )
-        if native_interrupt:
+        if is_native_interruption(record):
             self.pending_public_progress = []
             active = self.ancestor_matches_active_turn(record.get("parentUuid"))
             if active:
-                self.finish_active_turn("interrupt", active)
+                self.finish_active_turn("interrupt", active, interrupted_parent_uuid=record.get("parentUuid"))
                 log("TURN", f"native interruption confirmed nonce={active.nonce}")
             return
 
@@ -16746,6 +17139,7 @@ class Bridge:
                 return
             if self.mark_attachment_nonce_seen(record):
                 return
+            self.close_background_flow_tools(record)
 
         if record_type == "user" and message.get("role") == "user":
             if not record.get("isSidechain") and not record.get("isMeta") and (
@@ -16781,6 +17175,7 @@ class Bridge:
                 return
             if not nonce and self.mark_pending_sidecar_body_user_seen(record):
                 return
+            self.close_background_flow_tools(record)
             if self.bind_background_flow_notification(record):
                 return
             # T-260827-038 ③: isMeta 레코드는 사람 입력이 아니다 — 하네스가 턴 중간에
@@ -17531,6 +17926,8 @@ class Bridge:
             self.ambient_final_last_key = key
             if receipt_key and receipt_ids and all(type(mid) is int and mid > 0 for mid in receipt_ids):
                 self.outbox.mark_sent(receipt_key, receipt_ids)
+            if record and receipt_ids:
+                self.maybe_send_go_card(cleaned_final, str(record.get("uuid") or ""), receipt_ids[-1])
         if delivered and suggested_reply:
             bubble_ids = self.deliver_suggested_bubble(suggested_reply, context="ambient final")
             if bubble_ids:
@@ -17552,7 +17949,9 @@ class Bridge:
         self.ambient_flow_message_id = 0
         self.ambient_flow_started_at = 0.0
 
-    def finish_active_turn(self, status: str, active: ActiveTurn) -> bool:
+    def finish_active_turn(
+        self, status: str, active: ActiveTurn, *, interrupted_parent_uuid: str | None = None,
+    ) -> bool:
         with self.lock:
             if self.active_turn is not active:
                 current = self.active_turn
@@ -17570,11 +17969,29 @@ class Bridge:
                 row for row in getattr(self, "pending_public_progress", [])
                 if row.get("public_progress_scope") != f"telegram:{active.nonce}"
             ]
+            if status == "interrupt":
+                # Record consumed members of this native turn before exposing an
+                # idle slot or doing Telegram I/O. Otherwise drain_queue can promote
+                # B while A's interruption card is being edited, then wait forever
+                # for a second answer to the already cancelled turn (T-261011-037).
+                cancelled = [
+                    item for item in self.pending
+                    if interrupted_parent_uuid and active.user_uuid
+                    and item.busy_injected and item.user_uuid
+                    and self.reply_chain_contains(interrupted_parent_uuid, item.user_uuid)
+                    and self.reply_chain_contains(item.user_uuid, active.user_uuid)
+                ]
+                for item in cancelled:
+                    self.queue.append_status(item, "interrupt", interrupted_with=active.queue_id)
+                cancelled_ids = {item.queue_id for item in cancelled}
+                self.pending = [item for item in self.pending if item.queue_id not in cancelled_ids]
+                self.queue.append_status(self.queue_item_for_active(active), status)
             self.active_turn = None
         self.stop_typing()
         self.close_flow_card(active, status)
-        self.queue.append_status(self.queue_item_for_active(active), status)
-        self.release_batched_busy_pending(active, status)
+        if status != "interrupt":
+            self.queue.append_status(self.queue_item_for_active(active), status)
+            self.release_batched_busy_pending(active, status)
         self.persist_state()
         self.write_egress_sidecar()
         self.drain_queue()
@@ -18206,6 +18623,8 @@ class Bridge:
                     data = str(cb.get("data") or "")
                     offset = update_id + 1
                     write_text_atomic(self.config.offset_file, offset)
+                    if claude_go_card.callback(self, cb, update_id):
+                        continue
                     buttons = getattr(self, 'stop_buttons', None)
                     if buttons is not None and buttons.callback(cb):
                         continue
