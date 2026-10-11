@@ -27,6 +27,75 @@ def load_bridge_module():
 
 
 class TypingLivenessTest(unittest.TestCase):
+    def test_forming_spinner_keeps_visible_ambient_response_alive(self):
+        mod = load_bridge_module()
+        for glyph in ("✢", "✶", "✽"):
+            with self.subTest(glyph=glyph):
+                bridge = mod.Bridge.__new__(mod.Bridge)
+                bridge.lock = threading.RLock()
+                bridge.active_turn = None
+                bridge.pending = []
+                bridge.ambient_response_active = True
+                bridge.ambient_directive_card_visible = True
+                bridge.repl = SimpleNamespace(
+                    supports_pane_features=True,
+                    capture_pane=lambda _lines: f"{glyph} Forming… (thinking with max effort)\n❯",
+                )
+                self.assertTrue(bridge.has_live_typing_work())
+                self.assertTrue(bridge.ambient_response_active)
+
+    def test_forming_prose_and_completed_footer_are_not_active_work(self):
+        mod = load_bridge_module()
+        for screen in ("Forming a plan is complete.\n❯", "✻ Cooked for 10s\n❯",
+                       "1 shell still running\n❯"):
+            with self.subTest(screen=screen):
+                self.assertFalse(mod.screen_has_active_work(screen))
+
+    def test_live_spinner_lines_from_current_claude_code_are_active_work(self):
+        # T-261011-050: 2026-10-11 18:46:30 KST 제어 노드 실측 — 현행 Claude Code(2.1.295)는
+        # 글리프 ·✢✳✶✻✽ 를 돌리며 임의 동사(Moonwalking…)와 「(22m 21s · thinking with
+        # max effort)」 식 상태 괄호를 그린다. 이 줄을 idle 로 읽으면 900s 를 넘긴 산 턴이
+        # active_turn_idle_timeout 으로 stale-release 되고 stop_typing() 이 「입력 중」을 끈다.
+        mod = load_bridge_module()
+        for screen in (
+            # @two-node-case: node(제어 노드) — 실제 pane 2026-10-11 18:5x KST
+            "✽ Moonwalking… (23m 8s · thought for 53s)\n❯",
+            "✢ Moonwalking… (22m 21s · thinking with max effort)\n❯",
+            "· Moonwalking… (thinking more with max effort)\n❯",
+            "✳ Hatching…\n❯",
+            # @two-node-case: node(작업 노드, 워커) — 실제 pane 2026-10-11 19:0x KST, Tip 줄이 뒤따른다
+            "✻ Spinning… (11m 22s · ↓ 47.0k tokens)\n"
+            "  ⎿ \u00a0Tip: Use /btw to ask a quick side question without interrupting Claude's current work\n"
+            "\n❯\u00a0",
+        ):
+            with self.subTest(screen=screen):
+                self.assertTrue(mod.screen_has_active_work(screen))
+
+    def test_completed_footer_and_bullet_prose_are_not_active_work(self):
+        # 완료형 footer(과거형·말줄임표 없음)와 중점(·) 글머리 산문은 계속 idle 이어야 한다.
+        mod = load_bridge_module()
+        for screen in (
+            "✻ Moonwalked for 23m 8s\n❯",
+            "· 제어 노드·macOS 노드 클로드가 회의를 연다\n❯",
+            "· Moonwalking without ellipsis is prose\n❯",
+            # @two-node-case: node(macOS 노드, 워커) — 실제 idle pane 2026-10-11 19:0x KST
+            "❯ \n────\n  🧠 ctx 15% (150k/1M) · user@host:~\n"
+            "  Fable 5.1 · effort max · 5h 22%\n  ⏱️  5h 22% · 리셋 21:40\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← …\n",
+        ):
+            with self.subTest(screen=screen):
+                self.assertFalse(mod.screen_has_active_work(screen))
+
+    def test_rotating_spinner_is_excluded_from_legacy_only_detection(self):
+        # T-261011-050: send-now 의 빠른 경로는 옛 탐지 범위(legacy)만 믿는다 — 현행 돌림판은
+        # 「ctrl+x ctrl+s to send now」 힌트 인접 검사로만 받는다(기존 send-now 테스트 계약 유지).
+        mod = load_bridge_module()
+        screen = "✢ Unraveling… (26s · ↓ 181 tokens)\n❯"
+        self.assertTrue(mod.screen_has_active_work(screen))
+        self.assertFalse(mod.screen_has_active_work(screen, rotating_words=False))
+        legacy = "✶ Working… (1m 02s · esc to interrupt)\n❯"
+        self.assertTrue(mod.screen_has_active_work(legacy, rotating_words=False))
+
     def test_turn_end_stops_typing_when_only_background_monitor_remains(self):
         mod = load_bridge_module()
         bridge = mod.Bridge.__new__(mod.Bridge)

@@ -34,3 +34,8 @@ Public hosting is a separate verification step: after publishing, repeat the lan
 Public export and regression suite: 38 tests (1 environment-specific skip). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
 For full pending question cards, register the bundled `hooks/claude-askq-sidecar.sh` using the README instructions. The hook captures question text without returning a permission decision. Package installation does not change Claude settings.
 GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
+
+## Release 0.14.7 verification
+
+Public export and regression suite: 43 tests (1 environment-specific skip). Run `python3 -m unittest discover -s tests` in a clean checkout. Tests use isolated state and captured senders; they do not send Telegram messages or reset a live session. Source assets are verified against the release tag, and release downloads are checked against `SHA256SUMS`.
+GitHub Pages rebuilds the existing `main:/docs` guide after merge. This static publication does not run a bridge service.
