@@ -2,6 +2,10 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/claude-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
+![Four Telegram bridges: Claude Code, Codex CLI, Grok CLI, and Cursor Agent](docs/assets/tgbridges_card.jpg)
+
+Sibling bridges: [Claude](https://github.com/ssamssae/claude-telegram-bridge) · [Codex](https://github.com/ssamssae/codex-telegram-bridge) · [Grok](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor](https://github.com/ssamssae/cursor-telegram-bridge).
+
 Control an already-running interactive Claude Code session from Telegram.
 
 This bridge polls Telegram, pastes incoming messages into a visible tmux Claude
