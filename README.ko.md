@@ -2,6 +2,10 @@
 
 [English](README.md) · [한국어](README.ko.md) · [Web guide · 웹 설명서](https://product.kangdaejong.com/claude-telegram-bridge/) · [Web verification](docs/feature-map.md)
 
+![네 개의 텔레그램 브릿지: Claude Code, Codex CLI, Grok CLI, Cursor Agent](docs/assets/tgbridges_card.jpg)
+
+같은 계열의 브릿지: [Claude](https://github.com/ssamssae/claude-telegram-bridge) · [Codex](https://github.com/ssamssae/codex-telegram-bridge) · [Grok](https://github.com/ssamssae/grok-telegram-bridge) · [Cursor](https://github.com/ssamssae/cursor-telegram-bridge).
+
 텔레그램의 본인 전용 봇으로 컴퓨터의 Claude에 메시지를 보내고 답변을 받습니다.
 브릿지 언어는 한국어·영어 중 고를 수 있습니다. AI 답변의 언어와 모델 설정은 별개입니다.
 
