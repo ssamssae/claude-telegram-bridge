@@ -74,17 +74,20 @@ if not transcript or not session_id:
     )
     raise SystemExit(0)
 
+# T-261024-001: 훅은 사용자 범위라 이 기기의 모든 클로드에서 돈다(T-261023-003). 대화창
+# tmux 창 밖의 세션에 대화창 번호를 적으면 브릿지가 그 기록을 대화창 것으로 믿고 따라간다.
+# 실사고 10/24 제어 노드: launchd 오토파일럿 검수(sdk-cli, TMUX_PANE 없음)가 기본 세션
+# =claude: 로 대화창 pane_pid 를 빌려 적어, 빈 「작업 진행」 카드와 기록 갈아타기 14회가 났다.
+entrypoint = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").strip()
+if entrypoint.startswith("sdk"):
+    write_hook_log("skip", reason="headless_entrypoint", entrypoint=entrypoint)
+    raise SystemExit(0)
+env_pane = os.environ.get("TMUX_PANE", "").strip()
+if not env_pane:
+    write_hook_log("skip", reason="no_tmux_pane")
+    raise SystemExit(0)
+
 pane_pid = 0
-
-
-def pane_targets():
-    env_pane = os.environ.get("TMUX_PANE", "").strip()
-    if env_pane:
-        yield env_pane
-    target = tmux_session
-    if not (target.startswith("%") or ":" in target or "." in target):
-        target = f"={target}:"
-    yield target
 
 
 def tmux_commands(target):
@@ -94,20 +97,19 @@ def tmux_commands(target):
 
 
 def resolve_pane_pid():
-    for target in pane_targets():
-        for cmd in tmux_commands(target):
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    stdin=subprocess.DEVNULL,
-                )
-                if proc.returncode == 0 and proc.stdout.strip().isdigit():
-                    return int(proc.stdout.strip())
-            except Exception:
-                continue
+    for cmd in tmux_commands(env_pane):
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                stdin=subprocess.DEVNULL,
+            )
+            if proc.returncode == 0 and proc.stdout.strip().isdigit():
+                return int(proc.stdout.strip())
+        except Exception:
+            continue
     return 0
 
 

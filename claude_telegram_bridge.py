@@ -49,6 +49,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge_flow_progress as _flow_progress  # noqa: E402
 import claude_go_card  # noqa: E402
+import claude_model_notice  # noqa: E402
 from bridge_i18n import Language, translate  # noqa: E402
 
 try:
@@ -233,6 +234,11 @@ DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
 #   그래서 /model 과 똑같이 "인터셉트해서 inline keyboard 로 고르고, 적용은 인자형" 을 쓴다.
 EFFORT_SLASH_COMMAND = "/effort"
 EFFORT_CALLBACK = "clb-effort"
+# T-261018-022: Claude Code 2.1.302 confirms `/effort <level>` in a session with history.
+# Title of that dialog; its option 1 reads 「Yes, switch to <level>」 (fixture
+# claude_pane_effort_confirm_v2_1_302.txt). The bridge answers it only for the level the
+# owner just chose on the phone — same shape as the /model 「Switch model?」 auto-Yes.
+EFFORT_CONFIRM_TITLE = "Change effort level?"
 # 선택지: env CLB_EFFORT_CHOICES(콤마) 우선. fallback 은 CLI 설명표의 5종.
 #   유효 레벨은 모델별로 다르고(CLI 내부 V1e(model)) ultracode 는 dynamic-workflows
 #   게이트라, 목록 밖 값은 '!' escape 원문 주입으로 남긴다 (하드코딩 최소화 — /model 동형).
@@ -1526,6 +1532,10 @@ def copy_command_line(text: str) -> str | None:
     return candidate
 
 
+# 본문에서 버블로 뺀 블록 자리(문자열 비교가 아니라 객체 동일성으로 구분한다).
+COPY_BUBBLE_SLOT = str("\u0000copy-bubble-slot")
+
+
 def copy_content_bubble_messages(text: str, surface: str) -> list[str]:
     original = text or ""
     if surface != "aniki_dm":
@@ -1543,7 +1553,7 @@ def copy_content_bubble_messages(text: str, surface: str) -> list[str]:
                 code = "\n".join(lines[index + 1 : end]).strip("\n")
                 if code:
                     bubbles.append(code)
-                    body_lines.append("")
+                    body_lines.append(COPY_BUBBLE_SLOT)
                     index = end + 1
                     continue
         command = copy_command_line(lines[index])
@@ -1557,14 +1567,26 @@ def copy_content_bubble_messages(text: str, surface: str) -> list[str]:
                 commands.append(command)
                 index += 1
             bubbles.append("\n".join(commands))
-            body_lines.append("")
+            body_lines.append(COPY_BUBBLE_SLOT)
             continue
         body_lines.append(lines[index])
         index += 1
     if not bubbles:
         return [original]
+    # T-261024-014: 본문 중간에서 뺀 블록은 자리 표시(↓ ①)를 남긴다. 실측 2026-10-24 작업 노드:
+    #   「…라고 물으시면:」 다음 펜스가 버블로 빠지자 본문엔 빈 줄만 남아 사용자이 「말이없네?」.
+    #   빈 자리 뒤에 산문이 이어질 때만 표시한다 — 끝에 붙은 블록은 바로 아래 버블이라 그대로 둔다.
+    slots = [i for i, line in enumerate(body_lines) if line is COPY_BUBBLE_SLOT]
+    if any(line.strip() for line in body_lines[slots[0] + 1:] if line is not COPY_BUBBLE_SLOT):
+        for number, slot in enumerate(slots, 1):
+            body_lines[slot] = f"↓ {copy_bubble_ordinal(number)}"
+    body_lines = ["" if line is COPY_BUBBLE_SLOT else line for line in body_lines]
     body = re.sub(r"\n{3,}", "\n\n", "\n".join(body_lines)).strip()
     return [body, *bubbles]
+
+
+def copy_bubble_ordinal(number: int) -> str:
+    return chr(0x2460 + number - 1) if 1 <= number <= 20 else f"({number})"
 
 
 def busy_inject_enabled() -> bool:
@@ -1739,6 +1761,36 @@ def composer_residual_text(screen: str) -> str:
         if core.startswith((">", "❯")):
             return core[1:].strip()
     return ""
+
+
+# Claude Code TUI 가 여러 줄 paste 를 접어 보여 주는 placeholder (예: "[Pasted text #1 +12 lines]").
+COMPOSER_PASTED_PLACEHOLDER_RE = re.compile(r"\[pasted text[^\]]*\]", re.IGNORECASE)
+# 이 길이 미만의 조각(슬래시 '/'·한두 글자)은 지시문과의 우연 일치 위험이 커서 재제출 근거로 안 쓴다.
+COMPOSER_RESIDUAL_MATCH_MIN_CHARS = 16
+
+
+def composer_residual_matches_prompt(residual: str, prompt: str) -> bool:
+    """T-261019-027: composer 잔여가 우리가 붙여넣은 지시문의 화면 조각일 때만 True.
+
+    잔여는 ❯ 줄 한 조각이라 지시문 전체가 아니라 접두부(또는 커서 쪽 꼬리)만 보인다.
+    지시문과 무관한 잔여에 Enter 를 다시 보내면 슬래시 메뉴 첫 항목이 실행된다
+    (2026-10-19 macOS 노드: residual_len=1 의 '/' 에 재제출 → 아무도 안 시킨
+    /verify-automations-change 실행). 판정이 모호하면 False — 호출부는 재제출 대신
+    제출 실패 통지로 끝낸다(Enter 금지가 기본값).
+    """
+    residual_norm = " ".join(residual.split())
+    prompt_norm = " ".join(prompt.split())
+    if not residual_norm or not prompt_norm:
+        return False
+    if residual_norm == prompt_norm:
+        return True
+    if COMPOSER_PASTED_PLACEHOLDER_RE.fullmatch(residual_norm):
+        # 주입 직전에 composer 를 비우므로, 여러 줄 지시문일 때의 placeholder 는 우리 paste 다.
+        return "\n" in prompt
+    core = residual_norm.rstrip("…").strip()
+    if len(core) < COMPOSER_RESIDUAL_MATCH_MIN_CHARS:
+        return False
+    return prompt_norm.startswith(core) or prompt_norm.endswith(core) or core in prompt_norm
 
 
 def send_now_composer_has_draft(ansi_screen: str) -> bool:
@@ -3422,6 +3474,26 @@ def pane_composer_visible(lines) -> bool:
     return False
 
 
+BLOCKING_SCREEN_MAX_LINES = 14
+BLOCKING_SCREEN_MAX_CHARS = 700
+
+
+def blocking_screen_excerpt(screen: str) -> str:
+    """입력줄이 안 보이면 입력칸을 가린 화면의 꼬리를 돌려준다 (T-261023-008).
+
+    10/23 작업 노드: 「autocompact 400k 로 바꿀까요」 안내창(꼬리표 `esc not now`·번호 없음)이
+    입력줄을 1시간 가렸는데, 선택 카드 조건(Esc to cancel·번호 옵션)에 안 걸려 사용자께는
+    「제출 실패」 문장만 갔다. 버튼은 붙이지 않고(산문 오탐 축 유지) 화면만 보여 준다.
+    입력줄이 보이면 빈 문자열 — 막힌 화면이 아니다.
+    """
+    lines = [line.rstrip() for line in (screen or "").splitlines()]
+    if not any(lines) or pane_composer_visible(lines):
+        return ""
+    tail = [line for line in lines if line.strip() and not CHOICE_RULE_RE.match(line)]
+    excerpt = "\n".join(tail[-BLOCKING_SCREEN_MAX_LINES:])
+    return excerpt[-BLOCKING_SCREEN_MAX_CHARS:]
+
+
 def _declared_confirm(lines):
     """선언 테이블에 든 확인창이면 그 옵션 블록의 **끝 인덱스**를 돌려준다 (T-260802-100).
 
@@ -3451,10 +3523,14 @@ def _declared_confirm(lines):
     return None
 
 
+# 2.1.302 prefixes the sentence with the warning glyph ⚠ (T-261019-028).
 CHOICE_AUTO_DENY_RE = re.compile(
-    r"^(Claude Code will automatically deny this request\s+in\s+)(\d{1,3}):([0-5]\d)"
+    r"^((?:⚠️?\s+)?Claude Code will automatically deny this request\s+in\s+)(\d{1,3}):([0-5]\d)"
     r"(?=,\s+to avoid blocking progress on an\s+unattended session)", re.MULTILINE,
 )
+# T-261023-019: 남은 시간이 이 이하인 승인창은 버튼 카드 대신 무음 한 줄 알림으로 보낸다.
+AUTO_DENY_NOTICE_MAX_SECONDS = 60
+AUTO_DENY_NOTICE = "⏱️ 곧 자동 거절되는 승인창이 떠서 버튼 없이 알려드려요. 누르실 필요 없어요."
 
 
 # ─ Claude screen vocabulary: send-now hint · app permission · workspace trust (T-261015-010) ──
@@ -3896,7 +3972,22 @@ ASKQ_TEXT_MAX = 500
 ASKQ_CLIPPED_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*Esc to cancel$")
 ASKQ_FULL_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*(?:ctrl\+g to edit in Vim\s*·\s*)?Esc to cancel$")
 ASKQ_CLIPPED_MIN_SUFFIX = 32
+ASKQ_ELLIPSIS = "…"
 ASKQ_RAIL_RE = re.compile(r"^\s*│")
+# T-261018-027: Claude Code 의 TUI 는 「⚠️」(U+26A0 U+FE0F) 같은 글자를 변형 선택자 없이 「⚠」로 그린다
+#   (2.1.304 macOS 노드 55x23 실측 2026-10-20 23:11, 작업 노드 재현. tmux 자체는 U+FE0F 를 보존한다 — printf 대조).
+#   화면 글자와 native 원본을 맞댈 때는 셀을 차지하지 않는 글자(변형 선택자·너비 0 결합자)를 양쪽에서 뺀다.
+ASKQ_INVISIBLE_RE = re.compile(r"[\u200b-\u200d\u2060\ufeff\ufe00-\ufe0f\U000e0100-\U000e01ef]")
+
+
+def askq_label_key(text: str) -> str:
+    """선택지 글자 대조 열쇠: 보이지 않는 글자를 빼고 공백은 한 칸으로."""
+    return " ".join(ASKQ_INVISIBLE_RE.sub("", text or "").split())
+
+
+def askq_text_key(text: str) -> str:
+    """질문 본문 대조 열쇠: 보이지 않는 글자와 공백을 모두 뺀다(tmux 는 낱말 안에서도 줄을 바꾼다)."""
+    return re.sub(r"\s+", "", ASKQ_INVISIBLE_RE.sub("", text or ""))
 # T-261010-024: Claude Code 는 AskUserQuestion tool_use 를 답한 뒤에야 JSONL 에 쓴다
 # (2.1.295·2.1.296 실측: 질문이 떠 있는 동안 0건, 답/Esc 직후 tool_use+tool_result 2건).
 # 그래서 머리줄이 잘린 화면은 대조할 원본이 없어 카드가 안 나갔다(10/10 macOS 노드 12:22·12:38).
@@ -3964,14 +4055,14 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
         matched = CHOICE_OPTION_RE.match(raw)
         if matched:
             first_option = idx if first_option is None else first_option
-            rows.append((int(matched.group(2)), " ".join(matched.group(3).split())))
+            rows.append((int(matched.group(2)), askq_label_key(matched.group(3))))
             selected_count += bool(matched.group(1))
         elif first_option is not None and raw.strip():
             if CHOICE_RULE_RE.match(raw) and len(rows) == len(native_options) + 1 and not separator:
                 separator = True
             elif not (len(rows) <= len(native_options) and raw.startswith("     ")):
                 return None
-    expected = [" ".join(option["label"].split()) for option in native_options]
+    expected = [askq_label_key(option["label"]) for option in native_options]
     freeform_label = "Type something."
     if len(rows) == len(native_options) + 2:
         freeform_label = rows[-2][1]
@@ -3998,10 +4089,17 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
         if start < end:
             body = body[start:end]
     visible = "".join(re.sub(r"^\s*│\s?", "", line) for line in body)
-    suffix = re.sub(r"\s+", "", visible)
-    native_title = re.sub(r"\s+", "", title)
+    suffix = askq_text_key(visible)
+    native_title = askq_text_key(title)
+    # T-261018-027: fullscreen caps a long question body and ends the shown window with
+    # "…" (2.1.302, vulcan 55x23 실측), so the visible text is a middle slice, not a suffix.
+    # Accept that slice only when the single "…" is the cut mark at its end.
+    elided = (not full_header and suffix.endswith(ASKQ_ELLIPSIS) and suffix.count(ASKQ_ELLIPSIS) == 1
+              and not native_title.endswith(suffix))
+    shown = suffix[:-len(ASKQ_ELLIPSIS)] if elided else suffix
     if ((full_header and suffix != native_title)
-            or (not full_header and (len(suffix) < ASKQ_CLIPPED_MIN_SUFFIX or not native_title.endswith(suffix)))):
+            or (not full_header and (len(shown) < ASKQ_CLIPPED_MIN_SUFFIX
+                                     or not (shown in native_title if elided else native_title.endswith(shown))))):
         return None
     restored = "☐ " + header.strip() + "\n" + " ".join(title.split()) + "\n" + "\n".join(lines[first_option:])
     parsed = parse_ask_question(restored)
@@ -4170,11 +4268,26 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
 
 
 def question_title_matches(native: str, visible: str) -> bool:
-    return bool(native and visible) and re.sub(r"\s+", "", native).startswith(re.sub(r"\s+", "", visible))
+    return bool(native and visible) and askq_text_key(native).startswith(askq_text_key(visible))
+
+
+QUESTION_CARD_PREVIEW_SECONDS = 600.0
+QUESTION_CARD_PREVIEW_MAX_CHARS = 2500
+
+
+def question_card_preview_text(bubbles) -> str:
+    """승인 카드에 다시 싣는 원문. 카드 한 장(4096자) 안에 들도록 자른다."""
+    text = "\n\n".join(str(bubble).strip() for bubble in bubbles if str(bubble).strip())
+    if len(text) > QUESTION_CARD_PREVIEW_MAX_CHARS:
+        text = text[:QUESTION_CARD_PREVIEW_MAX_CHARS].rstrip() + "\n…(나머지는 위 칸)"
+    return text
 
 
 def ask_question_card_text(parsed, translate=lambda text: text) -> str:
     rows = [f"❓ {parsed['title']}", ""]
+    preview = question_card_preview_text(parsed.get("preview") or [])
+    if preview:
+        rows.extend([translate("보낼 원문:"), preview, ""])
     for num, label in parsed["options"]:
         desc = parsed.get("descriptions", {}).get(num)
         rows.append(f"{num}. {label}" + (f" — {desc}" if desc else ""))
@@ -4489,6 +4602,11 @@ _BG_OUTPUT_PATH_RE = re.compile(r"[Oo]utput is being written to:\s*(\S+)")
 # 끝 통지가 안 오는 작업(서버 등)의 유령 입력중을 막으려고 항목마다 상한을 둔다.
 _BG_LAUNCH_RE = re.compile(r"Async agent launched|[Rr]unning in background with ID")
 BACKGROUND_TYPING_TOOLS = {"Agent", "Task", "Bash"}
+# T-261023-024: Claude Code 는 API 요청 본문을 `type=api-request-blob` 줄로 한 번 더 남긴다(키 hash·message·
+#   sessionId·type — toolUseResult·uuid·timestamp 없음). 정식 tool_result 레코드보다 먼저 와서, 이 줄로 판정하면
+#   후보를 먼저 꺼내 본문 정규식으로 오판한다(10/23 20:43 작업 노드: 다른 노드 기록을 인용한 일반 Bash 출력 →
+#   상한 30분까지 가짜 입력중). 시작·끝 판정은 정식 레코드가 한다.
+CLAUDE_REQUEST_SNAPSHOT_TYPE = "api-request-blob"
 
 # 백그라운드/서브에이전트 완료 통지 블록 실측 문구(T-260807-032):
 #   <task-notification>...<tool-use-id>toolu_xxx</tool-use-id>...<status>completed</status>
@@ -4586,6 +4704,48 @@ def ambient_final_direct_deliver_kind(text: str) -> str:
     if _NODE_REPORT_CARRIER_RE.search(text):
         return "node_report"
     return ""
+
+
+# T-261023-025: Claude Code 는 백그라운드 Bash 가 끝나면 출력 파일 끝에 `[exited with code N]`,
+#   중단되면 `[killed]` 를 붙인다(10/23 실측 — 제어 노드 bh0qbbxeb 는 `[killed]` 로 끝났는데 완료 알림이
+#   없어 브릿지가 running 으로 붙잡고 「입력중」을 유지했다). 마지막 줄일 때만 끝으로 본다.
+_BG_OUTPUT_END_RE = re.compile(r"\[(?:exited with code (-?\d+)|(killed))\]\s*\Z")
+
+
+def background_output_ending(path: str) -> tuple[str, str] | None:
+    """출력 파일 끝 표시 → (저장 상태, 사람용 문구). 아직 돌거나 못 읽으면 None."""
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _BG_OUTPUT_END_RE.search(tail)
+    if not match:
+        return None
+    if match.group(2):
+        return "cancelled", "중단됨"
+    code = int(match.group(1))
+    return ("completed", "끝남") if code == 0 else ("failed", f"종료 코드 {code}")
+
+
+def remember_background_output(owner: Any, tool_use_id: str, launch_text: str) -> str:
+    """백그라운드 실행 확인 문구에서 출력 파일 경로를 뽑아 기억한다(최근 128개)."""
+    match = _BG_OUTPUT_PATH_RE.search(launch_text or "")
+    if not match:
+        return ""
+    path = match.group(1).rstrip(".,;)")
+    if not os.path.isabs(path):
+        return ""
+    paths = getattr(owner, "background_output_paths", None)
+    if not isinstance(paths, dict):
+        paths = {}
+        owner.background_output_paths = paths
+    paths[tool_use_id] = path
+    while len(paths) > 128:
+        paths.pop(next(iter(paths)))
+    return path
 
 
 def progress_board_last_line(text: str) -> str:
@@ -5250,8 +5410,26 @@ def screen_status_region(screen: str, tail_lines: int = 16) -> str:
     return "\n".join(lines[-tail_lines:])
 
 
+def screen_has_declared_confirm(screen: str) -> bool:
+    """T-261018-022: a declared confirm dialog (CONFIRM_SCREENS) anywhere on the live pane.
+
+    Claude Code 2.1.302 draws 「Change effort level?」 mid-pane with blank rows below it and
+    hides the status line, so the status-region regex (bottom 16 lines) read that pane as
+    idle: the queue pasted into the dialog (Enter confirms option 1) and the stall watcher
+    never sent the card (실측 2026-10-18 15:49 작업 노드). Scrollback is excluded the same way
+    parse_pane_choice does it — a visible composer means the dialog is history, not live.
+    """
+    lines = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or pane_composer_visible(lines):
+        return False
+    return _declared_confirm(lines) is not None
+
+
 def screen_has_approval_wait(screen: str) -> bool:
     return bool(parse_workspace_trust_choice(screen) or parse_computer_use_choice(screen)
+                or screen_has_declared_confirm(screen)
                 or APPROVAL_WAIT_RE.search(screen_status_region(screen)))
 
 
@@ -5448,6 +5626,31 @@ def is_native_interruption(record: dict[str, Any]) -> bool:
             "[Request interrupted by user]", "[Request interrupted by user for tool use]",
         }
     )
+
+
+# T-261018-022: Claude Code records a slash command it ran locally (/effort, /model, …) as
+# user records wrapped in these tags (plus an isMeta caveat record). No model response follows.
+LOCAL_COMMAND_CONTENT_PREFIXES = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+)
+# Bookkeeping rows Claude Code appends around records; they carry no turn semantics.
+TRANSCRIPT_BOOKKEEPING_TYPES = frozenset({
+    "last-prompt", "ai-title", "mode", "atis-latch", "pr-link", "file-history-snapshot", "cost-state",
+})
+
+
+def is_local_command_record(record: dict[str, Any]) -> bool:
+    if record.get("type") == "system" and record.get("subtype") == "local_command":
+        return True
+    message = record.get("message")
+    if record.get("type") != "user" or not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    if record.get("isSidechain"):
+        return False
+    return content_text(message.get("content")).lstrip().startswith(LOCAL_COMMAND_CONTENT_PREFIXES)
 
 
 def record_timestamp_seconds(record: dict[str, Any]) -> float | None:
@@ -5719,6 +5922,8 @@ class TelegramClient:
         self.emoji = emoji
         self.chunk_size = chunk_size
         self.last_send_error = ""
+        # T-261024-002: 이 대화에서 본 가장 최근 메시지 번호(보낸 것·받은 것). 진행 카드가 묻혔는지 판정한다.
+        self.latest_message_id = 0
         # T-260811-022: 한국어 게이트가 차단한 원문을 적재할 위치 — 기존 config.state_dir
         # 관례(~/.claude/state, CLB_STATE_DIR)와 동일 기본값. 명시 인자가 있으면 그걸 우선한다
         # (테스트가 tmp 디렉토리로 격리할 수 있게).
@@ -6008,12 +6213,23 @@ class TelegramClient:
                     return None
             time.sleep(2)
 
+    def note_message_id(self, message_id: Any) -> None:
+        if type(message_id) is int and message_id > getattr(self, "latest_message_id", 0):
+            self.latest_message_id = message_id
+
     def get_updates(self, offset: int, timeout: int) -> list[dict[str, Any]]:
         payload = self.call("getUpdates", offset=offset, timeout=timeout)
         if not payload or not payload.get("ok"):
             return []
         result = payload.get("result")
-        return result if isinstance(result, list) else []
+        if not isinstance(result, list):
+            return []
+        for update in result:
+            message = update.get("message") if isinstance(update, dict) else None
+            chat = message.get("chat") if isinstance(message, dict) else None
+            if isinstance(chat, dict) and str(chat.get("id")) == str(self.chat_id):
+                self.note_message_id(message.get("message_id"))
+        return result
 
     def get_webhook_info(self) -> dict[str, Any]:
         payload = self.call("getWebhookInfo")
@@ -6200,6 +6416,7 @@ class TelegramClient:
             result = payload.get("result")
             if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
                 message_ids.append(int(result["message_id"]))
+                self.note_message_id(result["message_id"])
             else:
                 self.last_send_error = str(payload.get("delivery") or "Telegram returned no confirmed message ID")
                 return None
@@ -6290,6 +6507,7 @@ class TelegramClient:
             result = payload.get("result")
             if isinstance(result, dict) and type(result.get("message_id")) is int and result["message_id"] > 0:
                 message_ids.append(int(result["message_id"]))
+                self.note_message_id(result["message_id"])
             else:
                 self.last_send_error = str(payload.get("delivery") or "Telegram returned no confirmed message ID")
                 return None
@@ -8083,7 +8301,14 @@ class SessionBinder:
             updated_at = float(item.get("updated_at") or 0)
             session_id = str(item.get("sessionId") or item.get("session_id") or "")
             if not transcript.exists():
-                continue
+                # T-261019-025: EnterWorktree/ExitWorktree 는 살아 있는 세션 기록을 다른 프로젝트
+                # 폴더로 옮긴다(같은 inode). 옛 경로만 보고 건너뛰면 같은 pane 의 끝난 옛 세션이
+                # 이겨 답 미전달·질문 카드 버튼 없음·옛 메시지 재에코가 났다(macOS 노드 10/19 19:49).
+                moved = self._relocated_transcript(transcript, session_id)
+                if moved is None:
+                    continue
+                self._record_relocated_sidecar(transcript, moved, session_id, pane_pid)
+                transcript = moved
             if pane_open and transcript.resolve() not in pane_open:
                 continue
             try:
@@ -8099,6 +8324,42 @@ class SessionBinder:
         if scored_matches and scored_matches[0][2] > 0:
             return [scored_matches[0][3]]
         return [item[3] for item in scored_matches]
+
+    def _relocated_transcript(self, transcript: Path, session_id: str) -> Path | None:
+        """같은 sessionId 기록이 프로젝트 폴더들 가운데 정확히 한 곳에 있을 때만 그 경로."""
+        # 파일 이름에 쓸 수 있는 세션 id 만 받는다(글롭 문자 차단) — askq 사이드카와 같은 규칙.
+        if not ASKQ_SIDECAR_SESSION_RE.fullmatch(session_id) or transcript.name != f"{session_id}.jsonl":
+            return None
+        try:
+            found = [path for path in self.config.claude_projects_dir.glob(f"*/{transcript.name}") if path.is_file()]
+        except OSError:
+            return None
+        return found[0] if len(found) == 1 else None
+
+    def _record_relocated_sidecar(self, previous: Path, moved: Path, session_id: str, pane_pid: int) -> None:
+        """찾은 경로를 그 항목에 적어 다음 루프가 프로젝트 폴더를 다시 훑지 않게 한다."""
+        payload = read_json(self.config.session_sidecar_path) or {}
+        sessions = payload.get("sessions")
+        items = sessions.values() if isinstance(sessions, dict) else sessions if isinstance(sessions, list) else []
+        changed = False
+        for item in items:
+            if not isinstance(item, dict) or Path(str(item.get("transcript_path") or "")).expanduser() != previous:
+                continue
+            try:
+                item_pid = int(item.get("pane_pid") or 0)
+            except (TypeError, ValueError):
+                continue
+            if item_pid == pane_pid and str(item.get("sessionId") or item.get("session_id") or "") == session_id:
+                item.update(transcript_path=str(moved), relocated_from=str(previous), relocated_at=time.time())
+                changed = True
+        if not changed:
+            return
+        try:
+            write_json_atomic(self.config.session_sidecar_path, dict(payload, updated_at=time.time()))
+        except OSError as exc:
+            log("SESSION", f"relocated sidecar write failed: {exc}")
+            return
+        log("SESSION", f"transcript relocated {previous} → {moved} (T-261019-025)")
 
     def _resolve_fresh_sidecar_metadata(self, pane_pid: int) -> list[ClaudeSessionBinding]:
         payload = read_json(self.config.session_sidecar_path) or {}
@@ -9167,6 +9428,8 @@ class Bridge:
         # candidates = 띄웠지만 아직 백그라운드 확인 전. 재기동 시 비운다(유령 입력중 방지).
         self.background_typing_candidates: dict[str, float] = {}
         self.background_typing_tasks: dict[str, float] = {}
+        # T-261023-025: 백그라운드 Bash 출력 파일 경로 — 끝 표시로 완료 알림 없는 종료를 잡는다.
+        self.background_output_paths: dict[str, str] = {}
         self.progress_message_id: int = 0
         self.progress_last_render_at: float = 0.0
         self.last_transcript_mtime = 0.0
@@ -10463,6 +10726,7 @@ class Bridge:
             "approval_cards": list(getattr(self, "approval_cards", [])),
             "completed_reply": getattr(self, "completed_reply", None),
             "go_question_card": getattr(self, "go_question_card", None),
+            "model_notice": getattr(self, "model_notice", None),  # T-261021-001
             "background_flows": getattr(self, "background_flows", {}),
             "background_flow_boundaries": dict(list(getattr(self, "background_flow_boundaries", {}).items())[-500:]),
             "public_progress_origin": getattr(self, "public_progress_origin", None),
@@ -10613,6 +10877,7 @@ class Bridge:
         self.restore_completed_reply((state or {}).get("completed_reply"))
         go_card = (state or {}).get("go_question_card")
         self.go_question_card = go_card if isinstance(go_card, dict) else None
+        self.model_notice = claude_model_notice.load((state or {}).get("model_notice"))  # T-261021-001
         self.restore_background_flows(state or {})
         origin = (state or {}).get("public_progress_origin")
         self.public_progress_origin = (
@@ -10766,6 +11031,26 @@ class Bridge:
             return previous
 
         identity = session_identity(binding.transcript_path) if binding.transcript_path.exists() else None
+        # T-261019-025: 워크트리 진입·이탈은 같은 세션 기록을 다른 프로젝트 폴더로 옮길 뿐이다
+        # (같은 sessionId·같은 inode). 세션 교체로 다루면 active_turn 이 있을 때 offset=0 재판독
+        # (옛 메시지 재에코)이 나므로, 읽기 위치·진행 턴을 그대로 두고 경로만 바꾼다.
+        current = self.session_identity
+        if (
+            previous is not None and identity is not None and current is not None
+            and binding != previous and binding.session_id == previous.session_id
+            and binding.pane_pid == previous.pane_pid and binding.transport == previous.transport == "tmux"
+            and (identity.dev, identity.ino) == (current.dev, current.ino) and identity.size >= current.size
+        ):
+            self.session_binding = binding
+            self.session_identity = identity
+            log(
+                "SESSION",
+                f"transcript moved {previous.transcript_path} → {binding.transcript_path} "
+                f"offset={self.session_pos} (T-261019-025)",
+            )
+            self.persist_state()
+            self.write_egress_sidecar()
+            return binding
         if self.session_binding != binding or (identity is not None and self.transcript_identity_changed(identity)):
             # A live rotation can come from a terminal /clear, outside the Telegram queue.
             # First binding after restart must never replay an old completion notice.
@@ -11023,6 +11308,23 @@ class Bridge:
                 completed = completed_background_agent_tools(
                     binding.transcript_path, binding.session_id, tool_ids,
                 )
+                # T-261023-025: 완료 알림이 안 온 백그라운드 Bash 는 출력 파일 끝 표시로 닫는다.
+                paths = dict(getattr(self, "background_output_paths", {}) or {})
+                for flow in owned_flows:
+                    paths.update(flow.get("outputs") or {})
+                ended = {}
+                for tid in tool_ids - completed:
+                    ending = background_output_ending(paths[tid]) if tid in paths else None
+                    if ending:
+                        ended[tid] = ending[0]
+                if ended:
+                    for tid, status in ended.items():
+                        tasks.pop(tid, None)
+                        for flow in owned_flows:
+                            if flow.get("tools", {}).get(tid) == "running":
+                                flow["tools"][tid] = status
+                    self.persist_state()
+                    log("TYPE", f"reconciled ended background shells count={len(ended)}")
                 if completed:
                     for tid in completed:
                         tasks.pop(tid, None)
@@ -11042,7 +11344,8 @@ class Bridge:
     def observe_background_typing(self, record: dict[str, Any]) -> None:
         """T-261008-009: 텔레그램 턴의 백그라운드 작업 시작·끝을 transcript 에서 추적한다."""
         if (not hasattr(self, "background_typing_tasks")
-                or record.get("isSidechain") or record.get("isMeta")):
+                or record.get("isSidechain") or record.get("isMeta")
+                or record.get("type") == CLAUDE_REQUEST_SNAPSHOT_TYPE):
             return
         # T-261011-023: 턴 도중에 끝난 작업은 attachment 레코드로 끝을 알린다.
         endings = task_notification_endings(record)
@@ -11093,6 +11396,7 @@ class Bridge:
                                 if isinstance(native, dict) else bool(_BG_LAUNCH_RE.search(text or "")))
                 if asynchronous:
                     self.background_typing_tasks[tool_use_id] = started
+                    remember_background_output(self, tool_use_id, text)
             text_blob = content_text(content)
             if text_blob and self.background_typing_tasks:
                 for match in _TASK_NOTIFICATION_RE.finditer(text_blob):
@@ -11675,12 +11979,19 @@ class Bridge:
         # An explicit native cancellation is a terminal boundary. Once its tracked
         # turn is gone, ancillary writes (notably away_summary) must not renew the
         # destructive-command quiet window. New/unknown activity remains busy.
-        return self.active_turn is not None or not self.transcript_ends_with_interruption()
+        # T-261018-022: a local slash command (/effort, /model, …) is the same kind of
+        # boundary — its records refresh mtime but no response is coming. Without this,
+        # the /effort the owner just applied from the phone held the next /clear (and
+        # everything queued behind it) for the whole 60s window (실측 10/18 15:49 작업 노드).
+        return self.active_turn is not None or not (
+            self.transcript_ends_with_interruption() or self.transcript_ends_with_local_command()
+        )
 
-    def transcript_ends_with_interruption(self) -> bool:
+    def _transcript_tail_lines(self) -> list[str] | None:
+        """Whole lines from the bound transcript's tail, or None when unreadable or mid-write."""
         binding = self.session_binding
         if binding is None:
-            return False
+            return None
         try:
             with binding.transcript_path.open("rb") as stream:
                 before = os.fstat(stream.fileno())
@@ -11689,14 +12000,41 @@ class Bridge:
                 raw = stream.read()
                 after = os.fstat(stream.fileno())
         except OSError:
-            return False
+            return None
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-            return False
+            return None
         if not raw.endswith(b"\n"):
-            return False
+            return None
         lines = raw.decode("utf-8", errors="replace").splitlines()
         if start:
             lines = lines[1:]
+        return lines
+
+    def transcript_ends_with_local_command(self) -> bool:
+        """T-261018-022: the newest record is a local slash-command block of this session."""
+        binding = self.session_binding
+        lines = self._transcript_tail_lines()
+        if binding is None or lines is None:
+            return False
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError):
+                return False
+            if not isinstance(record, dict):
+                return False
+            if record.get("type") in TRANSCRIPT_BOOKKEEPING_TYPES:
+                continue
+            return record.get("sessionId") == binding.session_id and is_local_command_record(record)
+        return False
+
+    def transcript_ends_with_interruption(self) -> bool:
+        binding = self.session_binding
+        lines = self._transcript_tail_lines()
+        if binding is None or lines is None:
+            return False
         for line in reversed(lines):
             if not line.strip():
                 continue
@@ -12957,6 +13295,22 @@ class Bridge:
             return False
         if parsed.get("expires_in") == 0:
             return False
+        # T-261023-019: 곧 자동 거절될 승인창은 폰에서 누를 시간이 없다(10/23 macOS 노드 0:21 카드,
+        #   버튼이 열기 전에 지워짐). 버튼 없이 무음 한 줄만 남긴다. 메시지는 지우지 않는다.
+        expires_in = parsed.get("expires_in")
+        if parsed["kind"] == "approval" and expires_in is not None and expires_in <= AUTO_DENY_NOTICE_MAX_SECONDS:
+            notice = self.tr(AUTO_DENY_NOTICE)
+            detail = "\n".join(parsed.get("context") or [])[:400]
+            # T-261014-008: 본문에 운영필터 단어가 있으면 알림 전체가 버려진다 — 본문만 뺀다.
+            if detail and classify_claude_ops_outbound(f"{notice}\n{detail}") is None:
+                notice += f"\n{detail}"
+            try:
+                self.telegram.send(notice, silent=True)
+            except Exception as exc:  # noqa: BLE001
+                log("BUSY", f"auto-deny notice failed: {type(exc).__name__}")
+                return False
+            log("CHOICE", f"auto-deny notice sent expires_in={expires_in} sig={parsed['signature']}")
+            return True
         body = choice_card_text(parsed, translate=self.tr)
         tracked = parsed["kind"] in {"approval", "computer_use"}
         if tracked:
@@ -13504,6 +13858,13 @@ class Bridge:
                 if question_title_matches(title, parsed["title"]):
                     card_parsed["title"] = title
                     break
+        # T-261024-014: 승인 카드는 바로 앞 진행 글의 복붙 원문(보낼 문안)을 카드 안에 다시 싣는다.
+        #   카드만 보고도 무엇을 승인하는지 알 수 있게 — 외부발신 「원문 먼저」 규칙(T-261023-009)의 화면 쪽.
+        recent = getattr(self, "recent_progress_copy", None)
+        if (recent and re.sub(r"^[^\w가-힣]+", "", str(card_parsed.get("header") or "")).strip() == "승인"
+                and time.monotonic() - recent[0] <= QUESTION_CARD_PREVIEW_SECONDS):
+            card_parsed["preview"] = list(recent[1])
+            self.recent_progress_copy = None
         params: dict[str, Any] = {
             "chat_id": self.config.chat_id,
             "text": getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
@@ -15013,6 +15374,7 @@ class Bridge:
         deadline = time.monotonic() + timeout
         current = ""
         mirrored = False
+        self.effort_dialog_confirmed = False
         while True:
             current = self.current_session_effort()
             if current and current.lower() == level.lower():
@@ -15021,11 +15383,25 @@ class Bridge:
             #   종전엔 확인창이 떠 있어도 이 루프가 그것을 못 보고 조용히 타임아웃했다.
             #   감지되면 무엇을 묻고 있는지를 **폰으로 미러**한다(1회). 자동 응답은 하지
             #   않는다 — 폰 응답을 프롬프트로 라우팅하는 축(b)은 상태기계라 별건이다.
+            # ★T-261018-022 — 예외 하나: 방금 폰에서 고른 **그 레벨**의 「Change effort
+            #   level?」 확인창은 선택대로 1(예)을 보낸다. 이 창은 2.1.302 가 이력 있는 세션의
+            #   `/effort <level>` 마다 띄우는데(상태줄 숨김·JSONL 무기록), 카드로 넘기면 이
+            #   루프가 메인 루프를 6초 막아 카드 탭이 처리되지 못하고 「⛔ 폰에서는 답할 수
+            #   없어요」 거짓 통지까지 나갔다. 메뉴가 「선택창 없이 즉시 적용」을 약속한다.
+            #   다른 레벨·다른 창은 종전대로 카드/미러다 (대신 답하지 않는다).
             if not mirrored:
                 try:
                     screen = self.repl.capture_pane(80)
                 except Exception:  # noqa: BLE001
                     screen = ""
+                if (
+                    not self.effort_dialog_confirmed
+                    and pane_interstitial(screen) == "switch_effort"
+                    and self.confirm_effort_change_dialog(screen, level)
+                ):
+                    self.effort_dialog_confirmed = True
+                    log("INJECT", f"/effort {level} '{EFFORT_CONFIRM_TITLE}' answered 1 (Yes, as chosen)")
+                    continue
                 if pane_interstitial(screen):
                     # ★T-260802-100 — 버튼 카드를 **선시도**한다. 파싱 불가·종류 불허로
                     #   False 면 종전 미러 문구로 조용히 폴백한다(문구·동작 무변경).
@@ -15048,12 +15424,45 @@ class Bridge:
                 return False, current
             time.sleep(min(poll, max(0.0, deadline - time.monotonic())))
 
+    def confirm_effort_change_dialog(self, screen: str, level: str) -> bool:
+        """Answer 「Change effort level?」 with 1 only when it confirms the level just chosen (T-261018-022)."""
+        parsed = parse_pane_choice(screen)
+        if not parsed or parsed["kind"] != "confirm" or parsed["title"] != EFFORT_CONFIRM_TITLE:
+            return False
+        options = dict(parsed["options"])
+        if parsed.get("selected") != 1 or not re.fullmatch(
+            rf"(?i)yes,\s+switch\s+to\s+{re.escape(level)}", (options.get(1) or "").strip()
+        ):
+            return False
+        send = getattr(self.repl, "send_choice_key", None)
+        submit = getattr(self.repl, "submit_prompt", None)
+        try:
+            if callable(send):
+                send("1")
+            elif callable(submit):
+                submit("1")
+            else:
+                return False
+        except Exception as exc:  # noqa: BLE001
+            log("INJECT", f"/effort {level} confirm dialog answer failed: {exc}")
+            return False
+        return True
+
     @staticmethod
-    def effort_apply_notice(level: str, confirmed: bool, current: str, selected: bool = False, language: str = "") -> str:
+    def effort_apply_notice(
+        level: str, confirmed: bool, current: str, selected: bool = False, language: str = "",
+        dialog_confirmed: bool = False,
+    ) -> str:
         label = current or translate("(세션 상태줄에서 확인 불가)", language)
         if confirmed:
             action = translate("사고강도 선택 적용" if selected else "사고강도 적용", language)
-            return translate("✅ {action}: {level}\n현재 세션 사고강도: {label}", language, action=action, level=level, label=label)
+            text = translate("✅ {action}: {level}\n현재 세션 사고강도: {label}", language, action=action, level=level, label=label)
+            if dialog_confirmed:
+                text += "\n" + translate(
+                    "확인창 「Change effort level?」은 선택대로 1(예)로 답했어요 — 다음 응답은 이력을 다시 읽어 조금 느릴 수 있어요.",
+                    language,
+                )
+            return text
         return translate('⚠️ 사고강도 전환 확인 실패: {level}\n현재 세션 사고강도: {label}\n(주입은 나갔을 수 있어요 — 상태줄로 확인해 주세요)', language, level=level, label=label)
 
     def handle_effort_command(self, item: "QueueItem") -> None:
@@ -15077,7 +15486,10 @@ class Bridge:
                 self.telegram.send(self.tr('claude bridge /effort 적용 실패: {v0}', v0=exc))
                 return
             confirmed, current = self.wait_for_session_effort(level)
-            self.telegram.send(self.effort_apply_notice(level, confirmed, current, language=self.language_code()))
+            self.telegram.send(self.effort_apply_notice(
+                level, confirmed, current, language=self.language_code(),
+                dialog_confirmed=getattr(self, "effort_dialog_confirmed", False),
+            ))
             self.queue.append_status(
                 item,
                 "injected",
@@ -15142,7 +15554,10 @@ class Bridge:
             return
         confirmed, current = self.wait_for_session_effort(level)
         self._emit_model_notice(
-            prefix(self.effort_apply_notice(level, confirmed, current, selected=True, language=self.language_code())),
+            prefix(self.effort_apply_notice(
+                level, confirmed, current, selected=True, language=self.language_code(),
+                dialog_confirmed=getattr(self, "effort_dialog_confirmed", False),
+            )),
             menu_message_id,
         )
         result = "applied" if confirmed else "unverified"
@@ -15805,6 +16220,23 @@ class Bridge:
             return ""
         return composer_residual_text(screen)
 
+    def composer_residual_is_active_prompt(self, residual: str, item: QueueItem) -> bool:
+        # T-261019-027: sidecar 경로의 가시 프롬프트가 기본이고, sidecar 기록이 실패한
+        # 턴은 envelope 전문이 paste 됐을 수 있어 두 후보를 모두 대조한다.
+        candidates = [self.sidecar_visible_prompt(item)]
+        try:
+            candidates.append(self.envelope_prompt(item))
+        except Exception as exc:  # noqa: BLE001 — 후보 계산 실패는 매칭 실패로만 좁힌다
+            log("INJECT", f"residual match candidate build failed queue={item.queue_id[:10]}: {exc}")
+        return any(composer_residual_matches_prompt(residual, candidate) for candidate in candidates)
+
+    def blocking_screen_excerpt_for_notice(self) -> str:
+        try:
+            return blocking_screen_excerpt(sanitize_text(self.repl.capture_pane(80), limit=12000))
+        except Exception as exc:  # noqa: BLE001 — 화면 첨부는 보조 정보라 실패해도 알림은 보낸다
+            log("QUEUE", f"blocking screen capture failed: {exc}")
+            return ""
+
     def fail_active_submit_confirmation(self, active: ActiveTurn, item: QueueItem, error: str) -> None:
         with self.lock:
             if self.active_turn is not active:
@@ -15815,9 +16247,11 @@ class Bridge:
         self.queue.append_status(item, "failed", error=error, submit_confirm_failed=True)
         try:
             preview = sanitize_text(item.text, limit=80)
-            self.telegram.send(
-                self.tr('⚠️ 브릿지 제출 실패: 지시를 Claude Code composer에 붙였지만 제출 확인이 안 돼 자동 재시도를 중단했어요. 최신 상황 기준으로 다시 보내주세요. (“{v0}…”)', v0=preview)
-            )
+            notice = self.tr('⚠️ 브릿지 제출 실패: 지시를 Claude Code composer에 붙였지만 제출 확인이 안 돼 자동 재시도를 중단했어요. 최신 상황 기준으로 다시 보내주세요. (“{v0}…”)', v0=preview)
+            excerpt = self.blocking_screen_excerpt_for_notice()
+            if excerpt:
+                notice += "\n\n" + self.tr('터미널 입력칸을 다른 화면이 가리고 있어요. 지금 화면:\n{v0}', v0=excerpt)
+            self.telegram.send(notice)
         except Exception as exc:  # noqa: BLE001
             log("QUEUE", f"submit confirmation failure notice failed: {exc}")
         self.persist_state()
@@ -15829,6 +16263,20 @@ class Bridge:
         if not residual:
             return False
         item = self.queue_item_for_active(active)
+        if not self.composer_residual_is_active_prompt(residual, item):
+            # 지시문이 아닌 잔여(사용자 타이핑 조각·'/'·유령 렌더)에는 Enter 를 보내지
+            # 않는다 — 슬래시 메뉴 첫 항목 오발사 벡터(T-261019-027).
+            log(
+                "INJECT",
+                f"composer residual mismatch queue={item.queue_id[:10]} "
+                f"residual_len={len(residual)}; submit retry suppressed",
+            )
+            self.fail_active_submit_confirmation(
+                active,
+                item,
+                f"composer residual does not match injected directive (residual_len={len(residual)})",
+            )
+            return True
         if active.submit_attempts >= self.config.submit_retry_max_attempts:
             self.fail_active_submit_confirmation(
                 active,
@@ -17079,6 +17527,10 @@ class Bridge:
                     flow["tools"] = {tid: status for tid, status in list(flow["tools"].items())[-128:]
                                      if isinstance(tid, str) and isinstance(status, str)
                                      and status in {"candidate", "running", "completed", "failed", "cancelled"}}
+                    outputs = flow.get("outputs")
+                    flow["outputs"] = {tid: path for tid, path in outputs.items()
+                                       if tid in flow["tools"] and isinstance(path, str)
+                                       and os.path.isabs(path)} if isinstance(outputs, dict) else {}
                     self.background_flows[key] = flow
         boundaries = state.get("background_flow_boundaries")
         self.background_flow_boundaries = {
@@ -17154,6 +17606,10 @@ class Bridge:
                                 if isinstance(native_result, dict) else bool(_BG_LAUNCH_RE.search(text or "")))
                 if asynchronous:
                     flow["tools"][tid] = "running"
+                    path = remember_background_output(self, tid, text)
+                    if path:
+                        flow.setdefault("outputs", {})[tid] = path
+                        flow["outputs"] = dict(list(flow["outputs"].items())[-128:])
                 else:
                     flow["tools"].pop(tid, None)
 
@@ -17391,7 +17847,14 @@ class Bridge:
         raw_text = sanitize_text(strip_bridge_nonce_markers(content_text(public_content)))
         raw_text = re.sub(r"<oai-mem-citation\b[^>]*>.*?(?:</oai-mem-citation>|$)", "", raw_text, flags=re.DOTALL).strip()
         text = _flow_progress.public_progress_text(raw_text)
-        if not text:
+        # T-261021-023: 진행 문장은 코드펜스를 지운다(펜스는 "단계"가 아니다). 그런데 중간 텍스트의
+        #   펜스는 사용자이 읽어야 할 복붙 콘텐츠(보낼 문안·칠 명령)인 경우가 있고, 바로 뒤의 질문 카드가
+        #   「위 문안」으로 그걸 가리킨다. 실측 2026-10-21 19:29 macOS 노드: 문안 펜스가 한 번도 전달되지 않은 채
+        #   승인 카드만 도착했다. 최종답변과 같은 R-C8 규격으로 산문 뒤에 복붙 버블을 따로 보낸다.
+        #   (aniki_dm 만 분리한다 — copy_content_bubble_messages 가 다른 surface 는 원문 그대로 돌려준다.)
+        surface = "aniki_dm" if is_private_chat_id(self.config.chat_id) else "mesh_group"
+        bubbles = copy_content_bubble_messages(raw_text, surface)[1:] if raw_text else []
+        if not text and not bubbles:
             return
         if not confirmed and not self.public_progress_tool_boundary(record):
             # Claude also emits a final answer with stop_reason=None. Keep that
@@ -17409,29 +17872,55 @@ class Bridge:
             return
         digest = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
         key = f"public-progress:{binding.session_id}:{scope}:{digest}"
-        if self.outbox.status(key) == "sent":
+        # 복붙 버블은 버블마다 키를 따로 둔다 — 산문이 착지한 뒤 버블이 실패해도 재시도 때 산문·앞 버블을
+        # 다시 보내지 않는다(같은 JSONL 줄을 다시 읽는 계약은 그대로다).
+        bubble_keys = [f"public-progress-copy:{binding.session_id}:{scope}:{digest}:{index}"
+                       for index in range(len(bubbles))]
+        if self.outbox.status(key) == "sent" and all(self.outbox.status(k) == "sent" for k in bubble_keys):
             return
         if time.time() - created >= PUBLIC_PROGRESS_STALE_SECONDS:
-            self.outbox.mark_sent(key, [])
+            for stale_key in (key, *bubble_keys):
+                self.outbox.mark_sent(stale_key, [])
             log("SEND", "public progress skipped (stale)")
             return
-        self.outbox.mark_sending(key, 1)
-        # Clear any leftover error so a policy drop is judged from this send only.
-        self.telegram.last_send_error = ""
-        try:
-            ids = self.telegram.send(text, _user_reply_to_message_id=anchor)
-        except Exception as exc:  # noqa: BLE001
-            # Never include public text or transport error payloads in the log.
-            raise RuntimeError(f"public progress send unconfirmed ({type(exc).__name__})") from None
-        if not ids and getattr(self.telegram, "last_send_error", "") == CLAUDE_OPS_OUTBOUND_DROP:
-            # Policy drop is terminal; retrying the same JSONL line would loop forever.
-            self.outbox.mark_sent(key, [])
-            log("SEND", "public progress dropped by outbound policy")
-            return
-        if not ids or not all(type(mid) is int and mid > 0 for mid in ids):
-            raise RuntimeError("public progress send unconfirmed")
-        self.outbox.mark_sent(key, ids)
-        log("SEND", "public progress delivered")
+        if self.outbox.status(key) != "sent":
+            if not text:
+                # 산문이 전혀 없으면 빈 메시지를 만들지 않고 복붙 버블만 보낸다(R-C8 4항).
+                self.outbox.mark_sent(key, [])
+            else:
+                self.outbox.mark_sending(key, 1)
+                # Clear any leftover error so a policy drop is judged from this send only.
+                self.telegram.last_send_error = ""
+                try:
+                    ids = self.telegram.send(text, _user_reply_to_message_id=anchor)
+                except Exception as exc:  # noqa: BLE001
+                    # Never include public text or transport error payloads in the log.
+                    raise RuntimeError(f"public progress send unconfirmed ({type(exc).__name__})") from None
+                if not ids and getattr(self.telegram, "last_send_error", "") == CLAUDE_OPS_OUTBOUND_DROP:
+                    # Policy drop is terminal; retrying the same JSONL line would loop forever.
+                    for dropped_key in (key, *bubble_keys):
+                        self.outbox.mark_sent(dropped_key, [])
+                    log("SEND", "public progress dropped by outbound policy")
+                    return
+                if not ids or not all(type(mid) is int and mid > 0 for mid in ids):
+                    raise RuntimeError("public progress send unconfirmed")
+                self.outbox.mark_sent(key, ids)
+                log("SEND", "public progress delivered")
+        for bubble, bubble_key in zip(bubbles, bubble_keys):
+            if self.outbox.status(bubble_key) == "sent":
+                continue
+            self.outbox.mark_sending(bubble_key, 1)
+            try:
+                ids = self.telegram.send_copy_content(bubble, code=True, reply_to_message_id=anchor)
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"public progress copy bubble unconfirmed ({type(exc).__name__})") from None
+            if not ids or not all(type(mid) is int and mid > 0 for mid in ids):
+                raise RuntimeError("public progress copy bubble unconfirmed")
+            self.outbox.mark_sent(bubble_key, ids)
+            log("SEND", "public progress copy bubble delivered")
+        if bubbles:
+            # T-261024-014: 바로 뒤 승인 카드가 「위 문안」을 가리키면 카드에 같은 원문을 다시 싣는다.
+            self.recent_progress_copy = (time.monotonic(), list(bubbles))
 
     def process_record(self, record: dict[str, Any]) -> None:
         binding = self.session_binding
@@ -18155,6 +18644,27 @@ class Bridge:
             pass
         return None
 
+    def queued_telegram_reply_anchor(self, record: dict[str, Any] | None) -> int | None:
+        """이 답이 바쁠 때 보낸 텔레그램 메시지(busy-inject 대기 항목)에 대한 답이면 그 메시지 id.
+
+        T-261023-021: 2026-10-23 00:07~00:17 제어 노드 — 사용자이 클로드가 바쁠 때 보낸 메시지는 native 큐로
+        들어갔고, 앞 턴이 끝나자 클로드가 곧바로 그 메시지를 처리했다. 브릿지는 그 항목을 아직 승격하지 않아
+        (00:17:13 승격) 답이 소유턴 없는 ambient 최종답변으로 나갔고, 운영 잡음 필터가 「이메일」 한 단어로
+        버렸다(DROP kind=mail, send-unconfirmed ambient final). 출처는 브릿지가 넣은 대기 항목이다 — 답의
+        부모 사슬에서 가장 가까운 사람 입력 경계가 그 항목의 본문(user_uuid)일 때만 인정한다. 음성 턴은
+        소유턴 경로와 같이 제외한다. 다른 재진입(노드발·cron·handoff)의 필터는 그대로다.
+        """
+        if not isinstance(record, dict):
+            return None
+        with self.lock:
+            items = list(self.pending)
+        for item in items:
+            if (item.busy_injected and item.user_uuid and item.source != "voice"
+                    and type(item.message_id) is int and item.message_id > 0
+                    and self.public_progress_matches_origin(record.get("parentUuid"), item.user_uuid)):
+                return item.message_id
+        return None
+
     def mirror_ambient_final(
         self, content: Any, *, record: dict[str, Any] | None = None, stop_hook_confirmed: bool = False,
     ) -> None:
@@ -18272,6 +18782,15 @@ class Bridge:
             log("SEND", f"skip native final receipt={self.outbox.status(receipt_key)} assistant={native_origin.assistant_uuid}")
             return
         send_context = {"_native_final_origin": native_origin} if native_origin else {}
+        # T-261023-021: 바쁠 때 보낸 텔레그램 메시지에 대한 답은 그 메시지에 대한 답장이다(운영 알림 아님).
+        reply_anchor = None
+        if (not native_origin and isinstance(record, dict) and isinstance(record.get("message"), dict)
+                and content == record["message"].get("content")):
+            reply_anchor = self.queued_telegram_reply_anchor(record)
+        reply_context = {"_user_reply_to_message_id": reply_anchor} if reply_anchor else {}
+        bubble_reply_context = {"reply_to_message_id": reply_anchor} if reply_anchor else {}
+        if reply_anchor:
+            log("SEND", f"ambient final answers queued telegram message mid={reply_anchor}")
         receipt_ids: list[int] = []
         send_attempted = False
 
@@ -18282,7 +18801,7 @@ class Bridge:
             if native_origin and send_attempted:
                 return None
             send_attempted = True
-            ids = self.telegram.send(body, **send_context, **kwargs)
+            ids = self.telegram.send(body, **send_context, **reply_context, **kwargs)
             if ids:
                 receipt_ids.extend(ids)
             return ids
@@ -18346,7 +18865,7 @@ class Bridge:
                 log("SEND", f"ambient final send failed (non-fatal): {exc}")
         if delivered:
             for bubble in copy_content_bubbles:
-                bubble_ids = self.telegram.send_copy_content(bubble, code=True, **send_context)
+                bubble_ids = self.telegram.send_copy_content(bubble, code=True, **send_context, **bubble_reply_context)
                 if bubble_ids is None:
                     delivered = False
                     log("SEND", "copy-content bubble failed after ambient final (non-fatal)")
@@ -18671,7 +19190,8 @@ class Bridge:
                     self.progress_items[tool_use_id] = ProgressItem(
                         tool_use_id=tool_use_id, kind="bg", label=flow_cap_text(label, 60), started_at=now,
                     )
-                elif name == "Task":
+                elif name in ("Task", "Agent"):
+                    # T-261024-002: 지금 하네스는 서브에이전트를 `Agent` 로 띄운다(10/23 macOS 노드 검토 에이전트 카드 0줄).
                     raw_label = str(inp.get("description") or inp.get("subagent_type") or "").strip()
                     label = korean_gate_filter_fragment(raw_label) or "서브에이전트"
                     self.progress_items[tool_use_id] = ProgressItem(
@@ -18683,6 +19203,14 @@ class Bridge:
                     continue
                 tool_use_id = str(item.get("tool_use_id") or "")
                 pitem = self.progress_items.get(tool_use_id)
+                if pitem is not None and pitem.kind == "subagent" and not pitem.done:
+                    # T-261024-002: 포그라운드 에이전트는 이 tool_result 가 최종 결과라 완료 통지가 오지
+                    # 않는다. 백그라운드 확인 문구가 아니면 카드에서 뺀다(영원히 '위임' 으로 남는 유령 줄 방지).
+                    raw = item.get("content")
+                    text = raw if isinstance(raw, str) else content_text(raw)
+                    if not _BG_LAUNCH_RE.search(text or ""):
+                        del self.progress_items[tool_use_id]
+                    continue
                 if pitem is None or pitem.kind != "bg" or pitem.output_path:
                     continue
                 # dispatch 직후 확인 텍스트에서 output 경로만 얻는다 — 이 tool_result 는
@@ -18722,6 +19250,13 @@ class Bridge:
                     tail = handle.read().decode("utf-8", errors="replace")
             except OSError:
                 continue
+            ending = background_output_ending(item.output_path)
+            if ending:
+                # T-261023-025: 완료 알림 없이 끝난(특히 killed) 작업도 카드에서 끝으로 바꾼다.
+                item.done = True
+                item.done_at = time.time()
+                item.last_activity = ending[1]
+                continue
             current, total = parse_progress_signal(tail)
             if total is not None:
                 item.current, item.total = current, total
@@ -18759,6 +19294,17 @@ class Bridge:
             log_priority_lane_suppress("progress board")
             return False
         try:
+            # T-261024-002: 카드 뒤에 새 메시지가 왔으면 카드가 위로 묻혀 안 보인다(10/23 22:53 macOS 노드 카드가
+            # 답 2개 위에 묻힘). 옛 카드를 지우고 맨 아래에 새로 올린다. 지우기 실패는 무시한다.
+            buried = bool(self.progress_message_id) and (
+                int(getattr(self.telegram, "latest_message_id", 0) or 0) > self.progress_message_id
+            )
+            if buried:
+                try:
+                    self.telegram.delete_activity_indicator(self.progress_message_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                self.progress_message_id = 0
             if not self.progress_message_id:
                 ids = self.telegram.send(body, silent=True)
                 if not ids:
@@ -18906,6 +19452,7 @@ class Bridge:
                         self.process_record(record)
                         self.observe_progress_signals(record)
                         self.observe_background_typing(record)
+                        claude_model_notice.observe(self, record, log=log)  # T-261021-001
                         # An end_turn stops its response indicator even when a
                         # sibling task is still running. Refresh without waiting
                         # for another incoming Telegram message or long poll.

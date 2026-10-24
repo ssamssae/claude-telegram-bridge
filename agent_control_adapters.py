@@ -149,6 +149,10 @@ def claude_turn_activity(path):
             if (not row.get('promptId') or row.get('interruptedMessageId')) and text.strip() in (
                     '[Request interrupted by user]', '[Request interrupted by user for tool use]'):
                 return 'idle'
+            # T-261022-017: a local command record without promptId (/clear) ran inside the CLI;
+            # no model turn follows it. Slash commands that start a turn carry promptId.
+            if not row.get('promptId') and text.lstrip().startswith('<command-name>'):
+                return 'idle'
             if content and not row.get('isMeta') and not row.get('isCompactSummary'):
                 return 'busy'
     return None
