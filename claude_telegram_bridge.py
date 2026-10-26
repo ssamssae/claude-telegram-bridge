@@ -17264,6 +17264,12 @@ class Bridge:
                         pending_item = item
                         break
         if active_item:
+            # T-261026-026: 첨부가 다시 묶은 턴 시작을 최신 경계로 맞춘다. 공개 진행의 대체 판정(부모 기록 창
+            #   밖)은 「최신 경계 = user_uuid」일 때만 열린다 — 본문 user 만 경계로 남으면 긴 턴에서 진행 글·
+            #   복붙 상자·승인 카드 원문이 조용히 빠졌다(제어 노드 2026-10-26 20:43~21:39).
+            boundaries = getattr(self, "background_flow_boundaries", {})
+            boundaries[user_uuid] = boundaries.pop(user_uuid, "")
+            self.background_flow_boundaries = dict(list(boundaries.items())[-500:])
             self.queue.append_status(
                 active_item,
                 "user_jsonl_seen",
@@ -18204,10 +18210,18 @@ class Bridge:
             if self.outbox.status(bubble_key) == "sent":
                 continue
             self.outbox.mark_sending(bubble_key, 1)
+            self.telegram.last_send_error = ""
             try:
                 ids = self.telegram.send_copy_content(bubble, code=True, reply_to_message_id=anchor)
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(f"public progress copy bubble unconfirmed ({type(exc).__name__})") from None
+            if not ids and getattr(self.telegram, "last_send_error", "") == CLAUDE_OPS_OUTBOUND_DROP:
+                # T-261026-003: 상자도 정책 버림은 끝난 일이다. 미확인으로 올리면 같은 JSONL 줄을 다시 읽어
+                #   멈추지 않는다(제어 노드 2026-10-26 09:52~10:02 약 1,000번 — 그동안 질문 카드가 못 나갔다).
+                #   버려진 원문은 아래 recent_progress_copy 로 바로 뒤 승인 카드에 실린다.
+                self.outbox.mark_sent(bubble_key, [])
+                log("SEND", "public progress copy bubble dropped by outbound policy")
+                continue
             if not ids or not all(type(mid) is int and mid > 0 for mid in ids):
                 raise RuntimeError("public progress copy bubble unconfirmed")
             self.outbox.mark_sent(bubble_key, ids)
