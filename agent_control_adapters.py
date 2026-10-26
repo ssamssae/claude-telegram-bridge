@@ -99,6 +99,21 @@ def codex_turn_activity(path):
     return None
 
 
+CODEX_THREAD_ID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$')
+
+
+def codex_thread_id(path):
+    """Codex names both the rollout and its writer lock after the thread id."""
+    match = CODEX_THREAD_ID.search(Path(path).stem)
+    return match.group(0) if match else ''
+
+
+def session_key(engine, pid, path):
+    """The one control session key. A Codex rollout and its writer lock share the
+    thread id, so the first turn keeps the key that a sender saw before it."""
+    return fingerprint(engine, pid, (codex_thread_id(path) if engine == 'codex' else '') or path)
+
+
 def claude_prompt_anchor(path, anchor):
     """Sidecar receipts point at attachments; only follow their prompt ancestry."""
     rows = {row.get('uuid'): row for row in history_rows(path, max_bytes=8 * 1024 * 1024)
@@ -207,6 +222,10 @@ class TerminalAdapter:
             # Do NOT use session_file's newest-session fallback for input targeting.
             path = g['session_file_from_descendants'](pid)
             if not path:
+                # Codex writes the rollout only after the first turn. A fresh TUI
+                # holds just its own writer lock, which names the exact thread.
+                path = g.get('codex_thread_lock_from_descendants', lambda pid: None)(pid)
+            if not path:
                 raise ControlError('session_unbound')
             screen = b.repl.capture_visible_screen()
             approval = g['parse_approval_prompt'](screen)
@@ -278,7 +297,7 @@ class TerminalAdapter:
         if turn_id:
             info = Path(path).stat()
             turn = fingerprint(path, info.st_dev, info.st_ino, turn_id)
-        return {'session': fingerprint(engine, pid, path), 'session_label': Path(path).stem[-12:],
+        return {'session': session_key(engine, pid, path), 'session_label': Path(path).stem[-12:],
                 'turn': turn, 'turn_id': turn_id,
                 'status': status, 'draft': draft, 'question': question,
                 'capabilities': capabilities, 'messages': transcript(path),

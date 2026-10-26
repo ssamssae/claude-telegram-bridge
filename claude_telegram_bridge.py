@@ -3524,9 +3524,16 @@ def _declared_confirm(lines):
 
 
 # 2.1.302 prefixes the sentence with the warning glyph ⚠ (T-261019-028).
+# T-261024-018: the safety-check dialog draws it inside a │ border and wraps it on a
+# narrow pane ("…request in\n│ 0:26, to avoid…"), so words may be split by a newline
+# plus border. Unmatched, the countdown stayed in the signature and every redraw sent a new card.
+_AUTO_DENY_SEP = r"(?:[ \t]*\n[ \t]*(?:│[ \t]*)?|[ \t]+)"
 CHOICE_AUTO_DENY_RE = re.compile(
-    r"^((?:⚠️?\s+)?Claude Code will automatically deny this request\s+in\s+)(\d{1,3}):([0-5]\d)"
-    r"(?=,\s+to avoid blocking progress on an\s+unattended session)", re.MULTILINE,
+    r"^((?:│[ \t]*)?(?:⚠️?[ \t]+)?"
+    + _AUTO_DENY_SEP.join("Claude Code will automatically deny this request in".split())
+    + _AUTO_DENY_SEP + r")(\d{1,3}):([0-5]\d)(?=,"
+    + _AUTO_DENY_SEP + _AUTO_DENY_SEP.join("to avoid blocking progress on an unattended session".split())
+    + ")", re.MULTILINE,
 )
 # T-261023-019: 남은 시간이 이 이하인 승인창은 버튼 카드 대신 무음 한 줄 알림으로 보낸다.
 AUTO_DENY_NOTICE_MAX_SECONDS = 60
@@ -3867,6 +3874,12 @@ def _choice_context(lines, above_idx: int, title: str, *, truncate: bool = True)
 
 # 콜백 prefix. callback_data = "clb-choice::<signature>::<번호>" (64바이트 한도 안).
 CHOICE_CALLBACK = "clb-choice"
+# T-261025-028: 여러 개 고르기 카드의 「다 골랐어요」 버튼 값(보기 번호 자리).
+QUESTION_MULTI_DONE = "done"
+QUESTION_MULTI_NOTICES = {
+    "empty": "하나 이상 체크한 뒤 눌러주세요",
+    "changed": "화면이 바뀌었어요 — 새 카드에서 골라주세요",
+}
 # T-261014-008: 질문 카드 미전달 안전망 알림 — 질문 본문을 싣지 않는다(운영필터·사생활).
 QUESTION_STALL_NOTICE = "A question is open in the terminal, but its card was not delivered. Please answer it in the terminal."
 
@@ -3929,10 +3942,16 @@ def choice_card_text(parsed, translate=lambda text: text) -> str:
     return "\n".join(rows)
 
 
-def choice_keyboard(parsed):
+def choice_keyboard(parsed, translate=lambda text: text):
+    # T-261025-028: 여러 개 고르기 = 보기 버튼이 체크를 켜고 끈다. 버튼 글자에 지금 체크 상태를
+    #   싣고, 맨 아래 「다 골랐어요」 버튼이 다음 칸으로 넘긴다.
+    multi = bool(parsed.get("multi"))
+    checked = set(parsed.get("checked") or ())
     buttons = []
     for num, label in parsed["options"]:
         text = f"{num}. {label}"
+        if multi:
+            text = ("✅ " if num in checked else "⬜ ") + text
         if len(text) > 48:
             text = text[:47] + "…"
         buttons.append(
@@ -3944,6 +3963,11 @@ def choice_keyboard(parsed):
                 ),
             }]
         )
+    if multi:
+        buttons.append([{
+            "text": translate("➡️ 다 골랐어요"),
+            "callback_data": "{}::{}::{}".format(CHOICE_CALLBACK, parsed["signature"], QUESTION_MULTI_DONE),
+        }])
     return buttons
 
 
@@ -3966,7 +3990,7 @@ ASKQ_HINT_RE = re.compile(r"(?i)\benter to select\b.*\besc to cancel\b")
 ASKQ_TAB_RE = re.compile(r"^\s*(?:←\s+)?[☐☒]\s+\S")
 ASKQ_FREEFORM_RE = re.compile(r"(?i)^type something\.?$")
 ASKQ_CHAT_RE = re.compile(r"(?i)^chat about this$")
-ASKQ_MULTI_MARK_RE = re.compile(r"^\[[ ✔xX]\]\s*")
+ASKQ_MULTI_MARK_RE = re.compile(r"^\[([ ✔xX])\]\s*")
 ASKQ_REVIEW_TITLE = "Ready to submit your answers?"
 ASKQ_TEXT_MAX = 500
 ASKQ_CLIPPED_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*Esc to cancel$")
@@ -4021,6 +4045,48 @@ def read_askq_sidecar(session_id) -> dict | None:
                and isinstance(question.get("header", ""), str) for question in questions):
         return None
     return {"tool_id": tool_id, "session_id": session_id, "questions": questions}
+
+
+ASKQ_SETTLE_SCAN_BYTES = 512 * 1024
+ASKQ_SETTLE_SCAN_SECONDS = 15.0
+
+
+def askq_settled_in_transcript(path, tool_id) -> tuple[bool, dict | None]:
+    """T-261024-023: 열린 질문이 기록상 끝났는가. (끝남, 그 tool_result 레코드)를 돌려준다.
+
+    증거는 둘뿐이다 — 그 tool_use_id 의 tool_result, 또는 그 tool_use 뒤에 온 다른 assistant
+    메시지. 못 찾으면 열린 채로 둔다: 질문 창 동안 기록은 멈추고, tool_use 를 답 뒤에야 쓰는
+    판도 있어서(bind_late_question_cards) 「안 보임」은 「끝남」이 아니다.
+    """
+    try:
+        with Path(path).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - ASKQ_SETTLE_SCAN_BYTES))
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except (OSError, TypeError, ValueError):
+        return False, None
+    tool_message = None
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        message = record.get("message") if isinstance(record, dict) else None
+        if not isinstance(message, dict) or record.get("isSidechain"):
+            continue
+        content = message.get("content")
+        blocks = [block for block in content if isinstance(block, dict)] if isinstance(content, list) else []
+        if record.get("type") == "user" and any(
+            block.get("type") == "tool_result" and block.get("tool_use_id") == tool_id for block in blocks
+        ):
+            return True, record
+        if record.get("type") != "assistant":
+            continue
+        if any(block.get("type") == "tool_use" and block.get("id") == tool_id for block in blocks):
+            tool_message = message.get("id") or tool_id
+        elif tool_message is not None and message.get("id") and message.get("id") != tool_message:
+            return True, None
+    return False, None
 
 
 def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, *, full_header=False):
@@ -4209,13 +4275,17 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
     options: list[tuple[int, str, str]] = []
     selected = 0
     multi = False
+    checked: list[int] = []
     for idx in range(start + 1, hint_idx):
         raw = lines[idx]
         matched = CHOICE_OPTION_RE.match(raw)
         if matched:
             label = matched.group(3).strip()
-            if ASKQ_MULTI_MARK_RE.match(label):
+            mark = ASKQ_MULTI_MARK_RE.match(label)
+            if mark:
                 multi = True
+                if mark.group(1) != " ":
+                    checked.append(int(matched.group(2)))
                 label = ASKQ_MULTI_MARK_RE.sub("", label).strip()
             options.append((int(matched.group(2)), label, ""))
             if matched.group(1):
@@ -4251,6 +4321,10 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
             descriptions[num] = desc
     if not buttons:
         return None
+    if multi:
+        # T-261025-028: 여러 개 고르기에서 체크를 켜고 끌 때마다 머리표가 ☐↔☒ 로 바뀐다(2026-10-25
+        #   v2.1.310 실측). 같은 질문이 새 카드·새 서명이 되지 않게 머리표를 ☐ 로 맞춘다.
+        header = header.replace("☒", "☐")
     payload = header + "|" + question + "|" + "|".join(label for _, label, _ in options)
     return {
         "kind": "question",
@@ -4261,6 +4335,7 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
         "descriptions": descriptions,
         "freeform": None if multi else freeform,
         "multi": multi,
+        "checked": checked,
         "review": review_idx >= 0,
         "selected": selected,
         "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
@@ -4275,6 +4350,13 @@ QUESTION_CARD_PREVIEW_SECONDS = 600.0
 QUESTION_CARD_PREVIEW_MAX_CHARS = 2500
 
 
+def progress_text_truncated(raw_text: str, progress_text: str) -> bool:
+    """진행 글 축약(두 문장)이 산문을 실제로 잘랐는가. 목록 기호·꾸밈 차이는 무시한다."""
+    def letters(value: str) -> str:
+        return re.sub(r"[\W\d_]+", "", value or "")
+    return bool(progress_text) and len(letters(raw_text)) > len(letters(progress_text)) + 20
+
+
 def question_card_preview_text(bubbles) -> str:
     """승인 카드에 다시 싣는 원문. 카드 한 장(4096자) 안에 들도록 자른다."""
     text = "\n\n".join(str(bubble).strip() for bubble in bubbles if str(bubble).strip())
@@ -4287,13 +4369,18 @@ def ask_question_card_text(parsed, translate=lambda text: text) -> str:
     rows = [f"❓ {parsed['title']}", ""]
     preview = question_card_preview_text(parsed.get("preview") or [])
     if preview:
-        rows.extend([translate("보낼 원문:"), preview, ""])
+        rows.extend([translate(parsed.get("preview_label") or "보낼 원문:"), preview, ""])
     for num, label in parsed["options"]:
         desc = parsed.get("descriptions", {}).get(num)
         rows.append(f"{num}. {label}" + (f" — {desc}" if desc else ""))
     rows.append("")
     if parsed.get("multi"):
-        rows.append(translate("여러 개를 고르는 질문이라 터미널에서 골라주세요."))
+        # T-261025-028: DM 장식 정리가 본문의 ☑·✅ 를 지우므로 체크 상태는 글자 줄로 싣는다.
+        checked = set(parsed.get("checked") or ())
+        labels = [label for num, label in parsed["options"] if num in checked]
+        rows.append(translate("고른 것: {v0}").format(v0=", ".join(labels)) if labels
+                    else translate("고른 것: 아직 없음"))
+        rows.append(translate("보기 버튼을 누르면 체크가 켜지고 꺼져요. 다 고르면 「다 골랐어요」를 누르세요."))
     else:
         rows.append(translate("버튼을 누르면 그 답이 골라져요."))
         if parsed.get("freeform"):
@@ -4305,6 +4392,15 @@ def ask_question_answer_text(text: str) -> str:
     """직접 입력 답 = 한 줄·제어문자 제거·길이 상한. 입력칸은 한 줄짜리다."""
     cleaned = "".join(ch for ch in (text or "") if ch.isprintable() or ch in "\n\t")
     return " ".join(cleaned.split())[:ASKQ_TEXT_MAX]
+
+
+def askq_multi_buttons(parsed, card, signature: str) -> set[int]:
+    """같은 여러 개 고르기 질문 화면이면 보기 번호들, 아니면 빈 집합 (T-261025-028)."""
+    if not parsed or not parsed.get("multi") or parsed["signature"] != signature:
+        return set()
+    if parsed["header"] + "|" + parsed["title"] != card.get("episode"):
+        return set()
+    return {num for num, _ in parsed["options"]}
 
 
 def ask_question_answer_visible(parsed, number: int, answer: str) -> bool:
@@ -4619,6 +4715,27 @@ _TASK_NOTIFICATION_RE = re.compile(
     r"<tool-use-id>([^<]+)</tool-use-id>.*?<status>([^<]+)</status>(?:.*?<summary>([^<]*)</summary>)?",
     re.DOTALL,
 )
+
+
+def mark_progress_notifications(progress_items: dict[str, Any], text_blob: str, now: float) -> None:
+    """task-notification 블록의 <tool-use-id> 와 id 가 같은 진행 항목만 done 으로 바꾼다(T-260807-032).
+    observe_progress_signals 가 리스트 content(text 블록)와 문자열 content 양쪽에서 부른다 — 완료 통지가
+    어느 모양으로 오든 같은 판정을 쓰기 위해서다(T-261024-055). 다른 id 의 항목은 건드리지 않는다."""
+    if not text_blob:
+        return
+    for match in _TASK_NOTIFICATION_RE.finditer(text_blob):
+        tool_use_id = match.group(1).strip()
+        status = match.group(2).strip()
+        summary = (match.group(3) or "").strip()
+        pitem = progress_items.get(tool_use_id)
+        if pitem is None or pitem.done:
+            continue
+        pitem.done = True
+        pitem.done_at = now
+        # T-260812-002: 완료 요약도 growing-edit 카드에 섞여드는 자유텍스트라 병합 전에
+        # 걸러야 한다(label 과 동일 이유).
+        gated_summary = korean_gate_filter_fragment(summary)
+        pitem.last_activity = flow_cap_text(gated_summary, 70) if gated_summary else status
 
 
 # T-261011-023: 백그라운드 작업의 끝을 알리는 완료 알림 → [(tool_use_id, 저장할 상태)].
@@ -6028,8 +6145,16 @@ class TelegramClient:
             )
         )
         question_card = (
-            method == "sendMessage" and own_chat and isinstance(_question_card, dict)
+            own_chat and isinstance(_question_card, dict)
             and params.get("text") == self.with_emoji_prefix(ask_question_card_text(_question_card, translate=self.tr))
+            and (method == "sendMessage" or (
+                # T-261025-028: 여러 개 고르기 토글 = 같은 카드 고쳐 쓰기. 버튼까지 다시 만들어 대조한다.
+                method == "editMessageText" and bool(_question_card.get("multi"))
+                and type(params.get("message_id")) is int and params["message_id"] > 0
+                and params.get("reply_markup") == json.dumps(
+                    {"inline_keyboard": choice_keyboard(_question_card, translate=self.tr)}, ensure_ascii=False,
+                )
+            ))
         )
         if not (card_completion or user_reply or native_final_reply or user_flow_update or permission_card or workspace_trust_card or handoff_card or choice_card or question_card) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
             # 버림을 브릿지 로그에도 남긴다 — 종전엔 원장에만 남아 로그는 호출부의 「sent」만 보였다.
@@ -7481,6 +7606,51 @@ class TmuxClaudeTransport:
                 return "unconfirmed"
             self.tmux("send-keys", "-t", target, "Enter")
             return "sent"
+
+    def toggle_question_option_if_matches(self, card, signature: str, number: int, *, parser):
+        """여러 개 고르기 보기 하나의 체크를 켜고 끈다 (T-261025-028). (결과, 다시 읽은 화면)을 돌려준다.
+
+        실측 계약(Claude Code v2.1.310, 2026-10-25 작업 노드 격리 세션): 숫자 1자 = 그 보기 체크 켜기/끄기.
+        커서는 그대로다. 커서가 직접 입력 줄에 있으면 숫자가 글자로 들어가므로 보내지 않는다.
+        """
+        if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
+            return "invalid", None
+        with self.composer_lock():
+            before = parser(self.capture_pane(80))
+            buttons = askq_multi_buttons(before, card, signature)
+            if number not in buttons or before["selected"] not in buttons:
+                return "changed", None
+            expected = set(before["checked"]) ^ {number}
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), str(number))
+            for _ in range(10):
+                time.sleep(0.1)
+                after = parser(self.capture_pane(80))
+                if after and not askq_multi_buttons(after, card, signature):
+                    return "changed", None
+                if after and set(after["checked"]) == expected:
+                    return "sent", after
+            return "unconfirmed", None
+
+    def advance_question_if_matches(self, card, signature: str, *, parser) -> str:
+        """「다 골랐어요」 = → 키 1개로 다음 칸(다음 질문 또는 제출 확인 화면)으로 넘긴다 (T-261025-028).
+
+        실측 계약(v2.1.310): 여러 개 고르기 화면의 → = 다음 칸. 질문이 하나면 「Review your answers」
+        화면이 뜨고, 그 화면은 종전 질문 카드 경로로 새 카드가 된다(제출·취소는 그 카드에서).
+        """
+        with self.composer_lock():
+            before = parser(self.capture_pane(80))
+            buttons = askq_multi_buttons(before, card, signature)
+            if not buttons or before["selected"] not in buttons:
+                return "changed"
+            if not before["checked"]:
+                return "empty"
+            self.tmux("send-keys", "-t", self.resolve_pane_target(), "Right")
+            for _ in range(10):
+                time.sleep(0.1)
+                after = parser(self.capture_pane(80))
+                if after and not askq_multi_buttons(after, card, signature):
+                    return "sent"
+            return "unconfirmed"
 
     def send_approval_choice_if_matches(self, signature: str, number: int, expires_at: float | None) -> str:
         """Recheck the approval under the same lock as its key writes."""
@@ -9299,6 +9469,7 @@ class Bridge:
     question_tool = None
     question_receipts = ()
     askq_done_tool_ids = frozenset()
+    askq_settle_checked_at = float("-inf")
 
     def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeReplTransport, token: str) -> None:
         self.config = config
@@ -9350,6 +9521,8 @@ class Bridge:
         self.question_receipts: list[dict[str, Any]] = []
         # T-261010-024: 답이 끝난 사이드카 질문 ID — 잔재 사이드카가 다시 열리지 않게 한다.
         self.askq_done_tool_ids: frozenset[str] = frozenset()
+        # T-261024-023: 결과를 놓친 열린 질문의 기록 재확인 시각(15초 간격).
+        self.askq_settle_checked_at = float("-inf")
         self.approval_cards: list[dict[str, Any]] = []
         self.completed_reply: dict[str, Any] | None = None
         self.background_flows: dict[str, dict[str, Any]] = {}
@@ -11651,6 +11824,11 @@ class Bridge:
                     return "hook_blocked"
             return "idle"
         self.release_stale_active_turn_if_idle()
+        # T-261024-023: 기록상 열린 질문이 화면 판독보다 먼저다. 화면 글자는 흔들린다 —
+        # 제어 노드 2026-10-24 12:28·12:31 KST, 열린 질문 창이 generating·idle 로 읽혀 사용자 글이
+        # 두 번 붙여 넣어졌고, 그 Enter 가 기본 1번 「승인」을 제출해 아버님께 발신이 나갔다.
+        if self.native_question_open():
+            return "approval_wait"
         # T-261010-024: 질문 창은 진행 중 턴 안에서 뜨고 그동안 transcript 는 조용하다.
         # active_turn·transcript 신선도보다 먼저 봐야 busy-inject/idle 주입의 Enter 가
         # 질문 창에 떨어져 커서가 놓인 선택지를 대신 제출하지 않는다(재현 실측).
@@ -11728,6 +11906,8 @@ class Bridge:
             except OSError:
                 return bool(missing_transcript_busy)
 
+        if self.native_question_open():  # T-261024-023: busy_state 와 같은 순서
+            return True
         binding = self.session_binding
         if binding:
             try:
@@ -13462,6 +13642,8 @@ class Bridge:
         message_id = (callback.get("message") or {}).get("message_id")
         if type(message_id) is not int or message_id <= 0:
             toast = self.tr('버튼의 원래 메시지를 확인하지 못했어요')
+        elif len(parts) == 3 and parts[2] == QUESTION_MULTI_DONE and not computer_use:
+            toast = self.apply_question_multi_done(parts[1], message_id)
         elif len(parts) != 3 or not parts[2].isdigit():
             toast = self.tr('버튼 값을 못 읽었어요')
         else:
@@ -13528,6 +13710,8 @@ class Bridge:
             return self.tr('답변 결과를 확인 중이에요')
         if not choice_buttons_allowed(parsed["kind"]):
             return self.tr('이 화면은 폰에서 고르지 않도록 설정돼 있어요')
+        if parsed.get("multi"):
+            return self.apply_question_multi_toggle(card, signature, number)
         send = getattr(self.repl, "send_choice_key", None)
         if not callable(send):
             return self.tr('이 노드에서는 화면 선택을 못 보내요')
@@ -13541,6 +13725,75 @@ class Bridge:
             card["submitted"] = True
             self.persist_state()
         return self.tr('{v0}번을 골랐어요', v0=number)
+
+    def apply_question_multi_toggle(self, card, signature: str, number: int) -> str:
+        """여러 개 고르기 보기 탭 = 체크 켜기/끄기 (T-261025-028). 다시 읽은 화면으로 같은 카드를 고친다."""
+        if not card or not card.get("multi"):
+            return self.tr('이전 질문의 버튼입니다. 최신 질문을 확인해주세요.')
+        toggle = getattr(self.repl, "toggle_question_option_if_matches", None)
+        if not callable(toggle):
+            return self.tr('이 노드에서는 화면 선택을 못 보내요')
+        try:
+            status, after = toggle(card, signature, number, parser=lambda screen: self.parse_question_screen(
+                screen, expected_native=card))
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"multi toggle failed: {type(exc).__name__}")
+            return self.tr('터미널에 못 보냈어요')
+        log("CHOICE", f"multi toggle number={number} result={status} sig={signature}")
+        if status != "sent" or not after:
+            return self.tr(QUESTION_MULTI_NOTICES.get(status, '화면에서 바뀐 것을 확인하지 못했어요'))
+        self.edit_question_multi_card(card, after)
+        if number in after["checked"]:
+            return self.tr('{v0}번을 체크했어요', v0=number)
+        return self.tr('{v0}번 체크를 풀었어요', v0=number)
+
+    def apply_question_multi_done(self, signature: str, message_id: int) -> str:
+        """「다 골랐어요」 = 다음 칸으로 넘긴다 (T-261025-028). 제출은 다음에 뜨는 확인 카드에서 한다."""
+        card = self.question_card
+        if not repl_supports_pane_features(self.repl):
+            return self.tr('이 노드에서는 화면 선택을 못 보내요')
+        if not card or card.get("message_id") != message_id:
+            return self.tr('이전 질문의 버튼입니다. 최신 질문을 확인해주세요.')
+        if not card.get("multi"):
+            return self.tr('버튼 값을 못 읽었어요')
+        if not choice_buttons_allowed("question"):
+            return self.tr('이 화면은 폰에서 고르지 않도록 설정돼 있어요')
+        advance = getattr(self.repl, "advance_question_if_matches", None)
+        if not callable(advance):
+            return self.tr('이 노드에서는 화면 선택을 못 보내요')
+        try:
+            status = advance(card, signature, parser=lambda screen: self.parse_question_screen(
+                screen, expected_native=card))
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"multi done failed: {type(exc).__name__}")
+            return self.tr('터미널에 못 보냈어요')
+        log("CHOICE", f"multi done result={status} sig={signature}")
+        if status == "sent":
+            return self.tr('다음 화면으로 넘겼어요')
+        return self.tr(QUESTION_MULTI_NOTICES.get(status, '화면에서 바뀐 것을 확인하지 못했어요'))
+
+    def edit_question_multi_card(self, card, parsed) -> None:
+        """토글 뒤 다시 읽은 체크 상태로 같은 카드의 본문·버튼을 고친다 (T-261025-028)."""
+        card_parsed = dict(parsed, title=card.get("title") or parsed["title"])
+        try:
+            response = self.telegram.call(
+                "editMessageText", chat_id=self.config.chat_id, message_id=card["message_id"],
+                text=getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
+                    ask_question_card_text(card_parsed, translate=self.tr)
+                ),
+                reply_markup=json.dumps(
+                    {"inline_keyboard": choice_keyboard(card_parsed, translate=self.tr)}, ensure_ascii=False
+                ),
+                _request_timeout=10, _attempts=1, _wait_on_flood=False,
+                _question_card=card_parsed,
+            )
+            result = response.get("result") if isinstance(response, dict) else None
+            if (not isinstance(result, dict) or response.get("ok") is not True
+                    or result.get("message_id") != card["message_id"]):
+                raise RuntimeError("multi question card edit was not confirmed")
+        except Exception as exc:  # noqa: BLE001
+            # 터미널 체크는 이미 다시 읽어 확인했다. 카드 글은 다음 탭에서 다시 그린다.
+            log("CHOICE", f"multi question card edit failed: {type(exc).__name__}")
 
     def question_card_capability(self) -> dict[str, Any]:
         """Advertise readiness only after both inbound polling and pane capture work."""
@@ -13667,6 +13920,38 @@ class Bridge:
             ):
                 self.observe_question_record(record)
 
+    def native_question_open(self) -> bool:
+        """T-261024-023: 기록(훅 사이드카·transcript)상 결과 없이 열린 AskUserQuestion."""
+        tool = self.question_tool
+        binding = getattr(self, "session_binding", None)
+        return bool(
+            isinstance(tool, dict) and tool.get("tool_id") and not tool.get("completed")
+            and binding is not None and tool.get("session_id") == binding.session_id
+        )
+
+    def settle_open_question_from_transcript(self) -> None:
+        """T-261024-023: 결과를 놓친 질문이 주입을 영영 막지 않게, 기록의 증거로만 닫는다.
+
+        transcript 스레드에서만 부른다(질문 상태를 바꾸는 쪽은 그 스레드 하나 — T-261010-024).
+        """
+        if not self.native_question_open():
+            return
+        now = time.monotonic()
+        if now - self.askq_settle_checked_at < ASKQ_SETTLE_SCAN_SECONDS:
+            return
+        self.askq_settle_checked_at = now
+        tool, binding = self.question_tool, self.session_binding
+        settled, result_record = askq_settled_in_transcript(binding.transcript_path, tool["tool_id"])
+        if not settled:
+            return
+        if result_record is not None:
+            self.observe_question_record(result_record)  # 정상 길 그대로 — 카드 완료 표시까지
+        if not tool.get("completed"):
+            tool["completed"] = True
+            self.retire_askq_sidecar(tool["tool_id"], binding.session_id)
+            self.persist_state()
+        log("CHOICE", f"open question settled from transcript tool=…{str(tool['tool_id'])[-6:]}")
+
     def bind_question_tool_from_sidecar(self) -> None:
         """T-261010-024: 훅이 남긴 열린 질문 원본을 transcript 기록과 같은 길로 결합한다."""
         binding = getattr(self, "session_binding", None)
@@ -13735,7 +14020,9 @@ class Bridge:
                 if not card.get("tool_id") or card["tool_id"] != block.get("tool_use_id") or card.get("session_id") != binding.session_id:
                     continue
                 answer = answers.get(card["title"]) if isinstance(answers, dict) else None
-                if not block.get("is_error") and isinstance(answer, str) and answer.strip():
+                if card.get("review") and not block.get("is_error") and isinstance(answers, dict) and answers:
+                    card["completion"] = "✅ " + self.tr('제출했어요')
+                elif not block.get("is_error") and isinstance(answer, str) and answer.strip():
                     card["completion"] = "✅ " + self.tr('선택: {answer}', answer=answer[:2000])
                 else:
                     card["completion"] = self.tr('그 선택창이 이미 닫혔어요')
@@ -13804,6 +14091,7 @@ class Bridge:
             return
         self.question_checked_at = now
         self.recover_late_question_cards()
+        self.settle_open_question_from_transcript()
         self.refresh_question_cards()
         try:
             screen = self.repl.capture_pane(80)
@@ -13864,6 +14152,8 @@ class Bridge:
         if (recent and re.sub(r"^[^\w가-힣]+", "", str(card_parsed.get("header") or "")).strip() == "승인"
                 and time.monotonic() - recent[0] <= QUESTION_CARD_PREVIEW_SECONDS):
             card_parsed["preview"] = list(recent[1])
+            if len(recent) > 2:
+                card_parsed["preview_label"] = recent[2]
             self.recent_progress_copy = None
         params: dict[str, Any] = {
             "chat_id": self.config.chat_id,
@@ -13871,9 +14161,9 @@ class Bridge:
                 ask_question_card_text(card_parsed, translate=self.tr)
             ),
         }
-        if not parsed["multi"] and choice_buttons_allowed(parsed["kind"]):
+        if choice_buttons_allowed(parsed["kind"]):
             params["reply_markup"] = json.dumps(
-                {"inline_keyboard": choice_keyboard(parsed)}, ensure_ascii=False
+                {"inline_keyboard": choice_keyboard(parsed, translate=self.tr)}, ensure_ascii=False
             )
         # T-261014-008: 질문 카드는 운영필터 본문 검사에서 면제한다(TelegramClient 가 본문을 다시
         # 만들어 대조). 필터의 가짜 성공(ok:true, message_id 0)은 전달이 아니다.
@@ -13903,6 +14193,7 @@ class Bridge:
             "episode": episode,
             "signature": parsed["signature"],
             "freeform": parsed["freeform"],
+            "multi": parsed["multi"],
             "title": parsed["title"],
             "option_labels": [label for _, label in parsed["options"]],
             "message_id": (response.get("result") or {}).get("message_id"),
@@ -13920,6 +14211,9 @@ class Bridge:
             if question_title_matches(title, parsed["title"]):
                 self.question_card.update(title=title, tool_id=tool.get("tool_id"))
                 break
+        if parsed.get("review") and tool.get("tool_id") and not self.question_card.get("tool_id"):
+            # T-261025-028: 제출 확인 화면에는 질문 원문 제목이 없다. 열린 질문 도구에 묶어 결과가 오면 닫는다.
+            self.question_card.update(tool_id=tool["tool_id"], review=True)
         if isinstance(self.question_card["message_id"], int):
             self.question_receipts = [*self.question_receipts, self.question_card]
             self.persist_state()
@@ -17921,6 +18215,10 @@ class Bridge:
         if bubbles:
             # T-261024-014: 바로 뒤 승인 카드가 「위 문안」을 가리키면 카드에 같은 원문을 다시 싣는다.
             self.recent_progress_copy = (time.monotonic(), list(bubbles))
+        elif progress_text_truncated(raw_text, text):
+            # T-261024-021: 펜스 없는 스크립트도 진행 글은 두 문장으로 잘린다(제어 노드 2026-10-24 12:26
+            #   베리 재발신 승인 카드 — 894자 스크립트가 폰에 두 문장만 왔다). 잘린 산문은 전문을 카드에 싣는다.
+            self.recent_progress_copy = (time.monotonic(), [raw_text], "앞 글 전문:")
 
     def process_record(self, record: dict[str, Any]) -> None:
         binding = self.session_binding
@@ -19170,10 +19468,16 @@ class Bridge:
             return
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
         content = message.get("content")
+        now = time.time()
+        if isinstance(content, str):
+            # T-261024-055: 완료 통지(task-notification)는 message.content 가 리스트가 아니라 **문자열**인
+            # type=user 레코드로 온다(10/24 작업 노드·제어 노드 transcript 실측 — observe_background_typing 의
+            # 문자열 분기와 같은 모양). 리스트만 보면 끝난 에이전트가 카드에 「위임 · 경과」로 영원히 남는다.
+            mark_progress_notifications(self.progress_items, content, now)
+            return
         if not isinstance(content, list):
             return
         role = message.get("role")
-        now = time.time()
         if role == "assistant":
             for item in content:
                 if not (isinstance(item, dict) and item.get("type") == "tool_use"):
@@ -19220,21 +19524,7 @@ class Bridge:
                 match = _BG_OUTPUT_PATH_RE.search(text or "")
                 if match:
                     pitem.output_path = match.group(1).rstrip(".,;)")
-        text_blob = content_text(content)
-        if text_blob:
-            for match in _TASK_NOTIFICATION_RE.finditer(text_blob):
-                tool_use_id = match.group(1).strip()
-                status = match.group(2).strip()
-                summary = (match.group(3) or "").strip()
-                pitem = self.progress_items.get(tool_use_id)
-                if pitem is None or pitem.done:
-                    continue
-                pitem.done = True
-                pitem.done_at = now
-                # T-260812-002: 완료 요약도 growing-edit 카드에 섞여드는 자유텍스트라 병합 전에
-                # 걸러야 한다(위 label 과 동일 이유).
-                gated_summary = korean_gate_filter_fragment(summary)
-                pitem.last_activity = flow_cap_text(gated_summary, 70) if gated_summary else status
+        mark_progress_notifications(self.progress_items, content_text(content), now)
 
     def refresh_bg_progress_from_output(self) -> None:
         """실행중 bg 항목의 output_path 를 tail 해 진행 신호를 갱신한다. 디스크 I/O 라
