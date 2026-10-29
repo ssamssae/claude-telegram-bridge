@@ -2391,6 +2391,16 @@ def sanitize_text(text: str, limit: int = 12000) -> str:
     return text
 
 
+REPEATED_VARIATION_SELECTOR_RE = re.compile(r"([︎️])\1+")
+
+
+def collapse_repeated_variation_selectors(text: str) -> str:
+    # 터미널 붙여넣기는 겹친 변형 선택자(⏳ U+FE0F U+FE0F)를 1개로 접는다. 붙여넣을 글을 미리
+    # 접어 사이드카 지문·기록 파일 대조가 받은 글과 같은 글을 보게 한다(2026-10-29 작업 노드
+    # 「다해썽?⏳️」 미전달·재주입 3회, T-261029-022).
+    return REPEATED_VARIATION_SELECTOR_RE.sub(r"\1", text)
+
+
 def strip_ansi_control(text: str) -> str:
     return ANSI_ESCAPE_RE.sub("", text or "")
 
@@ -3995,6 +4005,12 @@ ASKQ_REVIEW_TITLE = "Ready to submit your answers?"
 ASKQ_TEXT_MAX = 500
 ASKQ_CLIPPED_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*Esc to cancel$")
 ASKQ_FULL_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*(?:ctrl\+g to edit in Vim\s*·\s*)?Esc to cancel$")
+# T-261027-007: 보기에 preview 가 있으면 터미널이 오른쪽에 본문 상자를 그리고 끝줄에 「n to add notes」를 더한다.
+ASKQ_PREVIEW_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*n to add notes\s*·\s*Esc to cancel$")
+ASKQ_PREVIEW_BOX_RE = re.compile(r"\s{2,}┌─+")
+ASKQ_PREVIEW_SELECTED_RE = re.compile(r"^\s*❯\s*([1-9])\.")
+# preview 상자 화면의 대화 줄은 번호가 없다(v2.1.311 제어 노드 격리 세션 실측, T-261027-007).
+ASKQ_PREVIEW_CHAT_ROW_RE = re.compile(r"(?i)^\s*(?:❯\s+)?chat about this\s*$")
 ASKQ_CLIPPED_MIN_SUFFIX = 32
 ASKQ_ELLIPSIS = "…"
 ASKQ_RAIL_RE = re.compile(r"^\s*│")
@@ -4113,10 +4129,13 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
                or not option["label"].strip() for option in native_options)
     ):
         return None
+    count = len(native_options)
     rows = []
     first_option = None
     selected_count = 0
     separator = False
+    # T-261026-032: 보이는 보기마다 그 아래 설명 줄을 모은다 — 위가 잘린 화면은 이 설명이 원본과 같은지로 확인한다.
+    shown_descriptions: dict[int, list[str]] = {}
     for idx, raw in enumerate(lines[:hint_idx]):
         matched = CHOICE_OPTION_RE.match(raw)
         if matched:
@@ -4124,53 +4143,97 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
             rows.append((int(matched.group(2)), askq_label_key(matched.group(3))))
             selected_count += bool(matched.group(1))
         elif first_option is not None and raw.strip():
-            if CHOICE_RULE_RE.match(raw) and len(rows) == len(native_options) + 1 and not separator:
+            if CHOICE_RULE_RE.match(raw) and rows[-1][0] == count + 1 and not separator:
                 separator = True
-            elif not (len(rows) <= len(native_options) and raw.startswith("     ")):
+            elif rows[-1][0] <= count and raw.startswith("     "):
+                shown_descriptions.setdefault(rows[-1][0], []).append(raw)
+            else:
                 return None
     expected = [askq_label_key(option["label"]) for option in native_options]
     freeform_label = "Type something."
-    if len(rows) == len(native_options) + 2:
+    if len(rows) >= 2 and rows[-1][0] == count + 2:
         freeform_label = rows[-2][1]
         if not freeform_label or ASKQ_MULTI_MARK_RE.match(freeform_label):
             return None
     expected.extend([freeform_label, "Chat about this"])
+    # T-261026-032: 보기 설명이 길면 fullscreen 55x23 은 머리표·질문에 앞 보기 줄까지 화면 위로 민다
+    #   (작업 노드 2.1.310 실측 10/26 22:22 — 2번 보기부터 보임). 숫자 키는 안 보이는 보기도 바로 고른다
+    #   (같은 날 격리 세션 「1」 → 1번 답). 보이는 줄이 원본 보기 줄들의 끝부분과 같을 때만 받는다.
+    first_number = rows[0][0] if rows else 0
     if (
-        not separator or selected_count != 1 or first_option is None
-        or rows != list(enumerate(expected, start=1))
+        not separator or first_option is None or not 1 <= first_number <= count + 1
+        or (full_header and first_number != 1)
+        or rows != list(enumerate(expected, start=1))[first_number - 1:]
+        or selected_count > 1 or (first_number == 1 and selected_count != 1)
     ):
         return None
-    # The left quote rail is painted by Claude, not part of the native title.
-    # Ignore whitespace during comparison because tmux can wrap inside a word.
+    native_descriptions = [askq_text_key(option["description"] if isinstance(option.get("description"), str) else "")
+                           for option in native_options]
+    visible_numbers = [number for number, _ in rows if number <= count]
+    descriptions_match = all(
+        askq_text_key("".join(shown_descriptions.get(number, []))) == native_descriptions[number - 1]
+        for number in visible_numbers)
+    verified = sum(len(native_descriptions[number - 1]) for number in visible_numbers)
     body = lines[:first_option]
-    if not full_header:
-        # T-261010-024: alt-screen 창도 TUI 시작 전 출력이 tmux 기록에 남아 캡처(-S -80) 위쪽에
-        # 붙는다(제어 노드 history_size=20 실측). 잘린 질문 본문은 선택지 바로 위에 이어진 인용 레일 줄뿐이다.
-        end = len(body)
-        while end and not body[end - 1].strip():
-            end -= 1
-        start = end
-        while start and ASKQ_RAIL_RE.match(body[start - 1]):
+    if first_number > 1:
+        # 화면 맨 위는 안 보이는 바로 앞 보기 설명의 끝부분이다. 그 위의 tmux 기록은 보지 않는다.
+        #   설명 줄이 하나도 안 보이면(화면이 보기 줄에서 시작) 어디서 잘렸는지 몰라 받지 않는다.
+        start = len(body)
+        while start and body[start - 1].startswith("     ") and body[start - 1].strip():
             start -= 1
-        if start < end:
-            body = body[start:end]
-    visible = "".join(re.sub(r"^\s*│\s?", "", line) for line in body)
-    suffix = askq_text_key(visible)
-    native_title = askq_text_key(title)
-    # T-261018-027: fullscreen caps a long question body and ends the shown window with
-    # "…" (2.1.302, vulcan 55x23 실측), so the visible text is a middle slice, not a suffix.
-    # Accept that slice only when the single "…" is the cut mark at its end.
-    elided = (not full_header and suffix.endswith(ASKQ_ELLIPSIS) and suffix.count(ASKQ_ELLIPSIS) == 1
-              and not native_title.endswith(suffix))
-    shown = suffix[:-len(ASKQ_ELLIPSIS)] if elided else suffix
-    if ((full_header and suffix != native_title)
-            or (not full_header and (len(shown) < ASKQ_CLIPPED_MIN_SUFFIX
-                                     or not (shown in native_title if elided else native_title.endswith(shown))))):
-        return None
-    restored = "☐ " + header.strip() + "\n" + " ".join(title.split()) + "\n" + "\n".join(lines[first_option:])
+        tail = askq_text_key("".join(body[start:]))
+        if (not tail or not descriptions_match or not native_descriptions[first_number - 2].endswith(tail)
+                or len(tail) + verified < ASKQ_CLIPPED_MIN_SUFFIX):
+            return None
+    else:
+        # The left quote rail is painted by Claude, not part of the native title.
+        # Ignore whitespace during comparison because tmux can wrap inside a word.
+        rail = False
+        if not full_header:
+            # T-261010-024: alt-screen 창도 TUI 시작 전 출력이 tmux 기록에 남아 캡처(-S -80) 위쪽에
+            # 붙는다(제어 노드 history_size=20 실측). 잘린 질문 본문은 선택지 바로 위에 이어진 인용 레일 줄뿐이다.
+            end = len(body)
+            while end and not body[end - 1].strip():
+                end -= 1
+            start = end
+            while start and ASKQ_RAIL_RE.match(body[start - 1]):
+                start -= 1
+            if start < end:
+                body = body[start:end]
+                rail = True
+        visible = "".join(re.sub(r"^\s*│\s?", "", line) for line in body)
+        suffix = askq_text_key(visible)
+        native_title = askq_text_key(title)
+        # T-261018-027: fullscreen caps a long question body and ends the shown window with
+        # "…" (2.1.302, vulcan 55x23 실측), so the visible text is a middle slice, not a suffix.
+        # Accept that slice only when the single "…" is the cut mark at its end.
+        elided = (not full_header and suffix.endswith(ASKQ_ELLIPSIS) and suffix.count(ASKQ_ELLIPSIS) == 1
+                  and not native_title.endswith(suffix))
+        shown = suffix[:-len(ASKQ_ELLIPSIS)] if elided else suffix
+        fragment = shown in native_title if elided else native_title.endswith(shown)
+        if full_header:
+            if suffix != native_title:
+                return None
+        elif len(shown) < ASKQ_CLIPPED_MIN_SUFFIX or not fragment:
+            # T-261026-032: 질문이 한 줄만 남으면(10/26 22:28 「해요. 어떻게 할까요?」) 제목만으로는 같은 질문인지
+            #   모른다. 레일 줄 조각이 원본에 있고, 보이는 보기 설명이 원본과 모두 같고, 합쳐 충분히 길 때만 받는다.
+            if not (rail and fragment and descriptions_match and len(shown) + verified >= ASKQ_CLIPPED_MIN_SUFFIX):
+                return None
+    # 화면 위로 밀린 보기 줄은 원본으로 채운다. 커서가 거기 있으면 1번에 임시로 두고, 파싱 뒤 0(안 보임)으로 돌린다.
+    hidden = []
+    for number in range(1, first_number):
+        option = native_options[number - 1]
+        hidden.append(f"  {number}. " + " ".join(option["label"].split()))
+        if native_descriptions[number - 1]:
+            hidden.append("     " + " ".join(option["description"].split()))
+    if hidden and not selected_count:
+        hidden[0] = "❯" + hidden[0][1:]
+    restored = "☐ " + header.strip() + "\n" + " ".join(title.split()) + "\n" + "\n".join(hidden + lines[first_option:])
     parsed = parse_ask_question(restored)
     if not parsed:
         return None
+    if hidden and not selected_count:
+        parsed["selected"] = 0
     parsed.update(
         title=title, recovered=True, native_tool_id=question_tool["tool_id"], native_session_id=session_id,
         freeform=len(native_options) + 1,
@@ -4212,6 +4275,87 @@ def fold_ask_question_freeform(lines):
     return None
 
 
+def parse_preview_ask_question(body, header: str, question_tool, session_id):
+    """T-261027-007: preview 상자가 있는 질문 화면은 보기 줄이 상자와 섞여 깨진다(macOS 노드 10/27 11:42 실측).
+    묶인 native 질문 원본으로만 읽는다 — 상자와 ❯ 줄이 화면에 보이고 원본에 preview 가 있을 때만."""
+    if (
+        not isinstance(question_tool, dict) or not session_id
+        or question_tool.get("session_id") != session_id or question_tool.get("completed")
+        or not isinstance(question_tool.get("tool_id"), str) or not question_tool["tool_id"]
+    ):
+        return None
+    questions = question_tool.get("questions")
+    if not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict):
+        return None
+    question = questions[0]
+    title, native_options = question.get("question"), question.get("options")
+    if (
+        question.get("multiSelect", False) is not False
+        or not isinstance(title, str) or not title.strip()
+        or not isinstance(native_options, list) or not 2 <= len(native_options) <= CHOICE_MAX_OPTIONS - 2
+        or any(not isinstance(option, dict) or not isinstance(option.get("label"), str)
+               or not option["label"].strip() for option in native_options)
+        or not native_option_previews(question)
+        or not any(ASKQ_PREVIEW_BOX_RE.search(raw) for raw in body)
+    ):
+        return None
+    marks = [int(m.group(1)) for m in (ASKQ_PREVIEW_SELECTED_RE.match(raw) for raw in body) if m]
+    if len(marks) != 1 or not 1 <= marks[0] <= len(native_options):
+        return None
+    labels = [option["label"].strip() for option in native_options]
+    descriptions = {
+        number: option["description"].strip() for number, option in enumerate(native_options, start=1)
+        if isinstance(option.get("description"), str) and option["description"].strip()}
+    payload = header + "|" + title.strip() + "|" + "|".join(labels)
+    return {
+        "kind": "question",
+        "header": header,
+        "title": title.strip(),
+        "context": [],
+        "options": list(enumerate(labels, start=1)),
+        "descriptions": descriptions,
+        "freeform": None,
+        "multi": False,
+        "checked": [],
+        "review": False,
+        "selected": marks[0],
+        "preview_layout": True,
+        "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
+    }
+
+
+def parse_clipped_preview_ask_question(lines, hint_idx: int, question_tool, session_id):
+    """T-261027-013: 작은 창(55x23)에서 질문 글이 길면 preview 화면의 머리표 줄이 화면 위로 밀린다
+    (macOS 노드 10/27 18:00 카드 ⑤ — 질문 7줄, 카드 대신 「화면 확인 필요」만 갔다). 머리표 대신 보기 바로 위
+    인용 레일 줄이 묶인 native 질문의 끝부분과 같을 때만 같은 질문으로 본다. v2.1.310 격리 세션 실측:
+    긴 질문은 앞부분만 잘리고 「…」로 줄이지 않는다."""
+    questions = question_tool.get("questions") if isinstance(question_tool, dict) else None
+    if (
+        hint_idx != len(lines) - 1
+        or not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict)
+    ):
+        return None
+    header, title = questions[0].get("header"), questions[0].get("question")
+    if not isinstance(header, str) or not header.strip() or "\n" in header or not isinstance(title, str):
+        return None
+    first_option = next((idx for idx in range(hint_idx) if CHOICE_OPTION_RE.match(lines[idx])), None)
+    if first_option is None:
+        return None
+    # 보기 바로 위에 이어진 레일 줄만 질문 글이다. 그 위는 TUI 시작 전 tmux 기록일 수 있다(T-261010-024).
+    end = first_option
+    while end and not lines[end - 1].strip():
+        end -= 1
+    start = end
+    while start and ASKQ_RAIL_RE.match(lines[start - 1]):
+        start -= 1
+    visible = askq_text_key("".join(re.sub(r"^\s*│\s?", "", line) for line in lines[start:end]))
+    native_title = askq_text_key(title)
+    if not visible or not native_title.endswith(visible) or (
+            visible != native_title and len(visible) < ASKQ_CLIPPED_MIN_SUFFIX):
+        return None
+    return parse_preview_ask_question(lines[first_option:hint_idx], "☐ " + header.strip(), question_tool, session_id)
+
+
 def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
     """AskUserQuestion 화면을 구조로 읽는다. 못 읽으면 조용히 None (오탐 버튼 < 폴백)."""
     text = strip_ansi_control(screen or "")
@@ -4225,7 +4369,7 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
     for count in (2, 3):
         if len(lines) >= count:
             footer = " ".join(line.strip() for line in lines[-count:])
-            if ASKQ_FULL_HINT_RE.fullmatch(footer):
+            if ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer):
                 lines[-count:] = [footer]
                 break
     wrapped = fold_ask_question_freeform(lines)
@@ -4257,6 +4401,8 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
             tab_idx = idx
             break
     if tab_idx < 0:
+        if review_idx < 0 and ASKQ_PREVIEW_HINT_RE.fullmatch(lines[hint_idx].strip()):
+            return parse_clipped_preview_ask_question(lines, hint_idx, question_tool, session_id)
         return parse_clipped_ask_question(lines, hint_idx, question_tool, session_id) if review_idx < 0 else None
     header = " ".join(lines[tab_idx].split())
     # Use the same native identity when a resize brings the header back. This
@@ -4266,6 +4412,8 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
         native_question = native_questions[0]
         native_header = native_question.get("header") if isinstance(native_question, dict) else None
         if isinstance(native_header, str) and header in {"☐ " + native_header.strip(), "☒ " + native_header.strip()}:
+            if ASKQ_PREVIEW_HINT_RE.fullmatch(lines[hint_idx].strip()):
+                return parse_preview_ask_question(lines[tab_idx + 1:hint_idx], header, question_tool, session_id)
             recovered = parse_clipped_ask_question(
                 lines[tab_idx + 1:], hint_idx - tab_idx - 1, question_tool, session_id, full_header=True)
             if recovered:
@@ -4348,6 +4496,10 @@ def question_title_matches(native: str, visible: str) -> bool:
 
 QUESTION_CARD_PREVIEW_SECONDS = 600.0
 QUESTION_CARD_PREVIEW_MAX_CHARS = 2500
+# T-261027-008: 카드 한 장에 다 못 싣는데 폰에도 안 간 원문은 카드 바로 앞에 이 크기로 나눠 보낸다.
+QUESTION_CARD_PART_BUDGET = 3500
+# T-261027-008: 폰에 안 간 글은 직전 이 개수까지 이어 둔다 — 「원문 → 저장 도구 → 한 줄 → 카드」도 원문이 남는다.
+QUESTION_CARD_UNRELAYED_KEEP = 3
 
 
 def progress_text_truncated(raw_text: str, progress_text: str) -> bool:
@@ -4357,17 +4509,46 @@ def progress_text_truncated(raw_text: str, progress_text: str) -> bool:
     return bool(progress_text) and len(letters(raw_text)) > len(letters(progress_text)) + 20
 
 
-def question_card_preview_text(bubbles) -> str:
+def question_card_preview_text(bubbles, tail: str | None = None) -> str:
     """승인 카드에 다시 싣는 원문. 카드 한 장(4096자) 안에 들도록 자른다."""
     text = "\n\n".join(str(bubble).strip() for bubble in bubbles if str(bubble).strip())
     if len(text) > QUESTION_CARD_PREVIEW_MAX_CHARS:
-        text = text[:QUESTION_CARD_PREVIEW_MAX_CHARS].rstrip() + "\n…(나머지는 위 칸)"
+        text = text[:QUESTION_CARD_PREVIEW_MAX_CHARS].rstrip() + "\n" + (tail or "…(나머지는 위 칸)")
     return text
+
+
+def question_card_preview_parts(bubbles) -> list[str]:
+    """T-261027-008: 카드에 다 못 싣는 원문의 전문 조각. 카드 한 장에 들면 빈 목록이다."""
+    text = "\n\n".join(str(bubble).strip() for bubble in bubbles if str(bubble).strip())
+    if len(text) <= QUESTION_CARD_PREVIEW_MAX_CHARS:
+        return []
+    return split_by_utf16_budget(text, QUESTION_CARD_PART_BUDGET)
+
+
+def ask_question_card_part_text(parsed, index, translate=lambda text: text) -> str:
+    """카드 바로 앞에 보내는 원문 조각 글. 운영 필터 면제는 이 글을 카드 자료로 다시 만들어 대조한다."""
+    parts = question_card_preview_parts(parsed.get("preview") or [])
+    if type(index) is not int or not 0 <= index < len(parts):
+        return ""
+    label = translate(parsed.get("preview_label") or "보낼 원문:")
+    return f"{label} ({index + 1}/{len(parts)})\n{parts[index]}"
+
+
+def native_option_previews(question) -> list[str]:
+    """질문 보기들의 preview 원문(T-261027-007). 같은 글은 한 번만, 보기 순서대로."""
+    if not isinstance(question, dict):
+        return []
+    previews: list[str] = []
+    for option in question.get("options") or []:
+        text = option.get("preview") if isinstance(option, dict) else None
+        if isinstance(text, str) and text.strip() and text.strip() not in previews:
+            previews.append(text.strip())
+    return previews
 
 
 def ask_question_card_text(parsed, translate=lambda text: text) -> str:
     rows = [f"❓ {parsed['title']}", ""]
-    preview = question_card_preview_text(parsed.get("preview") or [])
+    preview = question_card_preview_text(parsed.get("preview") or [], parsed.get("preview_tail"))
     if preview:
         rows.extend([translate(parsed.get("preview_label") or "보낼 원문:"), preview, ""])
     for num, label in parsed["options"]:
@@ -5569,6 +5750,13 @@ def screen_has_question_wait(screen: str) -> bool:
     hinted = bool(ASKQ_HINT_RE.search(" ".join(line.strip() for line in lines[-3:])))
     if hinted and any(ASKQ_CHAT_ROW_RE.match(line) for line in lines):
         return True
+    # T-261027-007: preview 상자 화면은 대화 줄에 번호가 없다 — 그 화면 고유 힌트(n to add notes)가
+    # 끝줄에 있을 때만 받는다. 놓치면 멈춤 자가복구가 답 대기 중인 턴을 풀어 「버려졌어요」를 보낸다.
+    preview_footer = any(
+        ASKQ_PREVIEW_HINT_RE.fullmatch(" ".join(line.strip() for line in lines[-count:]))
+        for count in (1, 2, 3) if len(lines) >= count)
+    if preview_footer and any(ASKQ_PREVIEW_CHAT_ROW_RE.match(line) for line in lines):
+        return True
     # 「Ready to submit」 검토 화면은 힌트 없이 끝나지만(실측), 힌트가 붙어도 놓치지 않는다(리뷰 #4).
     window = lines[-7:] if hinted else lines[-4:]
     return any(line.strip() == ASKQ_REVIEW_TITLE for line in window)
@@ -6067,6 +6255,7 @@ class TelegramClient:
         _computer_use_card: dict[str, Any] | None = None,
         _workspace_trust_card: dict[str, Any] | None = None,
         _question_card: dict[str, Any] | None = None,
+        _question_card_part: int | None = None,
         _choice_card: dict[str, Any] | None = None,
         **params: Any,
     ) -> dict[str, Any] | None:
@@ -6156,7 +6345,15 @@ class TelegramClient:
                 )
             ))
         )
-        if not (card_completion or user_reply or native_final_reply or user_flow_update or permission_card or workspace_trust_card or handoff_card or choice_card or question_card) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
+        # T-261027-008: 카드에 다 못 싣는 승인 원문은 카드 바로 앞에 조각으로 간다. 조각도 같은 카드 자료로
+        #   다시 만든 글과 같아야만 통과한다 — 다른 글·다른 방·없는 조각 번호는 종전대로 검사한다.
+        part_text = (ask_question_card_part_text(_question_card, _question_card_part, translate=self.tr)
+                     if isinstance(_question_card, dict) and type(_question_card_part) is int else "")
+        question_card_part = (
+            method == "sendMessage" and own_chat and bool(part_text)
+            and params.get("text") == self.with_emoji_prefix(part_text)
+        )
+        if not (card_completion or user_reply or native_final_reply or user_flow_update or permission_card or workspace_trust_card or handoff_card or choice_card or question_card or question_card_part) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
             # 버림을 브릿지 로그에도 남긴다 — 종전엔 원장에만 남아 로그는 호출부의 「sent」만 보였다.
             log("DROP", f"{method} kind={classify_claude_ops_outbound(params.get('text') or '')} "
                         f"buttons={int(reply_markup_has_buttons(params.get('reply_markup')))} own_chat={int(own_chat)}")
@@ -6783,6 +6980,18 @@ def cursor_offset_for_state(state: dict[str, Any] | None, identity: SessionIdent
 #   시간창이 이상해도 전량 재판독(카드 폭주)이 불가능하게. 둘 중 먼저 걸리는 쪽이 이긴다.
 SESSION_ROTATION_LOOKBACK_SECONDS = 120.0
 SESSION_ROTATION_LOOKBACK_MAX_BYTES = 256 * 1024
+
+# T-261029-019: 같은 pane 의 사이드카 후보 둘의 기록 mtime 이 이 창 안으로 비슷하면 마지막
+#   쓰기(mtime)가 아니라 SessionStart 사이드카가 더 최근에 적은 쪽을 고른다.
+#   실사고 2026-10-29 21:52 제어 노드: /clear 로 새 기록(fd2a075f)이 생기고 사이드카가 21:52:01.042
+#   에 적힌 뒤, 클로드가 옛 기록(595daa5f)에 꼬리 줄(atis-latch·cost-state…)을 21:52:01.058 에
+#   써서 옛 기록이 45 ms 더 새것이 됐다. mtime 우선 정렬이 옛 기록을 골라 브릿지가 회전을 못
+#   봤고 90초 뒤 「세션 전환을 확인하지 못했습니다」가 나갔다(작업 노드 동시각 정상 = 4 ms 차로
+#   새 기록이 이긴 우연). pane_open 필터는 /proc 전용이라 맥·리눅스 모두 비어 mtime 만 결정했다.
+#   창 밖(수십 초 이상 차이)은 종전대로 mtime 이 이긴다 — 늦게 적힌 낡은 사이드카가 살아 있는
+#   기록을 가리는 가드(test_sidecar_binding_prefers_recent_transcript_mtime_over_later_sidecar_write)
+#   는 그대로다.
+SIDECAR_ROTATION_MTIME_WINDOW_SEC = 5.0
 
 
 def _record_timestamp_epoch(raw: bytes) -> float | None:
@@ -7564,6 +7773,37 @@ class TmuxClaudeTransport:
             raise ValueError("send_choice_key accepts a single digit")
         with self.composer_lock():
             self.tmux("send-keys", "-t", self.resolve_pane_target(), key)
+
+    def select_preview_question_if_matches(self, signature: str, number: int, *, parser) -> str:
+        """preview 상자가 있는 질문 화면에서 보기 하나를 확정한다 (T-261027-007).
+
+        실측 계약(Claude Code v2.1.311, 2026-10-27 제어 노드 격리 세션): 이 화면에서 숫자 1자는 커서만
+        옮긴다(「2」→ ❯ 가 2번으로·상자가 2번 preview 로). 확정은 Enter 다. 숫자만 보낸 브릿지
+        탭은 18분 동안 답이 안 들어갔다(10/27 12:55 메모요 실기기 확인 카드). 같은 잠금 안에서
+        재판독해 커서가 그 번호에 있을 때만 Enter 를 보낸다.
+        """
+        if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
+            return "invalid"
+        with self.composer_lock():
+            before = parser(self.capture_pane(80))
+            if not before or not before.get("preview_layout") or before["signature"] != signature:
+                return "changed"
+            if number not in {num for num, _ in before["options"]}:
+                return "invalid"
+            target = self.resolve_pane_target()
+            if before["selected"] != number:
+                self.tmux("send-keys", "-t", target, str(number))
+                for _ in range(10):
+                    time.sleep(0.1)
+                    after = parser(self.capture_pane(80))
+                    if not after or not after.get("preview_layout") or after["signature"] != signature:
+                        return "changed"
+                    if after["selected"] == number:
+                        break
+                else:
+                    return "unconfirmed"
+            self.tmux("send-keys", "-t", target, "Enter")
+            return "sent"
 
     def type_question_text(self, text: str) -> None:
         """질문 화면의 직접 입력칸에 글자를 그대로 친다 (T-261004-016). 제출(Enter)은 안 한다.
@@ -8492,8 +8732,24 @@ class SessionBinder:
             scored_matches.append((fresh, transcript_mtime, updated_at, binding))
         scored_matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
         if scored_matches and scored_matches[0][2] > 0:
-            return [scored_matches[0][3]]
+            return [self._prefer_newest_entry_within_rotation_window(scored_matches)[3]]
         return [item[3] for item in scored_matches]
+
+    @staticmethod
+    def _prefer_newest_entry_within_rotation_window(
+        scored_matches: list[tuple[bool, float, float, ClaudeSessionBinding]],
+    ) -> tuple[bool, float, float, ClaudeSessionBinding]:
+        """mtime 1위와 창 안(SIDECAR_ROTATION_MTIME_WINDOW_SEC)인 후보끼리는 사이드카 최신이 이긴다.
+
+        T-261029-019: /clear 회전 순간 옛 기록 꼬리 쓰기가 새 기록보다 수십 ms 늦게 닿아도
+        SessionStart 가 마지막으로 적은 기록(= pane 의 현재 세션)을 고른다. 창 밖은 mtime 순서 그대로.
+        """
+        top = scored_matches[0]
+        near = [
+            item for item in scored_matches
+            if item[0] == top[0] and top[1] - item[1] <= SIDECAR_ROTATION_MTIME_WINDOW_SEC
+        ]
+        return max(near, key=lambda item: (item[2], item[1]))
 
     def _relocated_transcript(self, transcript: Path, session_id: str) -> Path | None:
         """같은 sessionId 기록이 프로젝트 폴더들 가운데 정확히 한 곳에 있을 때만 그 경로."""
@@ -12967,7 +13223,7 @@ class Bridge:
         return not self.config.envelope_sidecar_off_flag_path.exists()
 
     def sidecar_visible_prompt(self, item: QueueItem) -> str:
-        return escape_unsafe_slash(sanitize_text(item.text))
+        return escape_unsafe_slash(sanitize_text(collapse_repeated_variation_selectors(item.text)))
 
     def envelope_sidecar_context(self, item: QueueItem, *, visible_prompt: str, now: float | None = None) -> str:
         now = time.time() if now is None else now
@@ -13712,6 +13968,24 @@ class Bridge:
             return self.tr('이 화면은 폰에서 고르지 않도록 설정돼 있어요')
         if parsed.get("multi"):
             return self.apply_question_multi_toggle(card, signature, number)
+        if parsed.get("preview_layout"):
+            # T-261027-007: preview 상자 화면은 숫자가 커서만 옮긴다 — 숫자+재판독+Enter 를 한 잠금에서.
+            select = getattr(self.repl, "select_preview_question_if_matches", None)
+            if not callable(select):
+                return self.tr('이 노드에서는 화면 선택을 못 보내요')
+            try:
+                outcome = select(signature, number, parser=self.parse_question_screen)
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"inject failed: {exc}")
+                return self.tr('터미널에 못 보냈어요')
+            if outcome != "sent":
+                log("CHOICE", f"preview select outcome={outcome} number={number} sig={signature}")
+                return self.tr('화면이 바뀌었어요 — 새 카드에서 골라주세요')
+            log("CHOICE", f"injected number={number}+Enter (preview) sig={signature}")
+            if card and card.get("signature") == signature:
+                card["submitted"] = True
+                self.persist_state()
+            return self.tr('{v0}번을 골랐어요', v0=number)
         send = getattr(self.repl, "send_choice_key", None)
         if not callable(send):
             return self.tr('이 노드에서는 화면 선택을 못 보내요')
@@ -14140,21 +14414,44 @@ class Bridge:
         if tool.get("completed"):
             tool = {}
         binding = getattr(self, "session_binding", None)
+        native_question = None
         if binding and tool.get("session_id") == binding.session_id:
             for question in tool.get("questions", []):
                 title = question.get("question", "")
                 if question_title_matches(title, parsed["title"]):
                     card_parsed["title"] = title
+                    native_question = question
                     break
         # T-261024-014: 승인 카드는 바로 앞 진행 글의 복붙 원문(보낼 문안)을 카드 안에 다시 싣는다.
         #   카드만 보고도 무엇을 승인하는지 알 수 있게 — 외부발신 「원문 먼저」 규칙(T-261023-009)의 화면 쪽.
+        # T-261027-007: 카드 앞 글이 대화 기록에 안 남는 응답이 있다(10/27 박형우 답장 턴 — 진행 글 0건,
+        #   macOS 노드 설계 1·2절 카드도 같음). 그래서 질문 보기의 preview(도구 입력이라 기록에 남는다)를
+        #   모든 질문 카드에 싣는다. 승인 카드는 「보낼 원문」, 그 밖의 카드는 「내용」으로 단다.
+        is_approval = re.sub(r"^[^\w가-힣]+", "", str(card_parsed.get("header") or "")).strip() == "승인"
+        native_previews = native_option_previews(native_question)
         recent = getattr(self, "recent_progress_copy", None)
-        if (recent and re.sub(r"^[^\w가-힣]+", "", str(card_parsed.get("header") or "")).strip() == "승인"
-                and time.monotonic() - recent[0] <= QUESTION_CARD_PREVIEW_SECONDS):
+        fresh = bool(recent) and time.monotonic() - recent[0] <= QUESTION_CARD_PREVIEW_SECONDS
+        # T-261027-008: 4번째 값 = 그 원문이 폰에 전문으로 갔는가(값이 없으면 간 것 — 복붙 상자).
+        recent_on_phone = fresh and (len(recent) < 4 or bool(recent[3]))
+        preview_on_phone = True
+        if native_previews:
+            card_parsed["preview"] = native_previews
+            if not is_approval:
+                card_parsed["preview_label"] = "내용:"
+            above = "\n\n".join(str(bubble) for bubble in recent[1]) if recent_on_phone else ""
+            preview_on_phone = all(preview in above for preview in native_previews)
+            self.recent_progress_copy = None
+        elif recent and is_approval and fresh:
             card_parsed["preview"] = list(recent[1])
             if len(recent) > 2:
                 card_parsed["preview_label"] = recent[2]
+            preview_on_phone = recent_on_phone
             self.recent_progress_copy = None
+        if card_parsed.get("preview") and not preview_on_phone:
+            # T-261027-008: 폰에 안 간 원문이 카드 한 장보다 길면 카드 바로 앞에 전문을 나눠 보낸다.
+            tail = self.send_question_card_preview_parts(card_parsed, episode)
+            if tail:
+                card_parsed["preview_tail"] = tail
         params: dict[str, Any] = {
             "chat_id": self.config.chat_id,
             "text": getattr(self.telegram, "with_emoji_prefix", lambda value: value)(
@@ -14223,6 +14520,52 @@ class Bridge:
             f"question card sent options={len(parsed['options'])} freeform={parsed['freeform']} "
             f"multi={parsed['multi']} sig={parsed['signature']}",
         )
+
+    def send_question_card_preview_parts(self, card_parsed: dict[str, Any], episode: str) -> str | None:
+        """T-261027-008: 카드 한 장에 다 못 싣고 폰에도 안 간 승인 원문을 카드 바로 앞에 조각으로 보낸다.
+
+        실측 2026-10-27 10:05 작업 노드 — 원문 4,861자가 백그라운드 턴이라 폰에 0자 갔다. 카드는 2,500자까지만
+        싣고 「나머지는 위 칸」이라 하는데 위 칸이 없었다. 다 가면 None(그 꼬리가 참이 된다), 못 가면 카드에
+        실을 실패 꼬리를 돌려준다. 같은 조각은 outbox 로 한 번만 보낸다(카드 재시도에도 되풀이 0).
+        """
+        preview = card_parsed.get("preview") or []
+        parts = question_card_preview_parts(preview)
+        if not parts:
+            return None
+        binding = getattr(self, "session_binding", None)
+        digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:16]
+        episode_key = hashlib.sha1(episode.encode("utf-8")).hexdigest()[:12]
+        prefix = f"question-card-part:{binding.session_id if binding else '-'}:{episode_key}:{digest}"
+        outbox = getattr(self, "outbox", None)
+        with_prefix = getattr(self.telegram, "with_emoji_prefix", lambda value: value)
+        delivered = 0
+        for index in range(len(parts)):
+            key = f"{prefix}:{index}"
+            if outbox is not None and outbox.status(key) == "sent":
+                delivered += 1
+                continue
+            try:
+                response = self.telegram.call(
+                    "sendMessage", chat_id=self.config.chat_id,
+                    text=with_prefix(ask_question_card_part_text(card_parsed, index, translate=self.tr)),
+                    _question_card=card_parsed, _question_card_part=index,
+                )
+            except Exception:  # noqa: BLE001
+                response = None
+            result = response.get("result") if isinstance(response, dict) else None
+            if not (isinstance(response, dict) and response.get("ok") is True and isinstance(result, dict)
+                    and type(result.get("message_id")) is int and result["message_id"] > 0):
+                break
+            if outbox is not None:
+                outbox.mark_sent(key, [result["message_id"]])
+            delivered += 1
+        total = sum(len(part) for part in parts)
+        log("CHOICE", f"question card preview parts delivered={delivered}/{len(parts)} chars={total}")
+        if delivered == len(parts):
+            return None
+        # 폰에 간 것 = 카드 앞 2,500자와 앞에서부터 간 조각 중 긴 쪽. 그 뒤가 못 간 글이다.
+        on_phone = max(QUESTION_CARD_PREVIEW_MAX_CHARS, sum(len(part) for part in parts[:delivered]))
+        return f"…(나머지 {total - on_phone:,}자는 폰에 못 보냈어요 — 터미널에서 확인)"
 
     def maybe_answer_open_question(self, update: dict[str, Any]) -> bool:
         """질문 카드가 열려 있을 때 온 글 = 직접 입력 답. 처리했으면 True.
@@ -18102,6 +18445,18 @@ class Bridge:
                 self.send_public_progress(previous, confirmed=True)
                 pending.remove(previous)
 
+    @staticmethod
+    def public_progress_raw_text(message: dict[str, Any]) -> str:
+        """공개 글만 뽑는다 — 진행 글과 카드용 앞 글 기억(T-261027-008)이 같은 거름을 쓴다."""
+        # Explicit private channels are excluded at both message and block level.
+        content = message.get("content")
+        public_content = [
+            block for block in content if isinstance(block, dict) and block.get("type") == "text"
+            and block.get("channel") in (None, "commentary")
+        ] if isinstance(content, list) else content
+        raw_text = sanitize_text(strip_bridge_nonce_markers(content_text(public_content)))
+        return re.sub(r"<oai-mem-citation\b[^>]*>.*?(?:</oai-mem-citation>|$)", "", raw_text, flags=re.DOTALL).strip()
+
     def send_public_progress(self, record: dict[str, Any], *, confirmed: bool = False) -> None:
         """Relay only public main-turn text; failure leaves this JSONL line unread."""
         message = record.get("message") if isinstance(record.get("message"), dict) else {}
@@ -18137,15 +18492,21 @@ class Bridge:
             scope = f"native:{origin['uuid']}"
             anchor = None
         else:
+            # T-261027-008: 텔레그램 턴이 끝난 뒤 완료 알림으로 이어진 턴(백그라운드 턴)의 글은 폰에 안 간다.
+            #   실측 2026-10-27 10:05 작업 노드 SNS 7채널 게시 승인 카드 — 카드 11초 전 원문 4,861자가 기록에
+            #   있었지만 폰에는 0자 갔다. 바로 뒤 승인 카드가 그 글을 싣도록 남긴다(4번째 값 False = 폰에 안 감).
+            #   같은 줄은 뒤 단계가 실패하면 다시 읽힌다(T-261026-003) — 이미 있는 글은 다시 붙이지 않는다.
+            raw_text = self.public_progress_raw_text(message)
+            if raw_text and time.time() - created <= QUESTION_CARD_PREVIEW_SECONDS:
+                recent = getattr(self, "recent_progress_copy", None)
+                now = time.monotonic()
+                kept = (list(recent[1]) if recent and len(recent) > 3 and recent[3] is False
+                        and now - recent[0] <= QUESTION_CARD_PREVIEW_SECONDS else [])
+                if raw_text not in kept:
+                    kept.append(raw_text)
+                self.recent_progress_copy = (now, kept[-QUESTION_CARD_UNRELAYED_KEEP:], "앞 글 전문:", False)
             return
-        # Explicit private channels are excluded at both message and block level.
-        content = message.get("content")
-        public_content = [
-            block for block in content if isinstance(block, dict) and block.get("type") == "text"
-            and block.get("channel") in (None, "commentary")
-        ] if isinstance(content, list) else content
-        raw_text = sanitize_text(strip_bridge_nonce_markers(content_text(public_content)))
-        raw_text = re.sub(r"<oai-mem-citation\b[^>]*>.*?(?:</oai-mem-citation>|$)", "", raw_text, flags=re.DOTALL).strip()
+        raw_text = self.public_progress_raw_text(message)
         text = _flow_progress.public_progress_text(raw_text)
         # T-261021-023: 진행 문장은 코드펜스를 지운다(펜스는 "단계"가 아니다). 그런데 중간 텍스트의
         #   펜스는 사용자이 읽어야 할 복붙 콘텐츠(보낼 문안·칠 명령)인 경우가 있고, 바로 뒤의 질문 카드가
@@ -18206,6 +18567,7 @@ class Bridge:
                     raise RuntimeError("public progress send unconfirmed")
                 self.outbox.mark_sent(key, ids)
                 log("SEND", "public progress delivered")
+        dropped = False
         for bubble, bubble_key in zip(bubbles, bubble_keys):
             if self.outbox.status(bubble_key) == "sent":
                 continue
@@ -18221,6 +18583,7 @@ class Bridge:
                 #   버려진 원문은 아래 recent_progress_copy 로 바로 뒤 승인 카드에 실린다.
                 self.outbox.mark_sent(bubble_key, [])
                 log("SEND", "public progress copy bubble dropped by outbound policy")
+                dropped = True
                 continue
             if not ids or not all(type(mid) is int and mid > 0 for mid in ids):
                 raise RuntimeError("public progress copy bubble unconfirmed")
@@ -18228,11 +18591,12 @@ class Bridge:
             log("SEND", "public progress copy bubble delivered")
         if bubbles:
             # T-261024-014: 바로 뒤 승인 카드가 「위 문안」을 가리키면 카드에 같은 원문을 다시 싣는다.
-            self.recent_progress_copy = (time.monotonic(), list(bubbles))
+            #   T-261027-008: 4번째 값 = 전문이 폰에 갔는가. 정책에 버려진 상자는 안 갔다.
+            self.recent_progress_copy = (time.monotonic(), list(bubbles), None, not dropped)
         elif progress_text_truncated(raw_text, text):
             # T-261024-021: 펜스 없는 스크립트도 진행 글은 두 문장으로 잘린다(제어 노드 2026-10-24 12:26
             #   베리 재발신 승인 카드 — 894자 스크립트가 폰에 두 문장만 왔다). 잘린 산문은 전문을 카드에 싣는다.
-            self.recent_progress_copy = (time.monotonic(), [raw_text], "앞 글 전문:")
+            self.recent_progress_copy = (time.monotonic(), [raw_text], "앞 글 전문:", False)
 
     def process_record(self, record: dict[str, Any]) -> None:
         binding = self.session_binding
@@ -18300,7 +18664,8 @@ class Bridge:
                 uuid = record.get("uuid")
                 if isinstance(uuid, str):
                     if record.get("sessionId") == binding.session_id:
-                        self.pending_public_progress = []
+                        # T-261027-008: 새 사람 입력·완료 알림 뒤의 승인 카드에 앞 턴 글이 실리지 않게 같이 비운다.
+                        self.pending_public_progress, self.recent_progress_copy = [], None
                     self.background_flow_boundaries.setdefault(uuid, "")
                     self.background_flow_boundaries = dict(list(self.background_flow_boundaries.items())[-500:])
             self.observe_background_flow_results(record)
