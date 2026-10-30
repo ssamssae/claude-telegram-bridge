@@ -19857,7 +19857,10 @@ class Bridge:
         if not isinstance(content, list):
             return
         role = message.get("role")
-        if role == "assistant":
+        # T-261030-010: api-request-blob 사본은 이미 지나간 tool_use 를 다시 담는다 — 여기서 등록하면 끝난 작업이
+        # 「실행 · N분 경과」로 되살아나 영영 안 닫힌다(10/30 작업 노드 7줄). 등록만 막고, 아래 완료 통지 스캔은
+        # 사본에도 그대로 한다(턴 도중 끝난 작업의 통지는 다음 요청 사본에 실려서야 이 함수에 보인다).
+        if role == "assistant" and record.get("type") != CLAUDE_REQUEST_SNAPSHOT_TYPE:
             for item in content:
                 if not (isinstance(item, dict) and item.get("type") == "tool_use"):
                     continue
@@ -19896,10 +19899,18 @@ class Bridge:
                     continue
                 if pitem is None or pitem.kind != "bg" or pitem.output_path:
                     continue
-                # dispatch 직후 확인 텍스트에서 output 경로만 얻는다 — 이 tool_result 는
-                # "백그라운드로 넘어갔다" 확인일 뿐 완료가 아니므로 done 은 여기서 안 찍는다.
                 raw = item.get("content")
                 text = raw if isinstance(raw, str) else content_text(raw)
+                if record.get("type") != CLAUDE_REQUEST_SNAPSHOT_TYPE and (
+                    item.get("is_error") is True or not _BG_LAUNCH_RE.search(text or "")
+                ):
+                    # T-261030-029: 백그라운드로 넘어가지 못한 명령(가드 거절·권한 거부·오류)은 완료 통지가 영영
+                    # 안 온다 — 확인 문구가 없으면 카드에서 뺀다(10/30 제어 노드 「실행 · 6시간 21분 경과」 유령 줄).
+                    # 사본(api-request-blob) 결과로는 지우지 않는다 — 시작·끝 판정은 정식 레코드가 한다.
+                    del self.progress_items[tool_use_id]
+                    continue
+                # dispatch 직후 확인 텍스트에서 output 경로만 얻는다 — 이 tool_result 는
+                # "백그라운드로 넘어갔다" 확인일 뿐 완료가 아니므로 done 은 여기서 안 찍는다.
                 match = _BG_OUTPUT_PATH_RE.search(text or "")
                 if match:
                     pitem.output_path = match.group(1).rstrip(".,;)")
