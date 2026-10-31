@@ -1,0 +1,10 @@
+# Claude Telegram Bridge 0.14.14
+
+- `/feedback` sent from the phone now opens Claude Code's feedback drafts dialog as a card. The card shows the draft list, then the selected draft's fields, with buttons to review, send, keep for later or discard. The bridge presses Enter once per step, and new Telegram messages wait until the dialog closes. Before this release, `/feedback` went through the generic slash path, which pressed Enter several times. The third Enter could send the first draft without review, and new messages could reach the open dialog as keystrokes.
+- Slash commands sent from the phone (`/model`, `/effort`, `/feedback`) now check that the pasted command landed in the input line for up to 5 seconds (`CLB_SLASH_LANDING_WAIT_SEC`) instead of once after 0.2 seconds. A session that had been idle for hours could draw the pasted text one to three seconds late, and the bridge reported a failure. The check now reads only the input line, so the command menu shown under a pasted slash command is no longer mistaken for leftover input.
+- The terminal-turn mirror no longer treats Claude Code's compaction summary as a person typing in the terminal. Claude Code writes that summary as a user record (`isCompactSummary`). Before this release, the mirror could forward the summary to the phone and could clear queued inputs as if a person had taken over the terminal.
+- Multi-select questions whose header scrolled above a small pane are now sent as button cards. While the bridge reads such a question, and while it checks options and submits them, it briefly enlarges the tmux window to 80 rows and then restores the original size and window-size policy. Before this release, the bridge asked you to answer in the terminal.
+
+Validation: public export with the internal-symbol audit and the module parity gate, private-data and token scans with two independent scanners, public tests, twine check, and an installed-wheel resource check from a neutral folder in an isolated environment. Source bundle, wheel and source distribution are included.
+
+This release is published on GitHub and PyPI. It does not restart an installed bridge.
