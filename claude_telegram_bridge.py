@@ -233,6 +233,9 @@ DEFAULT_MODEL_MENU_ALIASES = ("default", "fable", "opus", "sonnet", "haiku")
 #   인자형은 type="local" supportsNonInteractive=True → 인자로 주면 픽커 없이 적용된다.
 #   그래서 /model 과 똑같이 "인터셉트해서 inline keyboard 로 고르고, 적용은 인자형" 을 쓴다.
 EFFORT_SLASH_COMMAND = "/effort"
+# T-261030-033: /feedback 은 일반 슬래시 경로(엔터 5번)로 넣으면 초안 창의 「검토 → 보내기」까지 눌린다.
+#   전용 처리기가 엔터 1번으로 창을 열고 폰 카드로 넘긴다 (Bridge.handle_feedback_command).
+FEEDBACK_SLASH_COMMAND = "/feedback"
 EFFORT_CALLBACK = "clb-effort"
 # T-261018-022: Claude Code 2.1.302 confirms `/effort <level>` in a session with history.
 # Title of that dialog; its option 1 reads 「Yes, switch to <level>」 (fixture
@@ -247,6 +250,7 @@ DEFAULT_EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 SELECTABLE_SLASH_HANDLERS = {
     MODEL_SLASH_COMMAND: "handle_model_command",
     EFFORT_SLASH_COMMAND: "handle_effort_command",
+    FEEDBACK_SLASH_COMMAND: "handle_feedback_command",
 }
 # 콜백 prefix → 적용 메서드. 위조 callback_data 는 각 적용부의 allowlist 가 막는다.
 SELECTABLE_SLASH_CALLBACKS = {
@@ -1761,6 +1765,25 @@ def composer_residual_text(screen: str) -> str:
         if core.startswith((">", "❯")):
             return core[1:].strip()
     return ""
+
+
+def composer_input_line(screen: str) -> tuple[str | None, str | None]:
+    """입력줄(위아래 가로줄 사이 「❯ …」)의 글자와 그 아래 명령 메뉴의 커서 명령 (T-261030-033).
+
+    인자 없는 슬래시(/feedback)를 붙여 넣으면 입력줄 아래에 명령 메뉴가 뜨고, 메뉴 줄도 「❯」로
+    시작한다. composer_residual_text() 는 아래에서부터 첫 「❯」 줄을 읽어서 메뉴 줄을 입력으로 오인한다
+    (2026-10-31 작업 노드 격리 실측: 「❯ /feedback   Send feedback to Anthropic」). 입력줄이 안 보이면 (None, None).
+    """
+    lines = [line.rstrip() for line in strip_ansi_control(screen or "").replace("\u00a0", " ").splitlines()]
+    for index in range(len(lines) - 2, 0, -1):
+        stripped = lines[index].strip()
+        if not stripped.startswith("❯") or not (
+                CHOICE_RULE_RE.match(lines[index - 1].strip()) and CHOICE_RULE_RE.match(lines[index + 1].strip())):
+            continue
+        menu = next((line.strip() for line in lines[index + 2:] if line.strip()), "")
+        words = menu[1:].split() if menu.startswith("❯") else []
+        return stripped[1:].strip(), (words[0] if words else None)
+    return None, None
 
 
 # Claude Code TUI 가 여러 줄 paste 를 접어 보여 주는 placeholder (예: "[Pasted text #1 +12 lines]").
@@ -3981,6 +4004,375 @@ def choice_keyboard(parsed, translate=lambda text: text):
     return buttons
 
 
+# ── /feedback 초안 창 → 폰 카드 (T-261030-033) ───────────────────────────────
+# 발원 = 사용자 2026-10-30 22:0x 「작업 노드 피드백 보내라니까 센드피드백 브릿지에서 버튼도 안생기고
+#   보내기가 안된다」. 피드백 도구(SendFeedback)는 초안 파일만 남기고, 보내기는 터미널 /feedback
+#   창에서만 된다. 그 창에는 번호 선택지도 'Esc to cancel' 꼬리표도 없어서 카드 판정에 안 걸렸다.
+# 실측(2026-10-31 00:1x 작업 노드 격리 tmux 55×23, v2.1.310, 인터넷 막음, 검토 창 엔터는 안 누름):
+#   목록 엔터 = 검토, 검토 엔터 = 보내기(커서 기본값이 「Send feedback」), 검토 Esc = 목록, 목록 Esc = 닫힘.
+#   엔터 뒤 목록은 0.055초, 검토는 0.031초 만에 뜬다. 그래서 일반 슬래시 경로(엔터 0.3초 간격 5번)로
+#   /feedback 을 넣으면 세 번째 엔터가 보내기에 닿는다 — 이 명령은 전용 처리기(엔터 1번)로만 보낸다.
+#   전체 화면 모드(tui=fullscreen)는 검토 창 아래쪽(보내기 줄·꼬리표)이 처음엔 안 보이고 PageDown 으로
+#   내려야 보인다. 고전 모드는 위쪽(제목)이 tmux 기록으로 밀린다.
+# ⚠️ 판정은 화면 맨 아래 구조만 본다 — 대화 기록이 같은 글자를 인용해도 맨 아래가 입력줄이면 아니다.
+#   셸 검출기(tmux-repl-busy.sh detect_feedback_screen)와 같은 규칙이고, test_tmux_repl_busy_feedback.sh
+#   가 같은 픽스처로 두 판정을 대조한다. 한쪽을 고치면 다른 쪽도 같이 고친다.
+FEEDBACK_CALLBACK = "clb-feedback"
+FEEDBACK_DIALOG_TITLE = "Feedback drafts"
+FEEDBACK_LIST_FOOTER = "Enter to review · d to discard · Esc to close"
+FEEDBACK_SEND_FOOTER = "↑/↓ to move · Enter to send · d to discard · Esc to later"
+FEEDBACK_NEXT_FOOTER = "↑/↓ to move · ←/→ to change · Enter to next · d to discard · Esc to later"
+FEEDBACK_FOOTERS = {FEEDBACK_LIST_FOOTER: "list", FEEDBACK_SEND_FOOTER: "send", FEEDBACK_NEXT_FOOTER: "next"}
+FEEDBACK_CONTINUE = "Any key to continue"
+FEEDBACK_DISCLAIMER = "Drafts live only on this machine"
+FEEDBACK_NEW_ROW_RE = re.compile(r"^(❯\s+)?\+ Write new feedback$")
+FEEDBACK_SEND_ROW_RE = re.compile(r"^(❯\s+)?Send feedback$")
+FEEDBACK_TRANSCRIPT_ROW_RE = re.compile(r"^(❯\s+)?Send\s+\S")
+FEEDBACK_ROW_RE = re.compile(r"^(❯\s+)?(?P<title>\S.*?)\s{2,}(?P<meta>[a-z][a-z _-]{0,30} · \S{1,8})$")
+FEEDBACK_SENT_RE = re.compile(r"Feedback sent \(receipt\s+(?P<receipt>[0-9A-Za-z][0-9A-Za-z-]{7,63})\)")
+FEEDBACK_ENV_RE = re.compile(r"Environment info \((?P<env>[^)]*)\)")
+FEEDBACK_SCROLL_MARK_RE = re.compile(r"\s+[↑↓]$")
+FEEDBACK_FIELD_LABELS = ("Type:", "Title:", "Area:", "Failure mode:", "Task:", "Details:")
+FEEDBACK_SEARCH_LINES = 40
+FEEDBACK_CARD_TEXT_MAX = 2500
+FEEDBACK_CARD_PART_BUDGET = 3500
+FEEDBACK_SCROLL_MAX = 8
+FEEDBACK_GONE_TEXT = "이 초안은 이제 이 노드에 없어요(이미 보냈거나 지웠어요)."
+FEEDBACK_LATER_TEXT = "나중에로 남겼어요. 초안은 이 노드에 그대로 있어요. 보내려면 /feedback 을 보내 주세요."
+FEEDBACK_CHANGED_TEXT = "화면이 카드와 달라서 아무 키도 누르지 않았어요."
+FEEDBACK_UNCONFIRMED_TEXT = "보냈는지 확인하지 못했어요. 터미널을 확인해 주세요. 다시 보내지 않았어요."
+
+
+def feedback_wait_seconds() -> float:
+    return float_env("CLB_FEEDBACK_WAIT_SEC", 3.0)
+
+
+def feedback_poll_seconds() -> float:
+    return float_env("CLB_FEEDBACK_POLL_SEC", 0.05)
+
+
+def feedback_scan_seconds() -> float:
+    return float_env("CLB_FEEDBACK_SCAN_SEC", 5.0)
+
+
+def feedback_sent_wait_seconds() -> float:
+    return float_env("CLB_FEEDBACK_SENT_WAIT_SEC", 8.0)
+
+
+def feedback_unconfirmed_hold_seconds() -> float:
+    # 보내기 엔터 뒤 결과 화면을 못 읽었으면 그 화면이 아직 보내는 중일 수 있다 — 그동안 큐를 잡는다.
+    return float_env("CLB_FEEDBACK_UNCONFIRMED_HOLD_SEC", 60.0)
+
+
+def _feedback_lines(screen: str) -> list[str]:
+    """화면의 비어 있지 않은 줄(앞뒤 공백 제거, NBSP 는 공백). 아래쪽 빈 줄은 먼저 걷는다."""
+    text = strip_ansi_control(screen or "").replace(" ", " ")
+    rows = [row.rstrip() for row in text.splitlines()]
+    while rows and not rows[-1].strip():
+        rows.pop()
+    return [row.strip() for row in rows if row.strip()]
+
+
+def _feedback_footer(lines: list[str]) -> tuple[str, int]:
+    """맨 아래 1~3줄을 이어 붙여 꼬리표를 찾는다(좁은 창은 꼬리표가 접힌다). (종류, 시작 줄)."""
+    joined = ""
+    for count in range(1, min(3, len(lines)) + 1):
+        joined = lines[-count] if not joined else f"{lines[-count]} {joined}"
+        kind = FEEDBACK_FOOTERS.get(joined)
+        if kind:
+            return kind, len(lines) - count
+    return "", len(lines)
+
+
+def _feedback_title_block(lines: list[str], end: int) -> int:
+    """마지막 「Feedback drafts」 다음 줄이 「Type:」인 곳. 그 사이에 다른 창 꼬리표가 있으면 옛 창이다."""
+    for index in range(end - 1, -1, -1):
+        if lines[index].startswith(("Enter to review · ", "↑/↓ to move · ")):
+            return -1
+        if lines[index] == FEEDBACK_DIALOG_TITLE and index + 1 < end and lines[index + 1].startswith("Type:"):
+            return index
+    return -1
+
+
+def _feedback_review_fields(lines: list[str], start: int) -> dict[str, list[str]]:
+    fields: dict[str, list[str]] = {}
+    current = ""
+    for index in range(start + 1, len(lines)):
+        line = FEEDBACK_SCROLL_MARK_RE.sub("", lines[index]).strip()
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        if FEEDBACK_SEND_ROW_RE.match(line) or (
+                FEEDBACK_TRANSCRIPT_ROW_RE.match(line) and nxt.startswith("transcript:")):
+            break
+        label = next((name for name in FEEDBACK_FIELD_LABELS if line.startswith(name)), "")
+        if label:
+            current = label
+            rest = line[len(label):].strip()
+            fields[label] = [rest] if rest else []
+        elif current:
+            fields[current].append(line)
+    return fields
+
+
+def _feedback_scroll_box(lines: list[str]) -> int:
+    """전체 화면 모드 검토 창을 중간까지 내린 화면: 가로줄 바로 아래 줄 끝이 ↑, 맨 끝 줄 끝이 ↓."""
+    if not lines[-1].endswith("↓"):
+        return -1
+    for index in range(len(lines) - 2, max(-1, len(lines) - FEEDBACK_SEARCH_LINES), -1):
+        if CHOICE_RULE_RE.match(lines[index]) and lines[index + 1].endswith("↑"):
+            return index
+    return -1
+
+
+def _feedback_review(lines: list[str], footer: str, footer_at: int) -> dict[str, Any] | None:
+    clean = [FEEDBACK_SCROLL_MARK_RE.sub("", line).strip() for line in lines]
+    end = footer_at if footer else len(lines)
+    send_at = next((index for index in range(end - 1, max(-1, end - 13), -1)
+                    if FEEDBACK_SEND_ROW_RE.match(clean[index])), -1)
+    env_at = next((index for index in range(end - 1, max(-1, end - 17), -1)
+                   if clean[index].startswith("Environment info (")), -1)
+    row_at = next((index for index in range(end - 2, max(-1, end - 21), -1)
+                   if FEEDBACK_TRANSCRIPT_ROW_RE.match(clean[index]) and clean[index + 1].startswith("transcript:")), -1)
+    title_at = _feedback_title_block(clean, end)
+    view = "full" if footer and title_at >= 0 else "bottom"
+    if footer in {"send", "next"}:
+        if send_at < 0 or env_at < 0 or env_at > send_at:
+            return None
+    elif footer:
+        return None
+    elif title_at >= 0 and lines[-1].endswith("↓"):
+        view = "top"
+    else:
+        box_at = _feedback_scroll_box(lines)
+        if box_at < 0 or max(send_at, env_at, row_at) <= box_at:
+            return None
+        view = "middle"
+    fields = _feedback_review_fields(clean, title_at) if title_at >= 0 else {}
+    if view == "top" and not {"Title:", "Details:"} <= set(fields):
+        return None
+    env = None
+    if env_at >= 0:
+        stop = send_at if send_at > env_at else min(len(clean), env_at + 5)
+        match = FEEDBACK_ENV_RE.search(" ".join(clean[env_at:stop]))
+        env = re.sub(r"\s+", " ", match.group("env")).strip() if match else None
+        if env is None and footer:
+            return None
+    transcript = selected = None
+    if row_at >= 0:
+        transcript = True if "sends this conversation to" in f"{clean[row_at]} {clean[row_at + 1]}" else None
+        selected = "transcript" if clean[row_at].startswith("❯") else None
+    if send_at >= 0 and clean[send_at].startswith("❯"):
+        selected = "send"
+    if footer == "next":
+        selected = "transcript"
+    title = " ".join(fields.get("Title:") or []) or None
+    return {
+        "kind": "feedback", "screen": "review", "view": view, "footer": footer,
+        "title": title, "type": (fields.get("Type:") or [None])[0], "env": env,
+        "transcript": transcript, "selected": selected,
+        "send_ready": footer == "send" and selected == "send",
+        "details": [line.lstrip("│").strip() for line in fields.get("Details:") or []] or None,
+        "failure_mode": (fields.get("Failure mode:") or [None])[0],
+        "task": (fields.get("Task:") or [None])[0],
+        "signature": hashlib.sha256(f"{title or ''}\0{env or ''}".encode()).hexdigest()[:16],
+    }
+
+
+def _feedback_list(lines: list[str], footer_at: int) -> dict[str, Any] | None:
+    new_at = next((index for index in range(footer_at - 1, max(-1, footer_at - 8), -1)
+                   if FEEDBACK_NEW_ROW_RE.match(lines[index])), -1)
+    if new_at < 0 or not " ".join(lines[new_at + 1:footer_at]).startswith(FEEDBACK_DISCLAIMER):
+        return None
+    title_at = next((index for index in range(new_at - 1, max(-1, new_at - FEEDBACK_SEARCH_LINES), -1)
+                     if lines[index] == FEEDBACK_DIALOG_TITLE), -1)
+    if title_at < 0:
+        return None
+    rows: list[dict[str, str]] | None = []
+    marks = [index for index, line in enumerate(lines[title_at + 1:new_at + 1]) if line.startswith("❯")]
+    selected = None
+    for line in lines[title_at + 1:new_at]:
+        match = FEEDBACK_ROW_RE.match(line)
+        if match:
+            if match.group(1):
+                selected = len(rows)
+            rows.append({"title": match.group("title").strip(), "meta": match.group("meta")})
+        elif "·" in line or line.startswith("❯") or len(line) > 40:
+            rows = None
+            break
+    if rows is not None and len(marks) != 1:
+        rows = None
+    identity = json.dumps(rows, ensure_ascii=False) if rows is not None else "\n".join(lines[title_at:new_at])
+    return {
+        "kind": "feedback", "screen": "list", "rows": rows,
+        "selected": selected if rows is not None else None,
+        "signature": hashlib.sha256(identity.encode()).hexdigest()[:16],
+    }
+
+
+def parse_feedback_dialog(screen: str) -> dict[str, Any] | None:
+    """화면 맨 아래가 /feedback 창(목록·검토·보낸 뒤)이면 그 구조, 아니면 None (T-261030-033)."""
+    lines = _feedback_lines(screen)
+    if not lines:
+        return None
+    if lines[-1] == FEEDBACK_CONTINUE:
+        tail = lines[-6:]
+        match = FEEDBACK_SENT_RE.search(" ".join(lines[-4:]))
+        if match and FEEDBACK_DIALOG_TITLE in tail:
+            return {"kind": "feedback", "screen": "sent", "receipt": match.group("receipt"),
+                    "signature": match.group("receipt")}
+        return None
+    footer, footer_at = _feedback_footer(lines)
+    if footer == "list":
+        return _feedback_list(lines, footer_at)
+    return _feedback_review(lines, footer, footer_at)
+
+
+def screen_has_feedback_dialog(screen: str) -> bool:
+    return parse_feedback_dialog(screen) is not None
+
+
+def feedback_drafts_dir() -> Path:
+    raw = os.environ.get("CLB_FEEDBACK_DRAFTS_DIR", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / ".claude" / "feedback" / "drafts"
+
+
+def load_feedback_drafts(directory: Path | None = None) -> list[dict[str, Any]]:
+    """보내지 않은 초안(status=queued)만, 저장 순서대로. 읽기 실패한 파일은 건너뛴다."""
+    drafts: list[dict[str, Any]] = []
+    try:
+        entries = sorted((directory or feedback_drafts_dir()).glob("*.json"))
+    except OSError:
+        return drafts
+    for entry in entries:
+        try:
+            value = json.loads(entry.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if (isinstance(value, dict) and value.get("status") == "queued"
+                and isinstance(value.get("draft_id"), str) and isinstance(value.get("title"), str)):
+            drafts.append(value)
+    drafts.sort(key=lambda value: str(value.get("created_at") or ""))
+    return drafts
+
+
+def _feedback_norm(text: object) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def feedback_draft_matches_title(draft: dict[str, Any], title: str | None) -> bool:
+    shown = _feedback_norm(title)
+    return bool(shown) and _feedback_norm(draft.get("title")) == shown
+
+
+def feedback_draft_matches_row(draft: dict[str, Any], row_title: str | None) -> bool:
+    shown = str(row_title or "").strip()
+    full = _feedback_norm(draft.get("title"))
+    if shown.endswith("…"):
+        prefix = _feedback_norm(shown[:-1])
+        return bool(prefix) and full.startswith(prefix)
+    return bool(full) and full == _feedback_norm(shown)
+
+
+def feedback_draft_matches_env(draft: dict[str, Any], env: str | None) -> bool:
+    """검토 창 「Environment info」가 그 초안 파일의 버전·턴 수·모델과 같은가 (아래쪽 화면의 신원)."""
+    version, turns, messages = draft.get("cli_version"), draft.get("assistant_turn_count"), draft.get("message_count")
+    if not env or not isinstance(version, str) or not version or type(turns) is not int or type(messages) is not int:
+        return False
+    parts = {part.strip() for part in re.sub(r"\s+", " ", env).split(",")}
+    model = draft.get("model")
+    return (f"v{version}" in parts and f"turn {turns}/{messages}" in parts
+            and (not isinstance(model, str) or not model or model in parts))
+
+
+def feedback_card_details(card: dict[str, Any]) -> str:
+    return str((card.get("draft") or {}).get("details") or "").strip()
+
+
+def feedback_card_parts(card: dict[str, Any]) -> list[str]:
+    """카드 한 장에 다 못 싣는 초안 원문 조각. 줄 단위로 나눈다. 카드 한 장에 들면 빈 목록."""
+    details = feedback_card_details(card)
+    if card.get("kind") == "list" or len(details) <= FEEDBACK_CARD_TEXT_MAX:
+        return []
+    parts: list[str] = []
+    current = ""
+    for line in details.splitlines():
+        for piece in split_by_utf16_budget(line, FEEDBACK_CARD_PART_BUDGET):
+            candidate = f"{current}\n{piece}" if current else piece
+            if current and len(candidate.encode("utf-16-le")) // 2 > FEEDBACK_CARD_PART_BUDGET:
+                parts.append(current)
+                candidate = piece
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
+def feedback_card_part_text(card: dict[str, Any], index: int, translate=lambda text: text) -> str:
+    parts = feedback_card_parts(card)
+    if type(index) is not int or not 0 <= index < len(parts):
+        return ""
+    return f"{translate('피드백 초안 원문')} ({index + 1}/{len(parts)})\n{parts[index]}"
+
+
+def feedback_card_text(card: dict[str, Any], translate=lambda text: text) -> str:
+    """폰 카드 본문. 운영 필터 면제는 이 글을 카드 자료로 다시 만들어 대조한다."""
+    kind = card.get("kind")
+    if kind == "list":
+        rows = [translate("터미널에 피드백 초안 목록이 열려 있어요."), ""]
+        for index, row in enumerate(card.get("rows") or [], 1):
+            rows.append(f"{index}. {row['title']} ({row['meta']})")
+        if card.get("rows") is None:
+            rows.append(translate("목록을 읽지 못했어요. 터미널에서 확인해 주세요."))
+        rows += ["", translate("초안을 누르면 내용을 보여 드려요. 아직 보내지 않아요."),
+                 translate("피드백 창이 열려 있는 동안 새 메시지는 기다려요.")]
+        return "\n".join(rows)
+    draft = card.get("draft") or {}
+    head = (translate("피드백 초안이 저장됐어요. 아직 보내지 않았어요.") if kind == "notice"
+            else translate("터미널에 피드백 검토 창이 열려 있어요. 아직 보내지 않았어요."))
+    rows = [head, ""]
+    meta = [f"{translate('종류')}: {draft['type']}" if draft.get("type") else ""]
+    for key, label in (("area", "분야"), ("failure_mode", "실패 유형"), ("task_category", "작업")):
+        if draft.get(key):
+            meta.append(f"{translate(label)}: {draft[key]}")
+    if any(meta):
+        rows.append(" · ".join(part for part in meta if part))
+    if draft.get("title"):
+        rows.append(f"{translate('제목')}: {draft['title']}")
+    details = feedback_card_details(card)
+    if details:
+        if feedback_card_parts(card):
+            details = details[:FEEDBACK_CARD_TEXT_MAX].rstrip() + "\n" + translate("…(나머지는 위 조각에 있어요)")
+        rows += ["", details]
+    rows.append("")
+    if not card.get("sendable"):
+        rows.append(translate("어떤 초안인지 화면과 초안 파일로 확인하지 못해 폰에서는 보낼 수 없어요. 터미널에서 확인해 주세요."))
+    elif kind == "notice":
+        rows.append(translate("보내기를 누르면 이 초안과 초안을 만든 대화 기록, 환경 정보가 Anthropic 에 가요."))
+        rows.append(translate("누른 뒤 터미널 화면이 이 초안과 같은지 확인하고 나서 보내요."))
+    else:
+        rows.append(translate("대화 기록도 함께 가요(터미널 표시: yes).") if card.get("transcript")
+                    else translate("대화 기록 첨부 여부는 터미널 화면에서 확인해 주세요."))
+        rows.append(translate("환경 정보와 API 요청 id 도 함께 가요."))
+    if kind != "notice":
+        rows.append(translate("피드백 창이 열려 있는 동안 새 메시지는 기다려요."))
+    return "\n".join(rows)
+
+
+def feedback_card_keyboard(card: dict[str, Any], translate=lambda text: text) -> list[list[dict[str, str]]]:
+    def button(text: str, action: str) -> dict[str, str]:
+        return {"text": text, "callback_data": f"{FEEDBACK_CALLBACK}::{card['token']}::{action}"}
+
+    if card.get("kind") == "list":
+        rows = []
+        for index, row in enumerate(card.get("rows") or [], 1):
+            label = f"{index}. {row['title']}"
+            rows.append([button(label if len(label) <= 48 else label[:47] + "…", f"review{index}")])
+        rows.append([button(translate("닫기"), "close")])
+        return rows
+    if not card.get("sendable"):
+        return [[button(translate("나중에"), "later")]]
+    return [[button(translate("보내기"), "send"), button(translate("나중에"), "later")]]
+
+
 # ── AskUserQuestion 질문 화면 → 폰 카드 (T-261004-016, 코덱스 질문 카드 동형) ──────────
 # 실측 화면(Claude Code v2.1.289, 2026-10-04 제어 노드 스크래치 세션):
 #     ☐ Fruit                              ← 질문 1개면 머리표 1개, 여러 개면 「←  ☐ A  ☐ B  ✔ Submit  →」
@@ -4012,6 +4404,10 @@ ASKQ_PREVIEW_SELECTED_RE = re.compile(r"^\s*❯\s*([1-9])\.")
 # preview 상자 화면의 대화 줄은 번호가 없다(v2.1.311 제어 노드 격리 세션 실측, T-261027-007).
 ASKQ_PREVIEW_CHAT_ROW_RE = re.compile(r"(?i)^\s*(?:❯\s+)?chat about this\s*$")
 ASKQ_CLIPPED_MIN_SUFFIX = 32
+# T-261025-028 재착수: 머리표가 화면 위로 밀린 여러 개 고르기 질문은 읽는 동안만 창을 이 높이로 늘린다
+#   (10/31 09:21 제어 노드 52×18 실측 — 보기 4개+설명이면 머리표·질문·1번 보기가 화면 밖이라 카드가 안 나갔다.
+#   2.1.312 격리 세션에서 80줄로 늘리면 0.055초 안에 질문 전체가 다시 그려졌다).
+ASKQ_TALL_CAPTURE_ROWS = 80
 ASKQ_ELLIPSIS = "…"
 ASKQ_RAIL_RE = re.compile(r"^\s*│")
 # T-261018-027: Claude Code 의 TUI 는 「⚠️」(U+26A0 U+FE0F) 같은 글자를 변형 선택자 없이 「⚠」로 그린다
@@ -4103,6 +4499,58 @@ def askq_settled_in_transcript(path, tool_id) -> tuple[bool, dict | None]:
         elif tool_message is not None and message.get("id") and message.get("id") != tool_message:
             return True, None
     return False, None
+
+
+def _askq_body_above_hint(screen: str) -> list[str] | None:
+    """질문 화면의 하단 선택 힌트 위 줄들. 힌트가 끝 쪽에 없으면 None (parse_ask_question 과 같은 준비)."""
+    text = strip_ansi_control(screen or "")
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for count in (2, 3):
+        if len(lines) >= count:
+            footer = " ".join(line.strip() for line in lines[-count:])
+            if ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer):
+                lines[-count:] = [footer]
+                break
+    for idx in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
+        if ASKQ_HINT_RE.search(lines[idx]):
+            return lines[:idx]
+    return None
+
+
+def askq_question_header_visible(screen: str) -> bool:
+    """머리표(☐/☒) 줄과 하단 선택 힌트가 둘 다 보이는 질문 화면인가 — 늘린 창이 다 그려졌다는 신호."""
+    body = _askq_body_above_hint(screen)
+    return body is not None and any(ASKQ_TAB_RE.match(line) for line in body)
+
+
+def askq_screen_settled(screen: str) -> bool:
+    """창을 되돌린 뒤 질문 화면이 다 그려졌는가 — 하단 선택 힌트가 보이거나 제출 확인 화면이다 (T-261025-028)."""
+    if _askq_body_above_hint(screen) is not None:
+        return True
+    return any(line.strip() == ASKQ_REVIEW_TITLE for line in strip_ansi_control(screen or "").splitlines())
+
+
+def askq_multi_screen_clipped(screen: str) -> bool:
+    """여러 개 고르기 질문인데 머리표(☐/☒) 줄이 화면 위로 밀린 화면인가 (T-261025-028 재착수).
+
+    아래쪽 선택 힌트와 체크 상자 보기 줄([ ]/[✔])이 보이는데 머리표 줄이 없을 때만 참이다.
+    단일 선택의 잘린 화면은 parse_clipped_ask_question 이 맡으므로 여기에 걸리지 않는다.
+    """
+    body = _askq_body_above_hint(screen)
+    if body is None or any(ASKQ_TAB_RE.match(line) for line in body):
+        return False
+    for line in body:
+        matched = CHOICE_OPTION_RE.match(line)
+        if matched and ASKQ_MULTI_MARK_RE.match(matched.group(3).strip()):
+            return True
+    return False
+
+
+def askq_screen_key(screen: str) -> str:
+    """같은 화면인지 볼 때 쓰는 키 — 창을 되돌린 뒤 다시 그린 화면은 줄 끝 공백만 다를 수 있다(10/31 실측)."""
+    return "\n".join(line.rstrip() for line in strip_ansi_control(screen or "").splitlines()).rstrip("\n")
 
 
 def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, *, full_header=False):
@@ -5727,7 +6175,7 @@ def screen_has_declared_confirm(screen: str) -> bool:
 
 def screen_has_approval_wait(screen: str) -> bool:
     return bool(parse_workspace_trust_choice(screen) or parse_computer_use_choice(screen)
-                or screen_has_declared_confirm(screen)
+                or screen_has_declared_confirm(screen) or screen_has_feedback_dialog(screen)
                 or APPROVAL_WAIT_RE.search(screen_status_region(screen)))
 
 
@@ -6257,6 +6705,8 @@ class TelegramClient:
         _question_card: dict[str, Any] | None = None,
         _question_card_part: int | None = None,
         _choice_card: dict[str, Any] | None = None,
+        _feedback_card: dict[str, Any] | None = None,
+        _feedback_card_part: int | None = None,
         **params: Any,
     ) -> dict[str, Any] | None:
         # T-261004-016: _request_timeout/_attempts/_wait_on_flood 는 typing 처럼 짧은
@@ -6353,7 +6803,22 @@ class TelegramClient:
             method == "sendMessage" and own_chat and bool(part_text)
             and params.get("text") == self.with_emoji_prefix(part_text)
         )
-        if not (card_completion or user_reply or native_final_reply or user_flow_update or permission_card or workspace_trust_card or handoff_card or choice_card or question_card or question_card_part) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
+        # T-261030-033: 피드백 초안 카드도 초안 원문을 싣는다(「error」「✅」가 든 초안이 버려지면 안 된다).
+        #   면제는 카드 자료로 같은 본문·버튼(조각은 같은 조각)을 다시 만들어 대조해야만 통과한다.
+        feedback_part = (feedback_card_part_text(_feedback_card, _feedback_card_part, translate=self.tr)
+                         if isinstance(_feedback_card, dict) and type(_feedback_card_part) is int else "")
+        feedback_card = (
+            method == "sendMessage" and own_chat and isinstance(_feedback_card, dict)
+            and (
+                (_feedback_card_part is None
+                 and params.get("text") == self.with_emoji_prefix(feedback_card_text(_feedback_card, translate=self.tr))
+                 and params.get("reply_markup") == json.dumps(
+                     {"inline_keyboard": feedback_card_keyboard(_feedback_card, translate=self.tr)}, ensure_ascii=False))
+                or (bool(feedback_part) and "reply_markup" not in params
+                    and params.get("text") == self.with_emoji_prefix(feedback_part))
+            )
+        )
+        if not (card_completion or user_reply or native_final_reply or user_flow_update or permission_card or workspace_trust_card or handoff_card or choice_card or question_card or question_card_part or feedback_card) and claude_node_room_outbound_should_drop(method, params.get("chat_id"), params.get("text") or ""):
             # 버림을 브릿지 로그에도 남긴다 — 종전엔 원장에만 남아 로그는 호출부의 「sent」만 보였다.
             log("DROP", f"{method} kind={classify_claude_ops_outbound(params.get('text') or '')} "
                         f"buttons={int(reply_markup_has_buttons(params.get('reply_markup')))} own_chat={int(own_chat)}")
@@ -7741,6 +8206,11 @@ def composer_clear_keys(interrupt: bool = True) -> tuple[str, ...]:
 
 class TmuxClaudeTransport:
     supports_pane_features = True
+    # T-261025-028 재착수: 잘린 여러 개 고르기 질문을 늘린 창에서 읽은 결과와 그 창 조절 잠금.
+    #   여러 스레드(질문 감시·버튼·정지 알림)가 동시에 늘리면 서로 원래 크기를 잘못 기억한다. 브릿지마다
+    #   어댑터는 하나이고 tmux 창도 하나라 클래스 값으로 둔다(생성자 없이 만든 어댑터도 쓸 수 있다).
+    _askq_tall_cache: tuple[str, str] | None = None
+    _askq_tall_lock = threading.RLock()
 
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -7855,8 +8325,8 @@ class TmuxClaudeTransport:
         """
         if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
             return "invalid", None
-        with self.composer_lock():
-            before = parser(self.capture_pane(80))
+        with self.composer_lock(), self.question_screen_reader(80) as read:
+            before = parser(read())
             buttons = askq_multi_buttons(before, card, signature)
             if number not in buttons or before["selected"] not in buttons:
                 return "changed", None
@@ -7864,7 +8334,7 @@ class TmuxClaudeTransport:
             self.tmux("send-keys", "-t", self.resolve_pane_target(), str(number))
             for _ in range(10):
                 time.sleep(0.1)
-                after = parser(self.capture_pane(80))
+                after = parser(read())
                 if after and not askq_multi_buttons(after, card, signature):
                     return "changed", None
                 if after and set(after["checked"]) == expected:
@@ -7877,8 +8347,8 @@ class TmuxClaudeTransport:
         실측 계약(v2.1.310): 여러 개 고르기 화면의 → = 다음 칸. 질문이 하나면 「Review your answers」
         화면이 뜨고, 그 화면은 종전 질문 카드 경로로 새 카드가 된다(제출·취소는 그 카드에서).
         """
-        with self.composer_lock():
-            before = parser(self.capture_pane(80))
+        with self.composer_lock(), self.question_screen_reader(80) as read:
+            before = parser(read())
             buttons = askq_multi_buttons(before, card, signature)
             if not buttons or before["selected"] not in buttons:
                 return "changed"
@@ -7887,7 +8357,7 @@ class TmuxClaudeTransport:
             self.tmux("send-keys", "-t", self.resolve_pane_target(), "Right")
             for _ in range(10):
                 time.sleep(0.1)
-                after = parser(self.capture_pane(80))
+                after = parser(read())
                 if after and not askq_multi_buttons(after, card, signature):
                     return "sent"
             return "unconfirmed"
@@ -8093,6 +8563,128 @@ class TmuxClaudeTransport:
                     self.tmux("resize-window", "-t", window_id, "-x", str(original_window_width), "-y", str(original_window_height))
                 except Exception as exc:  # noqa: BLE001
                     log("REPL", f"wide context capture restore failed: {exc}")
+
+    @contextmanager
+    def temporary_window_height(self, rows: int = ASKQ_TALL_CAPTURE_ROWS):
+        """잘린 질문을 읽는 동안만 창 높이를 늘렸다가 되돌린다 (T-261025-028 재착수).
+
+        temporary_window_width 와 같은 꼴이다. resize-window 는 그 창의 window-size 를 manual 로
+        고정한다(tmux 3.4·3.6a 실측) — 원래 전역 정책(latest)을 따르던 창이면 되돌린 뒤 창 옵션을 푼다.
+        늘렸으면 True 를 내준다.
+        """
+        with self._askq_tall_lock:
+            pane = self.resolve_pane_target()
+            try:
+                out = self.tmux(
+                    "display-message", "-p", "-t", pane,
+                    "#{window_id} #{window_width} #{window_height} #{pane_width} #{pane_height}",
+                )
+                window_id, window_width, window_height, pane_width, pane_height = out.stdout.strip().split()
+                width, height = int(window_width), int(window_height)
+                original_pane = (int(pane_width), int(pane_height))
+                pinned = bool(self.tmux("show-options", "-w", "-t", window_id, "window-size").stdout.strip())
+            except Exception as exc:  # noqa: BLE001
+                log("REPL", f"tall question capture unavailable: {exc}")
+                yield False
+                return
+            resized = False
+            if rows > height:
+                try:
+                    self.tmux("resize-window", "-t", window_id, "-x", str(width), "-y", str(rows))
+                    resized = True
+                    self.tmux("resize-pane", "-t", pane, "-y", str(rows))
+                except Exception as exc:  # noqa: BLE001
+                    log("REPL", f"tall question capture resize failed: {exc}")
+            try:
+                yield resized
+            finally:
+                if resized:
+                    try:
+                        self.tmux("resize-pane", "-t", pane, "-x", str(original_pane[0]), "-y", str(original_pane[1]))
+                        self.tmux("resize-window", "-t", window_id, "-x", str(width), "-y", str(height))
+                        if not pinned:
+                            self.tmux("set-option", "-w", "-u", "-t", window_id, "window-size")
+                    except Exception as exc:  # noqa: BLE001
+                        log("REPL", f"tall question capture restore failed: {exc}")
+                    self.wait_screen_settled()
+
+    def wait_screen_settled(self, lines: int = 80) -> None:
+        """창을 되돌린 뒤 질문 화면이 다시 다 그려질 때까지(1.5초 안) 기다린다 — 잠금 안이라 남은 반쯤 그린 화면을 못 읽는다.
+
+        10/31 작업 노드 실제 창: 늘렸다 곧바로 줄이면 윗부분만 남은 화면(힌트 없음)이 0.24초 멈춰 있어
+        바로 누른 체크가 「화면이 바뀌었어요」로 끝났다. 「같은 화면 두 번」으로는 못 거른다 — 하단 선택 힌트나
+        제출 확인 화면이 같은 모양으로 두 번 보일 때까지 기다린다. 질문이 그새 닫혔으면 시간만 채우고 끝난다.
+        """
+        previous = None
+        for _ in range(30):
+            time.sleep(0.05)
+            try:
+                screen = self.capture_pane(lines)
+            except Exception:  # noqa: BLE001
+                return
+            current = askq_screen_key(screen) if askq_screen_settled(screen) else None
+            if current is not None and current == previous:
+                return
+            previous = current
+
+    def wait_for_tall_question(self, lines: int = 80) -> str:
+        """늘린 창에 질문 전체가 다시 그려질 때까지(머리표와 힌트가 둘 다 보일 때까지) 1초 안에서 기다려 읽는다.
+
+        빈 중간 화면은 받지 않는다. 끝내 안 보이면 ""(호출부는 종전 화면으로 돌아간다).
+        """
+        for _ in range(20):
+            time.sleep(0.05)
+            screen = self.capture_pane(max(lines, ASKQ_TALL_CAPTURE_ROWS))
+            if askq_question_header_visible(screen):
+                return screen
+        return ""
+
+    def capture_question_pane(self, lines: int = 80, *, fresh: bool = False) -> str:
+        """질문 판독용 캡처 (T-261025-028 재착수).
+
+        머리표가 밀린 여러 개 고르기 화면이면 창 높이를 잠깐 늘려 다시 읽고 되돌린다. 작은 화면이
+        그대로면(줄 끝 공백 무시) 직전에 늘려 읽은 화면을 다시 쓴다 — 점검마다 창을 흔들지 않는다.
+        늘려 읽기에 실패하면 종전 화면을 그대로 돌려준다(카드 없음 = 종전 동작).
+        """
+        with self._askq_tall_lock:
+            screen = self.capture_pane(lines)
+            if not askq_multi_screen_clipped(screen):
+                self._askq_tall_cache = None
+                return screen
+            key = askq_screen_key(screen)
+            cached = self._askq_tall_cache
+            if not fresh and cached and cached[0] == key:
+                return cached[1]
+            with self.temporary_window_height() as resized:
+                tall = self.wait_for_tall_question(lines) if resized else ""
+            if not tall or askq_multi_screen_clipped(tall):
+                self._askq_tall_cache = None
+                return screen
+            self._askq_tall_cache = (key, tall)
+            return tall
+
+    @contextmanager
+    def question_screen_reader(self, lines: int = 80):
+        """체크·넘기기 거래 동안 화면을 읽는 함수를 준다 (T-261025-028 재착수).
+
+        평소엔 종전 캡처 그대로다(첫 캡처를 다시 찍지 않는다). 머리표가 밀린 여러 개 고르기 화면이면
+        거래가 끝날 때까지 창을 늘려 둔다 — 화면 밖 보기의 체크도 다시 읽어 확인한다(실측: 숫자 키는
+        안 보이는 보기도 체크한다). 끝나면 감시용 재사용 화면을 버린다.
+        """
+        with self._askq_tall_lock:
+            first = self.capture_pane(lines)
+            if not askq_multi_screen_clipped(first):
+                pending = [first]
+                yield lambda: pending.pop() if pending else self.capture_pane(lines)
+                return
+            try:
+                with self.temporary_window_height() as resized:
+                    tall = self.wait_for_tall_question(lines) if resized else ""
+                    pending = [tall or first]
+                    rows = max(lines, ASKQ_TALL_CAPTURE_ROWS) if tall else lines
+                    yield lambda: pending.pop() if pending else self.capture_pane(rows)
+            finally:
+                self._askq_tall_cache = None
 
     @contextmanager
     def composer_lock(self):
@@ -9887,6 +10479,14 @@ class Bridge:
         # episode 당 1회 발송 플래그. 승인 해소 시 리셋돼 재발 시 다시 알린다.
         self.approval_stall_since = 0.0
         self.approval_stall_notified = False
+        # T-261030-033: /feedback 초안 카드 — 재기동을 넘어 같은 초안에 알림을 두 번 보내지 않는다.
+        self.feedback_cards: list[dict[str, Any]] = []
+        self.feedback_seen: list[str] = []
+        self.feedback_baseline = False
+        self.feedback_scan_at = 0.0
+        self.feedback_hold_until = 0.0
+        self.feedback_failures: dict[str, int] = {}
+        self.load_feedback_state()
         # T-260707-15: 설문 카드가 key=0을 즉시 소비하지 못해도 같은 카드에
         # 반복 입력하지 않는다. 카드가 사라진 것이 재확인되면 자동 리셋된다.
         self.feedback_survey_dismiss_attempted = False
@@ -11886,6 +12486,10 @@ class Bridge:
         본문 판정의 나머지 축(T-260801-036 활성턴 조건 제거·본문 대기 가드)은 원문
         주석·픽스처가 그대로 지킨다 — 여기는 판정식을 옮겨 픽스처가 걸릴 자리를
         만든 것뿐이다.
+
+        T-261031-003: 압축 요약(isCompactSummary)도 재진입이 아니다 — Claude Code 가 대화를
+        줄이며 남긴 user 레코드라 isMeta 표시가 없다. 흐름 미러가 이걸 「⌨️ 터미널 입력」으로
+        폰에 옮겼다 (실사고 2026-10-31 02:17:30 작업 노드 쉬는 중 압축: 영어 요약문 복붙 말풍선 2개).
         """
         active_awaiting_body = bool(self.active_turn) and not self.active_turn.user_uuid
         return (
@@ -11893,6 +12497,7 @@ class Bridge:
             and not active_awaiting_body
             and not record.get("isSidechain")
             and not record.get("isMeta")
+            and not record.get("isCompactSummary")
             and bool(content_text(content).strip())
         )
 
@@ -12093,6 +12698,11 @@ class Bridge:
         except Exception:
             screen = None
         if screen is not None and screen_has_question_wait(screen):
+            return "approval_wait"
+        # T-261030-033: /feedback 창도 같은 자리에서 본다 — 목록 엔터 = 검토, 검토 엔터 = 보내기다.
+        #   보내기 엔터 뒤 결과를 못 읽은 동안(feedback_hold_until)도 그 화면에 키를 넣지 않는다.
+        if (screen is not None and screen_has_feedback_dialog(screen)) or time.time() < getattr(
+                self, "feedback_hold_until", 0.0):
             return "approval_wait"
         with self.lock:
             if self.active_turn:
@@ -13637,10 +14247,15 @@ class Bridge:
             self.approval_stall_notified = False
             return
         try:
-            screen = self.repl.capture_pane(80)
+            screen = self.capture_question_screen(80)
         except Exception:  # noqa: BLE001
             return
         self.refresh_approval_cards(screen)
+        if screen_has_feedback_dialog(screen):
+            # T-261030-033: 피드백 창은 check_feedback_drafts 의 카드가 맡는다 — 승인 대기 문구를 겹쳐 안 보낸다.
+            self.approval_stall_since = 0.0
+            self.approval_stall_notified = False
+            return
         question = self.parse_question_screen(screen)
         if question:
             # T-261014-008: 질문 화면은 질문 카드가 맡지만, 카드가 전달되지 않았으면(운영필터·
@@ -13884,6 +14499,457 @@ class Bridge:
             log("CHOICE", f"approval outcome={outcome} number={number} message_id={message_id} sig={parsed['signature']}")
             return toast
 
+    # ── /feedback 초안 카드 (T-261030-033) ──────────────────────────────────────
+    # 카드는 세 가지다: 새 초안 알림(notice) · 목록(list) · 검토(review). 버튼을 누르면 화면을 다시
+    # 읽고 카드와 다르면 키를 누르지 않는다. 보내기 엔터는 「Send feedback」 줄이 선택돼 있고 검토 창의
+    # 환경 정보(버전·턴 수·모델)가 그 초안 파일과 같을 때만 1번 누른다. 누르기 전에 카드를 「sending」
+    # 으로 저장한다 — 결과가 불명확해도 같은 카드로 다시 보내지 않는다.
+    def feedback_state_path(self) -> Path:
+        name = self.config.state_path.name
+        stem = name[: -len(".state.json")] if name.endswith(".state.json") else name
+        return self.config.state_path.with_name(f"{stem}.feedback-drafts.json")
+
+    def load_feedback_state(self) -> None:
+        payload = read_json(self.feedback_state_path()) or {}
+        seen, cards = payload.get("seen"), payload.get("cards")
+        self.feedback_seen = [item for item in seen if isinstance(item, str)][-500:] if isinstance(seen, list) else []
+        self.feedback_baseline = payload.get("baseline") is True
+        self.feedback_cards = []
+        for card in cards[-32:] if isinstance(cards, list) else []:
+            if not isinstance(card, dict) or type(card.get("message_id")) is not int or card["message_id"] <= 0:
+                continue
+            if card.get("chat_id") != str(self.config.chat_id) or not isinstance(card.get("token"), str):
+                continue
+            if card.get("state") == "sending":
+                card.update(state="done", completion=self.tr(FEEDBACK_UNCONFIRMED_TEXT), edited=False)
+            elif card.get("state") == "open" and card.get("kind") != "notice":
+                # 재기동 사이에 화면이 바뀌었을 수 있다 — 화면 카드는 버튼만 닫는다.
+                card.update(state="done", completion=self.tr("이전 피드백 창 카드예요. 새 카드에서 골라 주세요."),
+                            edited=False)
+            self.feedback_cards.append(card)
+
+    def persist_feedback_state(self) -> None:
+        payload = {
+            "baseline": bool(getattr(self, "feedback_baseline", False)),
+            "seen": list(getattr(self, "feedback_seen", []))[-500:],
+            "cards": list(getattr(self, "feedback_cards", []))[-32:],
+        }
+        try:
+            write_json_atomic(self.feedback_state_path(), payload)
+        except OSError as exc:
+            log("FEEDBACK", f"state write failed: {type(exc).__name__}")
+
+    @staticmethod
+    def feedback_draft_snapshot(draft: dict[str, Any]) -> dict[str, Any]:
+        keys = ("draft_id", "title", "type", "details", "area", "failure_mode", "task_category", "created_at")
+        return {key: draft[key] for key in keys if draft.get(key) is not None}
+
+    @staticmethod
+    def feedback_draft_by_id(draft_id: object) -> dict[str, Any] | None:
+        return next((draft for draft in load_feedback_drafts() if draft.get("draft_id") == draft_id), None)
+
+    def send_feedback_card(self, card: dict[str, Any]) -> bool:
+        card.setdefault("token", secrets.token_hex(6))
+        card.update(chat_id=str(self.config.chat_id), state="open", created_at=time.time())
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value, **_kw: value)
+        try:
+            for index in range(len(feedback_card_parts(card))):
+                self.telegram.call(
+                    "sendMessage", chat_id=self.config.chat_id,
+                    text=prefix(feedback_card_part_text(card, index, translate=self.tr)),
+                    _feedback_card=card, _feedback_card_part=index,
+                )
+            response = self.telegram.call(
+                "sendMessage", chat_id=self.config.chat_id,
+                text=prefix(feedback_card_text(card, translate=self.tr)),
+                reply_markup=json.dumps({"inline_keyboard": feedback_card_keyboard(card, translate=self.tr)},
+                                        ensure_ascii=False),
+                _feedback_card=card,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log("FEEDBACK", f"card send failed kind={card.get('kind')} error={type(exc).__name__}")
+            return False
+        result = response.get("result") if isinstance(response, dict) else None
+        if (not isinstance(response, dict) or response.get("ok") is not True or not isinstance(result, dict)
+                or type(result.get("message_id")) is not int or result["message_id"] <= 0):
+            log("FEEDBACK", f"card delivery not confirmed kind={card.get('kind')}")
+            return False
+        card["message_id"] = result["message_id"]
+        self.feedback_cards = [*getattr(self, "feedback_cards", []), card][-32:]
+        self.persist_feedback_state()
+        log("FEEDBACK", f"card sent kind={card['kind']} message_id={card['message_id']}")
+        return True
+
+    def finish_feedback_card(self, card: dict[str, Any], text: str, outcome: str) -> None:
+        card.update(state="done", completion=text, outcome=outcome, edited=False, retry_at=0)
+        self.persist_feedback_state()
+        log("FEEDBACK", f"card outcome={outcome} kind={card.get('kind')} message_id={card.get('message_id')}")
+        self.edit_feedback_card(card)
+
+    def edit_feedback_card(self, card: dict[str, Any]) -> None:
+        if card.get("edited") or not card.get("completion"):
+            return
+        prefix = getattr(self.telegram, "with_emoji_prefix", lambda value, **_kw: value)
+        body = feedback_card_text(card, translate=self.tr)
+        try:
+            response = self.telegram.call(
+                "editMessageText", chat_id=self.config.chat_id, message_id=card["message_id"],
+                text=prefix(body[:2700] + "\n\n" + card["completion"], keep_completion_check=True),
+                reply_markup=json.dumps({"inline_keyboard": []}),
+                _request_timeout=10, _attempts=1, _wait_on_flood=False, _question_completion=True,
+            )
+            done = isinstance(response, dict) and response.get("ok") is True
+        except Exception as exc:  # noqa: BLE001
+            done = "message is not modified" in str(exc).lower()
+        if done:
+            card["edited"] = True
+        else:
+            card["retry_at"] = time.time() + 30
+        self.persist_feedback_state()
+
+    def check_feedback_drafts(self) -> None:
+        """T-261030-033: 열린 /feedback 창 카드 맞추기 + 새 초안 알림 + 사라진 초안 카드 닫기."""
+        repl = getattr(self, "repl", None)  # __new__ 경량 스텁(테스트)에는 repl 이 없다
+        if repl is None or not repl_supports_pane_features(repl):
+            return
+        try:
+            screen = repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            screen = None
+        if screen is not None:
+            self.sync_feedback_dialog_cards(screen)
+        tick = time.monotonic()
+        if tick - getattr(self, "feedback_scan_at", 0.0) >= feedback_scan_seconds():
+            self.feedback_scan_at = tick
+            self.scan_feedback_drafts()
+        pending = [card for card in getattr(self, "feedback_cards", [])
+                   if card.get("completion") and not card.get("edited")]
+        now = time.time() if pending else 0.0
+        for card in pending:
+            if now >= card.get("retry_at", 0):
+                self.edit_feedback_card(card)
+
+    def scan_feedback_drafts(self) -> None:
+        drafts = load_feedback_drafts()
+        if not getattr(self, "feedback_baseline", False):
+            # 처음 켤 때 이미 있던 초안은 「새 초안」이 아니다 — 기준으로만 적어 둔다.
+            self.feedback_seen = [draft["draft_id"] for draft in drafts][-500:]
+            self.feedback_baseline = True
+            self.persist_feedback_state()
+            return
+        present = {draft["draft_id"] for draft in drafts}
+        for card in list(getattr(self, "feedback_cards", [])):
+            if (card.get("kind") == "notice" and card.get("state") == "open"
+                    and (card.get("draft") or {}).get("draft_id") not in present):
+                self.finish_feedback_card(card, self.tr(FEEDBACK_GONE_TEXT), "gone")
+        failures = getattr(self, "feedback_failures", {})
+        self.feedback_failures = failures
+        for draft in drafts:
+            if draft["draft_id"] in self.feedback_seen:
+                continue
+            card = {"kind": "notice", "draft": self.feedback_draft_snapshot(draft), "sendable": True}
+            sent = self.send_feedback_card(card)
+            failures[draft["draft_id"]] = 0 if sent else failures.get(draft["draft_id"], 0) + 1
+            if sent or failures[draft["draft_id"]] >= 3:
+                self.feedback_seen = [*self.feedback_seen, draft["draft_id"]][-500:]
+                self.persist_feedback_state()
+
+    def feedback_review_draft(self, review: dict[str, Any]) -> dict[str, Any] | None:
+        if not (review.get("title") or review.get("env")):
+            return None
+        drafts = load_feedback_drafts()
+        if review.get("title"):
+            drafts = [draft for draft in drafts if feedback_draft_matches_title(draft, review["title"])]
+        if review.get("env"):
+            drafts = [draft for draft in drafts if feedback_draft_matches_env(draft, review["env"])]
+        return drafts[0] if len(drafts) == 1 else None
+
+    def sync_feedback_dialog_cards(self, screen: str) -> None:
+        parsed = parse_feedback_dialog(screen)
+        cards = [card for card in getattr(self, "feedback_cards", [])
+                 if card.get("kind") in {"list", "review"} and card.get("state") == "open"]
+        if parsed is None:
+            for card in cards:
+                self.finish_feedback_card(card, self.tr("피드백 창이 닫혔어요. 아무것도 보내지 않았어요."), "closed")
+            return
+        if parsed["screen"] == "sent":
+            for card in cards:
+                self.finish_feedback_card(
+                    card, self.tr("터미널에서 보냈어요. 영수증: {receipt}", receipt=parsed["receipt"]), "sent")
+            return
+        if parsed["screen"] == "list":
+            key = f"list:{parsed['signature']}"
+            card = {"kind": "list", "rows": parsed["rows"], "signature": parsed["signature"], "key": key}
+        else:
+            draft = self.feedback_review_draft(parsed)
+            if draft is None and not (parsed.get("title") or parsed.get("env")) and cards:
+                return  # 중간까지 내린 화면 — 신원이 안 보일 뿐 같은 창이다
+            key = f"review:{draft['draft_id']}" if draft else f"review:{parsed['signature']}"
+            card = {"kind": "review", "key": key, "sendable": draft is not None,
+                    "draft": self.feedback_draft_snapshot(draft) if draft else {"title": parsed.get("title")},
+                    "transcript": parsed.get("transcript")}
+        if any(existing.get("key") == key for existing in cards):
+            return
+        for existing in cards:
+            self.finish_feedback_card(existing, self.tr("피드백 창 화면이 바뀌었어요. 새 카드에서 골라 주세요."), "replaced")
+        self.send_feedback_card(card)
+
+    def handle_feedback_command(self, item: "QueueItem") -> None:
+        """폰의 /feedback — 엔터 1번으로 창을 연다. 일반 슬래시 경로(엔터 5번)는 보내기까지 누른다."""
+        if not repl_supports_pane_features(self.repl):
+            self.defer_native_pane_command(item, FEEDBACK_SLASH_COMMAND)
+            return
+        if not load_feedback_drafts():
+            self.telegram.send(self.tr("보낼 피드백 초안이 없어요. Claude가 초안을 저장하면 그때 보낼 수 있어요."))
+            self.queue.append_status(item, "sent", slash_command=FEEDBACK_SLASH_COMMAND)
+            return
+        try:
+            staged = self.stage_and_submit_slash_choice(FEEDBACK_SLASH_COMMAND, "")
+        except Exception as exc:  # noqa: BLE001
+            log("FEEDBACK", f"/feedback stage failed: {type(exc).__name__}")
+            staged = False
+        if not staged:
+            self.queue.append_status(item, "failed", slash_command=FEEDBACK_SLASH_COMMAND,
+                                     error="feedback stage not verified")
+            self.telegram.send(self.tr("터미널 입력칸을 확인하지 못해 /feedback 을 넣지 않았어요."))
+            return
+        self.queue.append_status(item, "injected", slash_command=FEEDBACK_SLASH_COMMAND,
+                                 **self.terminal_retry_status_extra(item))
+        self.queue.append_status(item, "sent", slash_command=FEEDBACK_SLASH_COMMAND)
+        ok, _parsed, screen = self.feedback_wait(lambda parsed, _screen: bool(parsed) and parsed["screen"] == "list")
+        if not ok:
+            self.telegram.send(self.tr("피드백 창이 열리는 걸 확인하지 못했어요. 터미널을 확인해 주세요."))
+            return
+        log("FEEDBACK", f"/feedback opened with one Enter update={item.update_id}")
+        self.sync_feedback_dialog_cards(screen)
+
+    def handle_feedback_callback(self, callback: dict[str, Any]) -> bool:
+        data = str(callback.get("data") or "")
+        if not data.startswith(FEEDBACK_CALLBACK + "::"):
+            return False
+        message = callback.get("message") or {}
+        if str((message.get("chat") or {}).get("id")) != str(self.config.chat_id):
+            return True
+        parts = data.split("::")
+        card = next((item for item in getattr(self, "feedback_cards", [])
+                     if len(parts) == 3 and item.get("message_id") == message.get("message_id")
+                     and item.get("token") == parts[1]), None)
+        if card is None:
+            toast = self.tr("이전 피드백 버튼이에요. 새 카드에서 골라 주세요.")
+        elif card.get("state") != "open":
+            toast = self.tr("이미 처리한 버튼이에요. 카드의 결과를 확인해 주세요.")
+        else:
+            try:
+                toast = self.apply_feedback_action(card, parts[2])
+            except Exception as exc:  # noqa: BLE001
+                log("FEEDBACK", f"action failed kind={card.get('kind')} error={type(exc).__name__}")
+                if card.get("state") == "sending":
+                    self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT), "unconfirmed")
+                toast = self.tr("처리하다 멈췄어요. 터미널을 확인해 주세요.")
+        try:
+            self.telegram.call("answerCallbackQuery", callback_query_id=callback.get("id"), text=toast)
+        except Exception as exc:  # noqa: BLE001
+            log("FEEDBACK", f"answerCallbackQuery failed: {type(exc).__name__}")
+        return True
+
+    def apply_feedback_action(self, card: dict[str, Any], action: str) -> str:
+        kind = card.get("kind")
+        if kind == "notice" and action == "later":
+            self.finish_feedback_card(card, self.tr(FEEDBACK_LATER_TEXT), "later")
+            return self.tr("나중에로 남겼어요")
+        if kind == "notice" and action == "send":
+            return self.feedback_drive_notice_send(card)
+        if kind == "review" and action == "later":
+            return self.feedback_drive_close(card, "review", self.tr(FEEDBACK_LATER_TEXT), "later")
+        if kind == "review" and action == "send" and card.get("sendable"):
+            return self.feedback_drive_review_send(card)
+        if kind == "list" and action == "close":
+            return self.feedback_drive_close(card, "list", self.tr("피드백 창을 닫았어요. 아무것도 보내지 않았어요."), "closed")
+        if kind == "list" and action.startswith("review") and action[len("review"):].isdigit():
+            return self.feedback_drive_list_review(card, int(action[len("review"):]))
+        return self.tr("버튼 값을 못 읽었어요")
+
+    def feedback_key(self, key: str) -> None:
+        with self.repl.composer_lock():
+            self.repl._submit_prompt_unlocked(key)
+
+    def feedback_screen(self) -> str:
+        try:
+            return self.repl.capture_pane(80)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def feedback_wait(self, predicate, timeout: float | None = None) -> tuple[bool, dict[str, Any] | None, str]:
+        """키를 누른 뒤 화면을 다시 읽는다. (조건을 만났는가, 해석, 화면)."""
+        deadline = time.monotonic() + (feedback_wait_seconds() if timeout is None else timeout)
+        while True:
+            screen = self.feedback_screen()
+            parsed = parse_feedback_dialog(screen)
+            if predicate(parsed, screen):
+                return True, parsed, screen
+            if time.monotonic() >= deadline:
+                return False, parsed, screen
+            time.sleep(feedback_poll_seconds())
+
+    @staticmethod
+    def feedback_composer_visible(screen: str) -> bool:
+        lines = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+        return parse_feedback_dialog(screen) is None and pane_composer_visible(lines)
+
+    def feedback_close_dialog(self) -> bool:
+        """Esc 로 창을 닫는다. 키마다 화면을 다시 읽고, 피드백 창이 아닌 화면에는 키를 안 누른다."""
+        for _ in range(3):
+            parsed = parse_feedback_dialog(self.feedback_screen())
+            if parsed is None:
+                break
+            self.feedback_key("Escape")
+            before = parsed["screen"]
+            self.feedback_wait(lambda now, _screen, before=before: now is None or now["screen"] != before)
+        return self.feedback_composer_visible(self.feedback_screen())
+
+    def feedback_review_matches(self, review: dict[str, Any], draft: dict[str, Any]) -> bool:
+        if review.get("title") and not feedback_draft_matches_title(draft, review["title"]):
+            return False
+        if review.get("env") and not feedback_draft_matches_env(draft, review["env"]):
+            return False
+        return True
+
+    def feedback_select_row(self, listed: dict[str, Any], target: int) -> dict[str, Any] | None:
+        signature, total = listed["signature"], len(listed["rows"] or [])
+        for _ in range(total + 2):
+            position = total if listed["selected"] is None else listed["selected"]
+            if position == target:
+                break
+            self.feedback_key("Down" if position < target else "Up")
+            ok, listed, _screen = self.feedback_wait(
+                lambda now, _screen, position=position: bool(now) and now["screen"] == "list"
+                and now["signature"] == signature and now["selected"] != position)
+            if not ok:
+                return None
+        else:
+            return None
+        self.feedback_key("Enter")
+        ok, review, _screen = self.feedback_wait(lambda now, _screen: bool(now) and now["screen"] == "review")
+        return review if ok else None
+
+    def feedback_send_review(self, card: dict[str, Any], draft: dict[str, Any],
+                             review: dict[str, Any]) -> tuple[str, str]:
+        screen = self.feedback_screen()
+        presses = 0
+        while review.get("footer") not in {"send", "next"}:
+            if presses >= FEEDBACK_SCROLL_MAX:
+                return "no_send_row", ""
+            presses += 1
+            before = screen
+            self.feedback_key("NPage")
+            _ok, parsed, screen = self.feedback_wait(lambda _now, now_screen, before=before: now_screen != before)
+            if parsed is None:
+                continue  # 상세만 보이는 중간 화면 — 한 번 더 내린다
+            if parsed["screen"] != "review":
+                return "changed", ""
+            if not self.feedback_review_matches(parsed, draft):
+                return "mismatch", ""
+            review = parsed
+        if review.get("selected") == "transcript":
+            self.feedback_key("Down")
+            ok, parsed, _screen = self.feedback_wait(
+                lambda now, _screen: bool(now) and now["screen"] == "review" and now.get("selected") == "send")
+            if not ok:
+                return "changed", ""
+            review = parsed
+        if not review.get("send_ready") or not feedback_draft_matches_env(draft, review.get("env")):
+            return "mismatch", ""
+        card.update(state="sending", sending_at=time.time())
+        self.persist_feedback_state()
+        self.feedback_key("Enter")
+        ok, sent, _screen = self.feedback_wait(lambda now, _screen: bool(now) and now["screen"] == "sent",
+                                               timeout=feedback_sent_wait_seconds())
+        return ("sent", sent["receipt"]) if ok else ("unconfirmed", "")
+
+    def feedback_send_and_finish(self, card: dict[str, Any], draft: dict[str, Any],
+                                 review: dict[str, Any] | None) -> str:
+        outcome, receipt = ("mismatch", "")
+        if review is not None and self.feedback_review_matches(review, draft):
+            outcome, receipt = self.feedback_send_review(card, draft, review)
+        if outcome == "unconfirmed":
+            self.feedback_hold_until = time.time() + feedback_unconfirmed_hold_seconds()
+            self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT), outcome)
+            return self.tr("보냈는지 확인하지 못했어요")
+        closed = self.feedback_close_dialog()
+        tail = "\n" + (self.tr("피드백 창은 닫았어요.") if closed
+                       else self.tr("피드백 창을 다 닫지 못했어요. 터미널을 확인해 주세요."))
+        if outcome == "sent":
+            self.finish_feedback_card(card, "✅ " + self.tr("보냈어요. 영수증: {receipt}", receipt=receipt) + tail, outcome)
+            return self.tr("보냈어요")
+        self.finish_feedback_card(card, self.tr("터미널 화면이 이 초안과 달라서 보내지 않았어요.") + tail, outcome)
+        return self.tr("보내지 않았어요")
+
+    def feedback_drive_notice_send(self, card: dict[str, Any]) -> str:
+        draft = self.feedback_draft_by_id((card.get("draft") or {}).get("draft_id"))
+        if draft is None:
+            self.finish_feedback_card(card, self.tr(FEEDBACK_GONE_TEXT), "gone")
+            return self.tr("이 초안은 이제 없어요")
+        if screen_has_feedback_dialog(self.feedback_screen()):
+            return self.tr("피드백 창이 이미 열려 있어요. 열린 창의 카드에서 골라 주세요.")
+        if self.busy_state() != "idle":
+            return self.tr("터미널이 일하는 중이라 지금은 창을 열지 않았어요. 끝난 뒤 다시 눌러 주세요.")
+        screen = self.feedback_screen()
+        if not self.feedback_composer_visible(screen):
+            return self.tr("터미널 입력칸이 안 보여서 창을 열지 않았어요. 터미널을 확인해 주세요.")
+        if composer_residual_text(screen):
+            return self.tr("터미널 입력칸에 쓰던 글이 있어서 창을 열지 않았어요.")
+        try:
+            staged = self.stage_and_submit_slash_choice(FEEDBACK_SLASH_COMMAND, "")
+        except Exception as exc:  # noqa: BLE001
+            log("FEEDBACK", f"notice stage failed: {type(exc).__name__}")
+            staged = False
+        if not staged:
+            return self.tr("터미널 입력칸을 확인하지 못해 창을 열지 않았어요.")
+        ok, listed, _screen = self.feedback_wait(lambda now, _screen: bool(now) and now["screen"] == "list")
+        rows = (listed or {}).get("rows") or []
+        matches = [index for index, row in enumerate(rows) if feedback_draft_matches_row(draft, row["title"])]
+        if not ok or len(matches) != 1:
+            closed = self.feedback_close_dialog()
+            self.finish_feedback_card(card, self.tr("목록에서 이 초안을 하나로 찾지 못해 보내지 않았어요.") + (
+                "" if closed else "\n" + self.tr("피드백 창을 다 닫지 못했어요. 터미널을 확인해 주세요.")), "missing")
+            return self.tr("보내지 않았어요")
+        return self.feedback_send_and_finish(card, draft, self.feedback_select_row(listed, matches[0]))
+
+    def feedback_drive_review_send(self, card: dict[str, Any]) -> str:
+        draft = self.feedback_draft_by_id((card.get("draft") or {}).get("draft_id"))
+        review = parse_feedback_dialog(self.feedback_screen())
+        if draft is None:
+            self.finish_feedback_card(card, self.tr(FEEDBACK_GONE_TEXT), "gone")
+            return self.tr("이 초안은 이제 없어요")
+        if review is None or review["screen"] != "review" or not self.feedback_review_matches(review, draft):
+            self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+            return self.tr("화면이 바뀌었어요")
+        return self.feedback_send_and_finish(card, draft, review)
+
+    def feedback_drive_close(self, card: dict[str, Any], expect: str, text: str, outcome: str) -> str:
+        parsed = parse_feedback_dialog(self.feedback_screen())
+        if parsed is None or parsed["screen"] != expect:
+            self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+            return self.tr("화면이 바뀌었어요")
+        if self.feedback_close_dialog():
+            self.finish_feedback_card(card, text, outcome)
+            return self.tr("닫았어요")
+        self.finish_feedback_card(card, self.tr("피드백 창을 다 닫지 못했어요. 터미널을 확인해 주세요."), "unclosed")
+        return self.tr("다 닫지 못했어요")
+
+    def feedback_drive_list_review(self, card: dict[str, Any], number: int) -> str:
+        listed = parse_feedback_dialog(self.feedback_screen())
+        if (listed is None or listed["screen"] != "list" or listed["signature"] != card.get("signature")
+                or listed.get("rows") is None or not 1 <= number <= len(listed["rows"])):
+            self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+            return self.tr("화면이 바뀌었어요")
+        if self.feedback_select_row(listed, number - 1) is None:
+            self.finish_feedback_card(card, self.tr("검토 창이 열리는 걸 확인하지 못했어요. 터미널을 확인해 주세요."), "unconfirmed")
+            return self.tr("검토 창을 확인하지 못했어요")
+        self.finish_feedback_card(card, self.tr("검토 창을 열었어요. 새 카드에서 보내기나 나중에를 골라 주세요."), "review")
+        self.sync_feedback_dialog_cards(self.feedback_screen())
+        return self.tr("검토 창을 열었어요")
+
     def handle_pane_choice_callback(self, callback) -> bool:
         """버튼 탭 → pane 에 숫자 1자 주입. 화면이 그새 바뀌었으면 주입하지 않는다."""
         data = str(callback.get("data") or "")
@@ -13929,7 +14995,7 @@ class Bridge:
         if not (1 <= number <= CHOICE_MAX_OPTIONS):
             return self.tr('그 번호는 보낼 수 없어요')
         try:
-            screen = self.repl.capture_pane(80)
+            screen = self.capture_question_screen(80)
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"capture before inject failed: {exc}")
             return self.tr('지금 화면을 못 읽었어요')
@@ -14100,6 +15166,16 @@ class Bridge:
             and source.get("native_fingerprint") == hashlib.sha256(json.dumps(
                 questions[0], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         )
+
+    def capture_question_screen(self, lines: int = 80) -> str:
+        """질문 판독용 캡처 (T-261025-028 재착수).
+
+        tmux 어댑터는 머리표가 밀린 여러 개 고르기 화면을 창을 잠깐 늘려 읽는다. 그 기능이 없는
+        어댑터(ConPTY·시험용 가짜)나 글자가 아닌 결과면 종전 캡처를 쓴다.
+        """
+        capture = getattr(self.repl, "capture_question_pane", None)
+        screen = capture(lines) if callable(capture) else None
+        return screen if isinstance(screen, str) else self.repl.capture_pane(lines)
 
     def parse_question_screen(self, screen: str, *, expected_native=None):
         if expected_native:
@@ -14368,7 +15444,7 @@ class Bridge:
         self.settle_open_question_from_transcript()
         self.refresh_question_cards()
         try:
-            screen = self.repl.capture_pane(80)
+            screen = self.capture_question_screen(80)
         except Exception:  # noqa: BLE001
             return
         self.question_capture_ok_at = time.monotonic()
@@ -15789,7 +16865,7 @@ class Bridge:
         staging·모달회피·재시도는 그대로 공유하고 프롬프트 문자열만 달라진다
         (/model 경로는 위 얇은 래퍼라 동작 무변경).
         """
-        prompt = f"{command} {value}"
+        prompt = f"{command} {value}" if value else command  # T-261030-033: /feedback 은 인자가 없다
         lock = getattr(self.repl, "composer_lock", None)
         clear = getattr(self.repl, "_clear_composer_unlocked", None)
         stage = getattr(self.repl, "_stage_prompt_unlocked", None)
@@ -15799,6 +16875,9 @@ class Bridge:
 
         attempts = int_env("CLB_MODEL_INJECT_RETRIES", 2, minimum=1)
         stage_settle = max(0.0, float(os.environ.get("CLB_MODEL_STAGE_SETTLE_SEC", "0.1")))
+        # T-261030-033: 오래 쉰 세션은 붙여넣은 글자가 1~2초 뒤에 뜬다(10/31 07:30 작업 노드, 격리 재현
+        # 1.3~1.8초). 한 번만 보면 착지 실패로 끝나고 재시도가 두 번째 붙여넣기를 한다 — 기한까지 다시 본다.
+        landing_wait = max(0.0, float(os.environ.get("CLB_SLASH_LANDING_WAIT_SEC", "5")))
         escape_used = False
         with lock():
             for attempt in range(1, attempts + 1):
@@ -15828,20 +16907,32 @@ class Bridge:
                     continue
 
                 stage(prompt)
+                staged_at = time.monotonic()
                 if stage_settle:
                     time.sleep(stage_settle)
-                screen = self.repl.capture_pane(80)
-                modal = pane_interstitial(screen)
+                while True:
+                    screen = self.repl.capture_pane(80)
+                    modal = pane_interstitial(screen)
+                    typed, menu_choice = composer_input_line(screen)
+                    # 인자 없는 슬래시는 입력줄 아래 명령 메뉴가 뜬다 — 입력줄과 메뉴 커서가 같은 명령일 때만 Enter.
+                    landed = composer_residual_text(screen) == prompt or (
+                        not value and typed == prompt and menu_choice in {None, command})
+                    if modal or landed or time.monotonic() - staged_at >= landing_wait:
+                        break
+                    time.sleep(max(stage_settle, 0.05))
                 if modal:
                     if not escape_used:
                         submit("Escape")
                         escape_used = True
                     log("INJECT", f"{command} stage diverted to {modal} attempt={attempt}")
                     continue
-                if composer_residual_text(screen) == prompt:
+                if landed:
+                    waited = time.monotonic() - staged_at
+                    if waited >= 1.0:
+                        log("INJECT", f"{command} composer landed late after={waited:.1f}s attempt={attempt}")
                     submit("Enter")
                     return True
-                log("INJECT", f"{command} composer landing not observed attempt={attempt}")
+                log("INJECT", f"{command} composer landing not observed attempt={attempt} waited={landing_wait:g}s")
         return False
 
     def submit_model_alias(self, alias: str) -> None:
@@ -18696,11 +19787,12 @@ class Bridge:
             # T-260827-038 ③: isMeta 레코드는 사람 입력이 아니다 — 하네스가 턴 중간에
             # 끼워 넣는 보조물([Image: original …] 치수 노트 등, transcript 실측
             # isMeta=true). 이걸 direct_human_input 으로 읽으면 큐에 대기 중인 진짜
-            # 텔레그램 입력이 supersede 로 증발한다.
+            # 텔레그램 입력이 supersede 로 증발한다. 압축 요약(isCompactSummary)도 같다 (T-261031-003).
             if (
                 not nonce
                 and not record.get("isSidechain")
                 and not record.get("isMeta")
+                and not record.get("isCompactSummary")
                 and content_text(content)
             ):
                 self.supersede_stale_queued_inputs(
@@ -20298,6 +21390,8 @@ class Bridge:
                         continue
                     # 화면 선택지 버튼 (T-260802-042) — 선택형 슬래시 표보다 먼저 본다.
                     # 이쪽은 사전등록 없이 화면에서 유도한 선택지라 prefix 가 겹치지 않는다.
+                    if self.handle_feedback_callback(cb):
+                        continue
                     if self.handle_pane_choice_callback(cb):
                         continue
                     # 선택형 슬래시 inline keyboard 선택 → 비대화형 인자형 적용
@@ -20328,6 +21422,7 @@ class Bridge:
             self.check_send_now_button()
             self.check_busy_stuck_rebind()
             self.check_approval_stall_notify()
+            self.check_feedback_drafts()
             self.retry_media_downloads()
             self.retry_pending_send()
             self.service_suggested_loop_once()
