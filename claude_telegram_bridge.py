@@ -3560,12 +3560,19 @@ def _declared_confirm(lines):
 # T-261024-018: the safety-check dialog draws it inside a │ border and wraps it on a
 # narrow pane ("…request in\n│ 0:26, to avoid…"), so words may be split by a newline
 # plus border. Unmatched, the countdown stayed in the signature and every redraw sent a new card.
+# T-261031-020: 2.1.31x 는 문구를 「will automatically block this request in N:NN, to avoid holding up an
+# unattended session」으로 바꿨다(10/31 제어 노드 23:50·23:59 실측, 「Dangerous rm operation …」 안전 검사창).
+# 옛 문구만 맞추던 동안 초읽기가 서명에 남아 폰 버튼이 매초 「화면이 바뀌었어요」로 거절됐다 — 두 문구를 다 받는다.
 _AUTO_DENY_SEP = r"(?:[ \t]*\n[ \t]*(?:│[ \t]*)?|[ \t]+)"
 CHOICE_AUTO_DENY_RE = re.compile(
     r"^((?:│[ \t]*)?(?:⚠️?[ \t]+)?"
-    + _AUTO_DENY_SEP.join("Claude Code will automatically deny this request in".split())
+    + _AUTO_DENY_SEP.join("Claude Code will automatically".split())
+    + _AUTO_DENY_SEP + r"(?:deny|block)" + _AUTO_DENY_SEP
+    + _AUTO_DENY_SEP.join("this request in".split())
     + _AUTO_DENY_SEP + r")(\d{1,3}):([0-5]\d)(?=,"
-    + _AUTO_DENY_SEP + _AUTO_DENY_SEP.join("to avoid blocking progress on an unattended session".split())
+    + _AUTO_DENY_SEP + _AUTO_DENY_SEP.join("to avoid".split()) + _AUTO_DENY_SEP
+    + r"(?:" + _AUTO_DENY_SEP.join("blocking progress on".split()) + r"|" + _AUTO_DENY_SEP.join("holding up".split()) + r")"
+    + _AUTO_DENY_SEP + _AUTO_DENY_SEP.join("an unattended session".split())
     + ")", re.MULTILINE,
 )
 # T-261023-019: 남은 시간이 이 이하인 승인창은 버튼 카드 대신 무음 한 줄 알림으로 보낸다.
@@ -4041,6 +4048,20 @@ FEEDBACK_GONE_TEXT = "이 초안은 이제 이 노드에 없어요(이미 보냈
 FEEDBACK_LATER_TEXT = "나중에로 남겼어요. 초안은 이 노드에 그대로 있어요. 보내려면 /feedback 을 보내 주세요."
 FEEDBACK_CHANGED_TEXT = "화면이 카드와 달라서 아무 키도 누르지 않았어요."
 FEEDBACK_UNCONFIRMED_TEXT = "보냈는지 확인하지 못했어요. 터미널을 확인해 주세요. 다시 보내지 않았어요."
+# ── 초안 상자 (T-261031-014) ──────────────────────────────────────────────────────────
+# 실측 2026-10-31 21:31~21:33 KST 작업 노드(tui=fullscreen, 55열): SendFeedback 도구가 초안을 저장한 턴이 끝나면 입력줄·상태줄
+#   자리에 둥근 상자가 뜬다 — 「✻ Bug report drafted: <제목> …」 + 초안 요약(안쪽 세로줄) + 「1 to review · 2 to send · 0 to dismiss」.
+#   상자가 떠 있는 동안 붙여 넣은 글의 첫 글자가 키로 먹힌다(폰 「2」 → 초안이 확인 없이 발송, 21:59). 2 = 검토 창 없이 바로
+#   보내기, 1 = 검토 창, 0 = 상자 닫기(초안 파일은 남는다). 확인창 표(interstitial-patterns.tsv)에 넣지 않는 이유는 /feedback
+#   창과 같다 — 표는 화면 어디든 글자로 맞추고 브릿지가 Escape 를 보낸다. 셸 검출기(detect_feedback_screen ⑤)와 같은 규칙이다.
+FEEDBACK_DRAFTED_FOOTER = "1 to review · 2 to send · 0 to dismiss"
+FEEDBACK_DRAFTED_HEAD_RE = re.compile(r"^✻\s*(?P<type>[A-Z][A-Za-z ]+?) drafted:\s*(?P<title>\S.*)$")
+FEEDBACK_BOX_TOP_RE = re.compile(r"^╭─{8,}╮$")
+FEEDBACK_BOX_BOTTOM_RE = re.compile(r"^╰─{8,}╯$")
+FEEDBACK_DRAFTED_BOX_MAX = 12  # 꼬리표 위로 머리줄을 찾는 최대 줄 수
+FEEDBACK_DRAFTED_TAIL_MAX = 2  # 상자 아래 허용 줄 수 — 힌트 줄(「Ctrl+Y to paste deleted text」) 실측 1줄
+FEEDBACK_DRAFTED_KEYS = {"send": "2", "review": "1", "dismiss": "0"}
+FEEDBACK_DRAFTED_DISMISSED_TEXT = "초안 상자를 닫았어요. 아무것도 보내지 않았어요. 초안은 이 노드에 그대로 있어요. 보내려면 /feedback 을 보내 주세요."
 
 
 def feedback_wait_seconds() -> float:
@@ -4208,6 +4229,53 @@ def _feedback_list(lines: list[str], footer_at: int) -> dict[str, Any] | None:
     }
 
 
+def _feedback_box_text(line: str) -> str:
+    """둥근 상자 줄의 세로 테두리(│)를 벗긴 글자. 초안 요약 줄은 안쪽 세로줄(│ │)이 하나 더 있다."""
+    text = line.strip()
+    if text.startswith("│"):
+        text = text[1:]
+    if text.endswith("│"):
+        text = text[:-1]
+    return text.strip()
+
+
+def _feedback_drafted(lines: list[str]) -> dict[str, Any] | None:
+    """화면 맨 아래 초안 상자(「✻ … drafted:」 + 「1 to review · 2 to send · 0 to dismiss」)면 그 구조 (T-261031-014).
+
+    규칙은 셸 검출기(tmux-repl-busy.sh detect_feedback_screen ⑤)와 같다: 끝 1~3줄 안에 상자 아래 테두리 ╰─╯, 그 바로 위
+    줄이 꼬리표, 위로 12줄 안에 「✻ <종류> drafted: <제목>」 머리줄과 그 바로 위 상자 위 테두리 ╭─╮, 사이 줄은 전부 상자
+    줄(│). 상자 아래 줄은 힌트 2줄까지만 — 입력줄(❯)·가로줄·상자 줄이 아래에 있으면 상자가 아니다(기록 인용).
+    """
+    bottom = -1
+    for offset in range(1, min(FEEDBACK_DRAFTED_TAIL_MAX + 1, len(lines)) + 1):
+        if FEEDBACK_BOX_BOTTOM_RE.match(lines[len(lines) - offset]):
+            bottom = len(lines) - offset
+            break
+    if bottom < 2:
+        return None
+    for line in lines[bottom + 1:]:
+        if line.startswith(("❯", "╭", "╰", "│")) or CHOICE_RULE_RE.match(line):
+            return None
+    if _feedback_box_text(lines[bottom - 1]) != FEEDBACK_DRAFTED_FOOTER:
+        return None
+    for index in range(bottom - 2, max(-1, bottom - 2 - FEEDBACK_DRAFTED_BOX_MAX), -1):
+        if not lines[index].startswith("│"):
+            return None
+        match = FEEDBACK_DRAFTED_HEAD_RE.match(_feedback_box_text(lines[index]))
+        if not match:
+            continue
+        if index == 0 or not FEEDBACK_BOX_TOP_RE.match(lines[index - 1]):
+            return None
+        title = match.group("title").strip()
+        summary = [_feedback_box_text(line).lstrip("│").strip() for line in lines[index + 1:bottom - 1]]
+        identity = "\n".join([match.group("type"), title, *summary])
+        return {
+            "kind": "feedback", "screen": "drafted", "type": match.group("type"), "title": title,
+            "summary": summary, "signature": hashlib.sha256(identity.encode()).hexdigest()[:16],
+        }
+    return None
+
+
 def parse_feedback_dialog(screen: str) -> dict[str, Any] | None:
     """화면 맨 아래가 /feedback 창(목록·검토·보낸 뒤)이면 그 구조, 아니면 None (T-261030-033)."""
     lines = _feedback_lines(screen)
@@ -4220,6 +4288,9 @@ def parse_feedback_dialog(screen: str) -> dict[str, Any] | None:
             return {"kind": "feedback", "screen": "sent", "receipt": match.group("receipt"),
                     "signature": match.group("receipt")}
         return None
+    drafted = _feedback_drafted(lines)
+    if drafted is not None:
+        return drafted
     footer, footer_at = _feedback_footer(lines)
     if footer == "list":
         return _feedback_list(lines, footer_at)
@@ -4326,9 +4397,15 @@ def feedback_card_text(card: dict[str, Any], translate=lambda text: text) -> str
                  translate("피드백 창이 열려 있는 동안 새 메시지는 기다려요.")]
         return "\n".join(rows)
     draft = card.get("draft") or {}
-    head = (translate("피드백 초안이 저장됐어요. 아직 보내지 않았어요.") if kind == "notice"
-            else translate("터미널에 피드백 검토 창이 열려 있어요. 아직 보내지 않았어요."))
+    if kind == "notice":
+        head = translate("피드백 초안이 저장됐어요. 아직 보내지 않았어요.")
+    elif kind == "drafted":
+        head = translate("터미널에 피드백 초안 상자가 떠 있어요. 아직 보내지 않았어요.")
+    else:
+        head = translate("터미널에 피드백 검토 창이 열려 있어요. 아직 보내지 않았어요.")
     rows = [head, ""]
+    if kind == "drafted":
+        rows += [f"✻ {card.get('box_type') or ''} drafted: {card.get('box_title') or ''}".rstrip(), ""]
     meta = [f"{translate('종류')}: {draft['type']}" if draft.get("type") else ""]
     for key, label in (("area", "분야"), ("failure_mode", "실패 유형"), ("task_category", "작업")):
         if draft.get(key):
@@ -4343,6 +4420,15 @@ def feedback_card_text(card: dict[str, Any], translate=lambda text: text) -> str
             details = details[:FEEDBACK_CARD_TEXT_MAX].rstrip() + "\n" + translate("…(나머지는 위 조각에 있어요)")
         rows += ["", details]
     rows.append("")
+    if kind == "drafted":
+        if card.get("sendable"):
+            rows.append(translate("보내기 = 터미널에 2를 눌러요. 검토 창 없이 바로 이 초안과 초안을 만든 대화 기록, 환경 정보가 Anthropic 에 가요."))
+        else:
+            rows.append(translate("어떤 초안인지 화면과 초안 파일로 확인하지 못해 폰에서는 보낼 수 없어요. 검토나 닫기만 돼요."))
+        rows.append(translate("검토 = 터미널에 1을 눌러 검토 창을 열어요. 그다음 새 카드를 드려요."))
+        rows.append(translate("닫기 = 터미널에 0을 눌러 상자만 닫아요. 초안은 이 노드에 남아요."))
+        rows.append(translate("상자가 떠 있는 동안 새 메시지는 기다려요. 글을 넣으면 첫 글자가 이 상자의 키로 먹혀요."))
+        return "\n".join(rows)
     if not card.get("sendable"):
         rows.append(translate("어떤 초안인지 화면과 초안 파일로 확인하지 못해 폰에서는 보낼 수 없어요. 터미널에서 확인해 주세요."))
     elif kind == "notice":
@@ -4368,6 +4454,9 @@ def feedback_card_keyboard(card: dict[str, Any], translate=lambda text: text) ->
             rows.append([button(label if len(label) <= 48 else label[:47] + "…", f"review{index}")])
         rows.append([button(translate("닫기"), "close")])
         return rows
+    if card.get("kind") == "drafted":
+        row = [button(translate("검토"), "review"), button(translate("닫기"), "dismiss")]
+        return [[button(translate("보내기"), "send"), *row] if card.get("sendable") else row]
     if not card.get("sendable"):
         return [[button(translate("나중에"), "later")]]
     return [[button(translate("보내기"), "send"), button(translate("나중에"), "later")]]
@@ -14667,17 +14756,25 @@ class Bridge:
     def sync_feedback_dialog_cards(self, screen: str) -> None:
         parsed = parse_feedback_dialog(screen)
         cards = [card for card in getattr(self, "feedback_cards", [])
-                 if card.get("kind") in {"list", "review"} and card.get("state") == "open"]
+                 if card.get("kind") in {"list", "review", "drafted"} and card.get("state") == "open"]
         if parsed is None:
             for card in cards:
-                self.finish_feedback_card(card, self.tr("피드백 창이 닫혔어요. 아무것도 보내지 않았어요."), "closed")
+                self.finish_feedback_card(card, self.feedback_drafted_closed_text(card) if card.get("kind") == "drafted"
+                                          else self.tr("피드백 창이 닫혔어요. 아무것도 보내지 않았어요."), "closed")
             return
         if parsed["screen"] == "sent":
             for card in cards:
                 self.finish_feedback_card(
                     card, self.tr("터미널에서 보냈어요. 영수증: {receipt}", receipt=parsed["receipt"]), "sent")
             return
-        if parsed["screen"] == "list":
+        if parsed["screen"] == "drafted":
+            # T-261031-014: 초안 상자 — 머리줄 제목으로 초안 파일을 하나로 맞출 때만 보내기 버튼.
+            draft = self.feedback_drafted_draft(parsed)
+            key = f"drafted:{parsed['signature']}"
+            card = {"kind": "drafted", "key": key, "signature": parsed["signature"], "sendable": draft is not None,
+                    "box_type": parsed["type"], "box_title": parsed["title"],
+                    "draft": self.feedback_draft_snapshot(draft) if draft else {"title": parsed["title"]}}
+        elif parsed["screen"] == "list":
             key = f"list:{parsed['signature']}"
             card = {"kind": "list", "rows": parsed["rows"], "signature": parsed["signature"], "key": key}
         else:
@@ -14698,6 +14795,17 @@ class Bridge:
         """폰의 /feedback — 엔터 1번으로 창을 연다. 일반 슬래시 경로(엔터 5번)는 보내기까지 누른다."""
         if not repl_supports_pane_features(self.repl):
             self.defer_native_pane_command(item, FEEDBACK_SLASH_COMMAND)
+            return
+        screen = self.feedback_screen()
+        parsed = parse_feedback_dialog(screen)
+        if parsed is not None:
+            # T-261031-014: 상자·창이 이미 떠 있으면 붙여 넣지 않는다 — 붙여 넣은 글의 첫 글자가 상자의 키로 먹힌다.
+            self.sync_feedback_dialog_cards(screen)
+            self.queue.append_status(item, "sent", slash_command=FEEDBACK_SLASH_COMMAND)
+            self.telegram.send(self.tr("피드백 초안 상자가 이미 떠 있어요. 그 카드에서 골라 주세요.")
+                               if parsed["screen"] == "drafted"
+                               else self.tr("피드백 창이 이미 열려 있어요. 열린 창의 카드에서 골라 주세요."))
+            log("FEEDBACK", f"/feedback not pasted: {parsed['screen']} already open update={item.update_id}")
             return
         if not load_feedback_drafts():
             self.telegram.send(self.tr("보낼 피드백 초안이 없어요. Claude가 초안을 저장하면 그때 보낼 수 있어요."))
@@ -14767,6 +14875,8 @@ class Bridge:
             return self.feedback_drive_close(card, "list", self.tr("피드백 창을 닫았어요. 아무것도 보내지 않았어요."), "closed")
         if kind == "list" and action.startswith("review") and action[len("review"):].isdigit():
             return self.feedback_drive_list_review(card, int(action[len("review"):]))
+        if kind == "drafted" and action in FEEDBACK_DRAFTED_KEYS and (action != "send" or card.get("sendable")):
+            return self.feedback_drive_drafted(card, action)
         return self.tr("버튼 값을 못 읽었어요")
 
     def feedback_key(self, key: str) -> None:
@@ -14802,7 +14912,8 @@ class Bridge:
             parsed = parse_feedback_dialog(self.feedback_screen())
             if parsed is None:
                 break
-            self.feedback_key("Escape")
+            # T-261031-014: 초안 상자는 Esc 가 아니라 0(닫기)으로 닫는다 — Esc 동작은 실측 전이다.
+            self.feedback_key("0" if parsed["screen"] == "drafted" else "Escape")
             before = parsed["screen"]
             self.feedback_wait(lambda now, _screen, before=before: now is None or now["screen"] != before)
         return self.feedback_composer_visible(self.feedback_screen())
@@ -14883,6 +14994,78 @@ class Bridge:
             return self.tr("보냈어요")
         self.finish_feedback_card(card, self.tr("터미널 화면이 이 초안과 달라서 보내지 않았어요.") + tail, outcome)
         return self.tr("보내지 않았어요")
+
+    def feedback_drafted_draft(self, parsed: dict[str, Any]) -> dict[str, Any] | None:
+        """상자 머리줄 제목(끝이 … 이면 앞부분)과 하나로 맞는 초안 파일 (T-261031-014)."""
+        drafts = [draft for draft in load_feedback_drafts() if feedback_draft_matches_row(draft, parsed.get("title"))]
+        return drafts[0] if len(drafts) == 1 else None
+
+    def feedback_drafted_closed_text(self, card: dict[str, Any]) -> str:
+        draft_id = (card.get("draft") or {}).get("draft_id")
+        if draft_id and self.feedback_draft_by_id(draft_id) is None:
+            return self.tr("초안 상자가 사라졌고 초안 파일도 없어요. 터미널에서 보낸 것으로 보여요.")
+        return self.tr("초안 상자가 닫혔어요. 아무것도 보내지 않았어요. 초안은 이 노드에 그대로 있어요.")
+
+    def feedback_drive_drafted(self, card: dict[str, Any], action: str) -> str:
+        """초안 상자 카드의 버튼 → 터미널 키 1자(보내기 2·검토 1·닫기 0). 키마다 화면을 다시 읽는다 (T-261031-014)."""
+        parsed = parse_feedback_dialog(self.feedback_screen())
+        if parsed is None or parsed["screen"] != "drafted" or parsed["signature"] != card.get("signature"):
+            self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+            return self.tr("화면이 바뀌었어요")
+        draft_id = (card.get("draft") or {}).get("draft_id")
+        if action == "send":
+            if self.feedback_draft_by_id(draft_id) is None:
+                self.finish_feedback_card(card, self.tr(FEEDBACK_GONE_TEXT), "gone")
+                return self.tr("이 초안은 이제 없어요")
+            card.update(state="sending", sending_at=time.time())
+            self.persist_feedback_state()
+        self.feedback_key(FEEDBACK_DRAFTED_KEYS[action])
+        if action == "send":
+            return self.feedback_finish_drafted_send(card, draft_id)
+        ok, now, screen = self.feedback_wait(lambda now, _screen: now is None or now["screen"] != "drafted")
+        if action == "review":
+            if ok and now is not None and now["screen"] in {"review", "list"}:
+                self.finish_feedback_card(card, self.tr("검토 창을 열었어요. 새 카드에서 보내기나 나중에를 골라 주세요."), "review")
+                self.sync_feedback_dialog_cards(screen)
+                return self.tr("검토 창을 열었어요")
+            self.finish_feedback_card(card, self.tr("검토 창이 열리는 걸 확인하지 못했어요. 터미널을 확인해 주세요."), "unconfirmed")
+            return self.tr("검토 창을 확인하지 못했어요")
+        if ok and now is None and self.feedback_composer_visible(screen):
+            kept = not draft_id or self.feedback_draft_by_id(draft_id) is not None
+            self.finish_feedback_card(card, self.tr(FEEDBACK_DRAFTED_DISMISSED_TEXT) if kept else self.tr(FEEDBACK_GONE_TEXT),
+                                      "dismissed")
+            return self.tr("닫았어요")
+        self.finish_feedback_card(card, self.tr("초안 상자가 닫히는 걸 확인하지 못했어요. 터미널을 확인해 주세요."), "unconfirmed")
+        return self.tr("다 닫지 못했어요")
+
+    def feedback_finish_drafted_send(self, card: dict[str, Any], draft_id: object) -> str:
+        """2 를 누른 뒤: 보낸 뒤 화면(영수증) 또는 초안 파일 소멸이 보일 때까지 기다린다. 상자가 그대로면 보냈다고 하지 않는다."""
+        ok, now, screen = self.feedback_wait(
+            lambda now, _screen: (now is not None and now["screen"] == "sent") or self.feedback_draft_by_id(draft_id) is None,
+            timeout=feedback_sent_wait_seconds())
+        if not ok and now is not None and now["screen"] == "drafted":
+            self.feedback_hold_until = time.time() + feedback_unconfirmed_hold_seconds()
+            self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT), "unconfirmed")
+            return self.tr("보냈는지 확인하지 못했어요")
+        receipt = now["receipt"] if now is not None and now["screen"] == "sent" else ""
+        if not receipt:
+            match = FEEDBACK_SENT_RE.search(" ".join(_feedback_lines(screen)[-8:]))
+            receipt = match.group("receipt") if match else ""
+        lines = _feedback_lines(screen)
+        if now is None and lines and lines[-1] == FEEDBACK_CONTINUE:
+            self.feedback_key("Escape")  # 영수증 줄이 없는 「Any key to continue」 변형 — 아무 키로 닫는다(실측 전)
+            self.feedback_wait(lambda _now, now_screen: self.feedback_composer_visible(now_screen))
+        closed = self.feedback_close_dialog()
+        tail = "\n" + (self.tr("피드백 창은 닫았어요.") if closed
+                       else self.tr("피드백 창을 다 닫지 못했어요. 터미널을 확인해 주세요."))
+        if ok or receipt:
+            text = "✅ " + (self.tr("보냈어요. 영수증: {receipt}", receipt=receipt) if receipt
+                           else self.tr("보냈어요. 초안 파일이 사라졌어요(영수증은 화면에서 못 읽었어요)."))
+            self.finish_feedback_card(card, text + tail, "sent")
+            return self.tr("보냈어요")
+        self.feedback_hold_until = time.time() + feedback_unconfirmed_hold_seconds()
+        self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT) + tail, "unconfirmed")
+        return self.tr("보냈는지 확인하지 못했어요")
 
     def feedback_drive_notice_send(self, card: dict[str, Any]) -> str:
         draft = self.feedback_draft_by_id((card.get("draft") or {}).get("draft_id"))
