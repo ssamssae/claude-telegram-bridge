@@ -16,6 +16,28 @@ claude-telegram-bridge setup --language ko
 설정 도구가 본인 채팅을 연결하고 서비스와 필요한 세션 연결을 준비합니다.
 이미 설치했다면 새로 설정할 필요 없이 봇에 `/language ko`를 보내면 됩니다.
 
+## 제작자와 똑같이 쓰기 (한 줄 설치)
+
+```bash
+pipx install claude-telegram-bridge && claude-telegram-bridge setup --like-author --language ko
+```
+
+사람 손이 필요한 일은 둘뿐입니다. BotFather에서 봇을 만들어 토큰을 받는 것과, 그 봇에 `/start`를 보내는 것.
+나머지는 자동입니다. 설정 파일, 아래 스위치 4개, 브릿지 훅 전부, 상시 서비스와 워치독, tmux 세션과 그 안의 Claude 실행,
+그리고 폰→터미널→폰·터미널→폰 두 방향을 실제로 한 번씩 돌려 보는 자가 점검까지 합니다.
+대화식 설정 도구도 첫 질문으로 `Use the author's setup (recommended)? [Y/n]`을 묻고 기본값은 예입니다.
+
+| 스위치 | 켜지는 것 |
+| --- | --- |
+| `CLB_BUSY_INJECT=1` | Claude가 바쁜 중에도 폰 글이 입력줄에 바로 올라가고, 오래 기다리면 바로 보내기 버튼이 붙음 |
+| `CLB_FLOW_MIRROR=1` | 작업 흐름 카드와 그 카드의 중지 버튼, 터미널에서 친 글의 터미널 입력·결과 카드 |
+| `CLB_ASKUSER_CARDS_ENABLED=1` | 터미널의 질문 창이 폰에 답할 수 있는 카드로 옴 |
+| `CLB_SUGGESTED_LOOP=1` | 추천 답변을 취소 창이 지난 뒤 자동으로 보냄 |
+
+그다음부터는 어느 터미널에서든 `claude-tg`를 치면 브릿지가 보는 바로 그 Claude 세션에 붙습니다. 폰과 터미널이 같은 세션을 씁니다.
+따로 연 Claude 창은 폰과 연결되지 않으며, `claude-telegram-bridge doctor`가 그런 창을 보면 경고합니다.
+`setup --like-author --dry-run`은 아무것도 바꾸지 않고 할 일만 보여 줍니다.
+
 ## 언어와 기본 사용
 
 봇 대화에서 다음 명령을 보냅니다.
