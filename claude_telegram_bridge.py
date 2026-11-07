@@ -12687,6 +12687,24 @@ class Bridge:
         with self.lock:
             self.ambient_response_active = True
 
+    def begin_ambient_bout(self, origin_uuid: str) -> None:
+        """A new terminal-started bout: the previous bout's stop button must not survive it."""
+        previous = str(getattr(self, "ambient_flow_origin_uuid", "") or "")
+        if previous and previous != origin_uuid and not getattr(self, "ambient_flow_closed", True):
+            self._retire_ambient_stop_button(getattr(self, "ambient_flow_message_id", 0))
+        self.ambient_flow_origin_uuid = origin_uuid
+        self.begin_ambient_response()
+
+    def _retire_ambient_stop_button(self, message_id: int) -> None:
+        buttons = getattr(self, "stop_buttons", None)
+        origin = str(getattr(self, "ambient_flow_origin_uuid", "") or "")
+        if buttons is None or not origin or not message_id:
+            return
+        try:
+            buttons.retire("ambient:" + origin, int(message_id))
+        except Exception:  # noqa: BLE001
+            log("FLOW", "ambient stop card retire unavailable; card close continues")
+
     def finish_ambient_response(self) -> None:
         with self.lock:
             self.ambient_response_active = False
@@ -20198,8 +20216,7 @@ class Bridge:
                     self.public_progress_origin = {
                         "session_id": binding.session_id, "uuid": record["uuid"], "created_at": created,
                     }
-                self.ambient_flow_origin_uuid = str(record.get("uuid") or "")
-                self.begin_ambient_response()
+                self.begin_ambient_bout(str(record.get("uuid") or ""))
                 # T-260811-029: 이 재진입이 harness 의 <task-notification> 완료통지(백그라운드
                 #   Bash·서브에이전트 완료로 재진입한 턴)인지 기록한다 — 아래 assistant
                 #   레코드 처리에서 이 값 하나로 최종답변 직접발신 여부를 가른다. 순수
@@ -20474,17 +20491,21 @@ class Bridge:
         self.ambient_flow_body = append_flow_steps(previous, summary)
         if new_card:
             try:
+                # The bout is open before the stop binding is prepared, so the
+                # button can attach to this card (same binding as a phone turn).
+                self.ambient_flow_closed = False
                 ids = self.telegram.send(
                     format_ambient_flow(
                         self.ambient_flow_body,
                         node=self.config.node,
                         emoji=self.config.emoji,
                         context=self.ambient_directive_body,
-                    )
+                    ),
+                    **self.stop_button_kwargs(create=True),
                 )
                 self.ambient_flow_message_id = ids[0] if ids else 0
-                self.ambient_flow_closed = False
                 self.ambient_flow_started_at = time.time()  # 종료 카드 소요시간 기준 (T-260721-024)
+                self.stop_button_sent(self.ambient_flow_message_id)
                 if ids:
                     log("SEND", f"sent ambient flow mid={self.ambient_flow_message_id}")
                 else:
@@ -20502,6 +20523,7 @@ class Bridge:
                         emoji=self.config.emoji,
                         context=self.ambient_directive_body,
                     ),
+                    **self.stop_button_kwargs(),
                 )
                 log("SEND", f"edited ambient flow mid={self.ambient_flow_message_id}")
             except Exception as exc:  # noqa: BLE001
@@ -20537,6 +20559,8 @@ class Bridge:
             if not body:
                 return False
             self.ambient_flow_closed = True
+            # Retire the stop binding before the keyboard edit, like a phone turn.
+            self._retire_ambient_stop_button(self.ambient_flow_message_id)
             if not self._edit_flow_message(self.ambient_flow_message_id, body, _empty_flow_keyboard()):
                 return False
         except Exception as exc:  # noqa: BLE001
