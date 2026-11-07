@@ -201,6 +201,26 @@ class PublicExportTest(unittest.TestCase):
         self.assertIsNone(mod.mesh_cutover_call("sendMessage", {}, bot_token="tok"))
         self.assertTrue(issubclass(mod.MeshRouteRetiredError, RuntimeError))
         self.assertIsNone(mod.mesh_ledger_record())
+        # Stripped private regions must leave working public stubs: the flow
+        # mirror, directive-card and shutdown paths call these at runtime.
+        self.assertEqual(mod.node_label_emoji(""), ("", "\U0001f916"))
+        self.assertEqual(mod.node_label_emoji("claude"), ("claude", "\U0001f916"))
+        self.assertEqual(mod.node_label_emoji("other-node"), ("", "\U0001f916"))
+        self.assertEqual(mod._label_for_emoji("\U0001f916"), "")
+        self.assertFalse(mod.alt3_narrative_enabled())
+        self.assertEqual(mod.subject_particle("터미널"), "이")
+        self.assertEqual(mod.subject_particle("브릿지"), "가")
+        self.assertEqual(mod.subject_particle(""), "이")
+        self.assertEqual(mod.subject_particle("abc"), "이")
+        with mock.patch.dict(os.environ, {"CLB_RELAY_ALERT_BIN": "/tmp/relay-probe.sh"}):
+            self.assertEqual(mod.relay_alert_bin(), Path("/tmp/relay-probe.sh"))
+        with mock.patch.dict(os.environ, {}):
+            os.environ.pop("CLB_RELAY_ALERT_BIN", None)
+            default_bin = mod.relay_alert_bin()
+        self.assertIsInstance(default_bin, Path)
+        self.assertEqual(default_bin.name, "relay-alert.sh")
+        self.assertTrue(default_bin.is_absolute())
+        self.assertIsNone(mod.reap_inflight_mesh_send_children())
         cfg = dataclasses.replace(mod.Config.from_env(), chat_id="")
         with self.assertRaises(ValueError):
             mod.validate_startup_config(cfg)
