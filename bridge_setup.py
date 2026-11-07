@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import getpass
 import hashlib
 import json
@@ -33,10 +34,6 @@ WATCHDOG_LAUNCHD_LABEL = "com.user.claude-telegram-bridge-watchdog"
 REPO_DIR = Path(__file__).resolve().parent
 BRIDGE_SCRIPT = REPO_DIR / "claude_telegram_bridge.py"
 WATCHDOG_SCRIPT = REPO_DIR / "bridge_watchdog.py"
-SESSION_START_HOOK_URL = (
-    "https://raw.githubusercontent.com/ssamssae/claude-telegram-bridge/"
-    "main/hooks/claude-telegram-bridge-session-start.sh"
-)
 SETUP_TOTAL_STEPS = 6
 NATIVE_WINDOWS_GUIDANCE = (
     "Native Windows tmux mode is unsupported: Claude cannot run the .sh SessionStart hook. "
@@ -82,11 +79,51 @@ class SetupOptions:
     conpty_state_path: Path | None = None
     create_session: bool = False
     language: str = "en"
+    like_author: bool = False
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class HookSpec:
+    """One Claude Code hook the public bridge ships: file name, event, optional matcher."""
+
+    name: str
+    event: str
+    matcher: str | None = None
+    timeout: int | None = None
+
+
+HOOK_BASE_URL = "https://raw.githubusercontent.com/ssamssae/claude-telegram-bridge/main/hooks/"
+SESSION_START_HOOK_NAME = "claude-telegram-bridge-session-start.sh"
+# Every hook the public repository ships. The plain wizard registers only the
+# first one; the author preset registers all of them (each is self-filtering:
+# the AskUserQuestion sidecar only reacts to that tool, the egress guard only
+# to the Telegram MCP reply tool, so idle registrations cost nothing).
+PUBLIC_HOOKS: tuple[HookSpec, ...] = (
+    HookSpec(SESSION_START_HOOK_NAME, "SessionStart"),
+    HookSpec("claude-askq-sidecar.sh", "PreToolUse", "AskUserQuestion", 5),
+    HookSpec("claude-telegram-bridge-pretool-block.sh", "PreToolUse", "mcp__plugin_telegram_telegram__reply", 5),
+)
+# "Like the author": the switches that make a fresh install behave like the
+# maintainer's own bridge. All four default to off in config.example.env.
+AUTHOR_PRESET_ENV: tuple[tuple[str, str], ...] = (
+    ("CLB_BUSY_INJECT", "1"),
+    ("CLB_FLOW_MIRROR", "1"),
+    ("CLB_ASKUSER_CARDS_ENABLED", "1"),
+    ("CLB_SUGGESTED_LOOP", "1"),
+)
+AUTHOR_PRESET_QUESTION = "Use the author's setup (recommended)? [Y/n] "
+ATTACH_COMMAND = "claude-tg"
+SELF_CHECK_PHONE_TIMEOUT = 60.0
+SELF_CHECK_TERMINAL_TIMEOUT = 90.0
+SELF_CHECK_PROBE = "Reply with the single word OK. (bridge setup self-check)"
+TERMINAL_MIRROR_MARKERS = ("sent ambient directive", "sent ambient flow", "sent ambient final")
 
 
 ApiCall = Callable[..., dict[str, Any] | None]
 RunCommand = Callable[[list[str]], subprocess.CompletedProcess[str]]
 HookLoader = Callable[[], str]
+HookSource = Callable[[str], str]
 
 
 def out(message: str = "") -> None:
@@ -352,6 +389,7 @@ def write_private_config(
     transport: str = "tmux",
     conpty_state_path: Path | None = None,
     language: str = "en",
+    like_author: bool = False,
 ) -> None:
     if language not in {"en", "ko"}:
         raise SetupError("language must be en or ko")
@@ -378,6 +416,8 @@ def write_private_config(
             "CLB_TMUX_SESSION=claude",
             ]
         )
+    if like_author:
+        config_lines.extend(author_preset_lines())
     config_lines.extend(
         [
             "CLB_START_AT_END=1",
@@ -386,6 +426,10 @@ def write_private_config(
     )
     content = "\n".join(config_lines)
     write_text_atomic(config_file, content, mode=0o600)
+
+
+def author_preset_lines() -> list[str]:
+    return ["# Author preset (setup --like-author)", *(f"{key}={value}" for key, value in AUTHOR_PRESET_ENV)]
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -426,7 +470,7 @@ def ensure_setup_tmux_session(
         return True, attach_command, manual_command
 
     if options.non_interactive:
-        should_create = options.create_session
+        should_create = options.create_session or options.like_author
     else:
         answer = input("Start the Claude tmux session now? [Y/n] ").strip().lower()
         should_create = answer not in {"n", "no"}
@@ -449,15 +493,28 @@ def ensure_setup_tmux_session(
     return False, attach_command, manual_command
 
 
-def download_session_start_hook() -> str:
+def download_hook(name: str) -> str:
+    if name not in {spec.name for spec in PUBLIC_HOOKS}:
+        raise SetupError(f"unknown hook: {name}")
     try:
-        with urllib.request.urlopen(SESSION_START_HOOK_URL, timeout=30) as response:
+        with urllib.request.urlopen(HOOK_BASE_URL + name, timeout=30) as response:
             text = response.read().decode("utf-8")
     except Exception as exc:
-        raise SetupError(f"SessionStart hook download failed: {exc}") from exc
+        raise SetupError(f"hook download failed ({name}): {exc}") from exc
     if not text.startswith("#!/") or "claude-telegram-bridge" not in text:
-        raise SetupError("SessionStart hook download returned unexpected content")
+        raise SetupError(f"hook download returned unexpected content ({name})")
     return text
+
+
+def download_session_start_hook() -> str:
+    return download_hook(SESSION_START_HOOK_NAME)
+
+
+def preset_hook_path(hook_file: Path, spec: HookSpec) -> Path:
+    """The SessionStart hook keeps its configured path; the others sit beside it."""
+    if spec.name == SESSION_START_HOOK_NAME:
+        return hook_file
+    return hook_file.with_name(spec.name)
 
 
 def install_session_start_hook(path: Path, loader: HookLoader = download_session_start_hook) -> None:
@@ -507,11 +564,11 @@ def command_targets_hook(command: object, hook_file: object) -> bool:
     return any(normalized_hook_path(candidate) == target for candidate in candidates)
 
 
-def hook_registered(settings: dict[str, Any], hook_file: Path) -> bool:
+def hook_registered(settings: dict[str, Any], hook_file: Path, event: str = "SessionStart") -> bool:
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return False
-    entries = hooks.get("SessionStart")
+    entries = hooks.get(event)
     if not isinstance(entries, list):
         return False
     for entry in entries:
@@ -550,55 +607,84 @@ def write_settings_with_backup(
     return backup
 
 
+def merge_hooks(
+    settings_file: Path,
+    registrations: list[tuple[Path, HookSpec]],
+    *,
+    stamp: str | None = None,
+) -> SettingsChange:
+    """Register every (hook file, spec) not yet present; one settings write, one backup."""
+    settings, mode = load_settings(settings_file)
+    changed = False
+    for hook_file, spec in registrations:
+        if hook_registered(settings, hook_file, spec.event):
+            continue
+        hooks = settings.setdefault("hooks", {})
+        if not isinstance(hooks, dict):
+            raise SetupError("Claude settings hooks must be a JSON object; left unchanged")
+        entries = hooks.setdefault(spec.event, [])
+        if not isinstance(entries, list):
+            raise SetupError(f"Claude settings hooks.{spec.event} must be a JSON array; left unchanged")
+        command: dict[str, Any] = {
+            "type": "command",
+            # Must match the normalization command_targets_hook() uses when
+            # reading the command back (normalized_hook_path), not Path.resolve().
+            # resolve() follows symlinks (e.g. macOS /tmp -> /private/tmp) while
+            # normalized_hook_path() intentionally does not, so mixing the two
+            # broke idempotent installs/doctor/uninstall on symlinked paths.
+            "command": normalized_hook_path(hook_file)[1],
+        }
+        if spec.timeout is not None:
+            command["timeout"] = spec.timeout
+        entry: dict[str, Any] = {}
+        if spec.matcher:
+            entry["matcher"] = spec.matcher
+        entry["hooks"] = [command]
+        entries.append(entry)
+        changed = True
+    if not changed:
+        return SettingsChange(False, None)
+    backup = write_settings_with_backup(settings_file, settings, mode=mode, stamp=stamp)
+    return SettingsChange(True, backup)
+
+
+def merge_hook(
+    settings_file: Path,
+    hook_file: Path,
+    *,
+    event: str = "SessionStart",
+    matcher: str | None = None,
+    timeout: int | None = None,
+    stamp: str | None = None,
+) -> SettingsChange:
+    return merge_hooks(settings_file, [(hook_file, HookSpec(hook_file.name, event, matcher, timeout))], stamp=stamp)
+
+
 def merge_session_start_hook(
     settings_file: Path,
     hook_file: Path,
     *,
     stamp: str | None = None,
 ) -> SettingsChange:
-    settings, mode = load_settings(settings_file)
-    if hook_registered(settings, hook_file):
-        return SettingsChange(False, None)
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
-        raise SetupError("Claude settings hooks must be a JSON object; left unchanged")
-    entries = hooks.setdefault("SessionStart", [])
-    if not isinstance(entries, list):
-        raise SetupError("Claude settings hooks.SessionStart must be a JSON array; left unchanged")
-    entries.append(
-        {
-            "hooks": [
-                {
-                    "type": "command",
-                    # Must match the normalization command_targets_hook() uses when
-                    # reading the command back (normalized_hook_path), not Path.resolve().
-                    # resolve() follows symlinks (e.g. macOS /tmp -> /private/tmp) while
-                    # normalized_hook_path() intentionally does not, so mixing the two
-                    # broke idempotent installs/doctor/uninstall on symlinked paths.
-                    "command": normalized_hook_path(hook_file)[1],
-                }
-            ]
-        }
-    )
-    backup = write_settings_with_backup(settings_file, settings, mode=mode, stamp=stamp)
-    return SettingsChange(True, backup)
+    return merge_hook(settings_file, hook_file, event="SessionStart", stamp=stamp)
 
 
-def remove_session_start_hook(
+def remove_hook(
     settings_file: Path,
     hook_file: Path,
     *,
+    event: str = "SessionStart",
     stamp: str | None = None,
 ) -> SettingsChange:
     if not settings_file.exists():
         return SettingsChange(False, None)
     settings, mode = load_settings(settings_file)
     hooks = settings.get("hooks")
-    if not isinstance(hooks, dict) or not isinstance(hooks.get("SessionStart"), list):
+    if not isinstance(hooks, dict) or not isinstance(hooks.get(event), list):
         return SettingsChange(False, None)
     changed = False
     kept_entries = []
-    for entry in hooks["SessionStart"]:
+    for entry in hooks[event]:
         if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
             kept_entries.append(entry)
             continue
@@ -615,13 +701,22 @@ def remove_session_start_hook(
     if not changed:
         return SettingsChange(False, None)
     if kept_entries:
-        hooks["SessionStart"] = kept_entries
+        hooks[event] = kept_entries
     else:
-        hooks.pop("SessionStart", None)
+        hooks.pop(event, None)
     if not hooks:
         settings.pop("hooks", None)
     backup = write_settings_with_backup(settings_file, settings, mode=mode, stamp=stamp)
     return SettingsChange(True, backup)
+
+
+def remove_session_start_hook(
+    settings_file: Path,
+    hook_file: Path,
+    *,
+    stamp: str | None = None,
+) -> SettingsChange:
+    return remove_hook(settings_file, hook_file, event="SessionStart", stamp=stamp)
 
 
 def install_runner(runner_file: Path, config_file: Path) -> None:
@@ -842,16 +937,55 @@ def watchdog_status(*, os_name: str | None = None, run: RunCommand = run_command
     return "manual"
 
 
+def setup_plan_lines(options: SetupOptions) -> list[str]:
+    """What `setup --dry-run` would do: files, switches, hooks, session. No I/O."""
+    lines = [
+        "Dry run: nothing is written and Telegram is not contacted.",
+        f"config: {options.config_file}",
+        f"token files: {options.token_file}, {options.registry_file}",
+        f"state dir: {options.state_dir}",
+    ]
+    if options.like_author:
+        lines.append("author preset switches (bridge.env):")
+        lines.extend(f"  {key}={value}" for key, value in AUTHOR_PRESET_ENV)
+        lines.append("hooks (downloaded, then merged into Claude settings):")
+        for spec in PUBLIC_HOOKS:
+            where = f"{spec.event} ({spec.matcher})" if spec.matcher else spec.event
+            lines.append(f"  {where}: {preset_hook_path(options.hook_file, spec)}")
+    else:
+        lines.append("switches: defaults (all optional features off)")
+        lines.append(f"hooks: SessionStart: {options.hook_file}")
+    lines.append(f"Claude settings merge (backup first): {options.settings_file}")
+    lines.append(
+        f"runner: {options.runner_file}; service + watchdog: "
+        + ("install" if options.install_service else "skip")
+    )
+    if options.transport == "conpty":
+        lines.append("transport: native ConPTY host (no tmux session)")
+    else:
+        lines.append("tmux session: default/claude, Claude started inside it")
+        lines.append(f"attach any time with: {ATTACH_COMMAND}")
+    if options.like_author:
+        lines.append("self-check after install: bot -> phone, phone -> terminal -> phone, terminal -> phone")
+    return lines
+
+
 def setup_bridge(
     options: SetupOptions,
     *,
     api_call: ApiCall = telegram_call,
     hook_loader: HookLoader = download_session_start_hook,
+    hook_source: HookSource = download_hook,
     run: RunCommand = run_command,
 ) -> int:
     os_name = platform.system()
     transport = validate_setup_transport(options.transport, os_name=os_name)
     native_conpty = os_name == "Windows" and transport == "conpty"
+    if options.dry_run:
+        out("Claude Telegram Bridge setup (dry run)")
+        for line in setup_plan_lines(options):
+            out(line)
+        return 0
     out("Claude Telegram Bridge setup")
     setup_note(
         "You need a BotFather token, Telegram /start, and Claude Code."
@@ -859,6 +993,16 @@ def setup_bridge(
     )
     if native_conpty:
         warn(NATIVE_WINDOWS_CONPTY_GUIDANCE)
+    like_author = options.like_author
+    if not like_author and not options.non_interactive and not native_conpty:
+        setup_note(
+            "The author's setup turns on the flow card with its Stop button, question cards, "
+            "busy-time injection and the suggested-reply loop, registers every bridge hook, "
+            f"and adds the {ATTACH_COMMAND} command. Answer n to keep every optional switch off."
+        )
+        like_author = input(AUTHOR_PRESET_QUESTION).strip().lower() not in {"n", "no"}
+    if like_author:
+        options = dataclasses.replace(options, like_author=True)
 
     setup_step(1, "Paste and validate the BotFather token")
     token = (options.token or "").strip()
@@ -891,6 +1035,10 @@ def setup_bridge(
         answer = input(f"Overwrite existing config {options.config_file}? [y/N]: ").strip().lower()
         if answer not in {"y", "yes"}:
             raise SetupError("setup cancelled")
+    if options.like_author and options.config_file.exists():
+        previous = backup_path(options.config_file)
+        shutil.copy2(options.config_file, previous)
+        ok(f"backed up previous config: {previous}")
     write_private_config(
         config_file=options.config_file,
         token_file=options.token_file,
@@ -901,8 +1049,11 @@ def setup_bridge(
         transport=transport,
         conpty_state_path=options.conpty_state_path,
         language=options.language,
+        like_author=options.like_author,
     )
     ok(f"wrote private config: {options.config_file}")
+    if options.like_author:
+        ok("author preset on: " + ", ".join(f"{key}={value}" for key, value in AUTHOR_PRESET_ENV))
     ok(f"wrote token files: {options.token_file}, {options.registry_file}")
 
     setup_step(4, "Install and register the Claude SessionStart hook")
@@ -910,11 +1061,21 @@ def setup_bridge(
         setup_note("SessionStart hook skipped: the owned host binds Claude JSONL directly.")
     else:
         install_session_start_hook(options.hook_file, loader=hook_loader)
-        change = merge_session_start_hook(options.settings_file, options.hook_file)
+        registrations: list[tuple[Path, HookSpec]] = [(options.hook_file, PUBLIC_HOOKS[0])]
         ok(f"installed SessionStart hook: {options.hook_file}")
+        if options.like_author:
+            for spec in PUBLIC_HOOKS[1:]:
+                hook_path = preset_hook_path(options.hook_file, spec)
+                install_session_start_hook(hook_path, loader=lambda name=spec.name: hook_source(name))
+                registrations.append((hook_path, spec))
+                where = f"{spec.event} ({spec.matcher})" if spec.matcher else spec.event
+                ok(f"installed {where} hook: {hook_path}")
+        change = merge_hooks(options.settings_file, registrations)
         if change.backup:
             ok(f"backed up Claude settings: {change.backup}")
         ok("Claude settings SessionStart hook registered")
+        if options.like_author:
+            ok("Claude settings question-card and egress-guard hooks registered")
 
     setup_step(5, "Install the bridge service and watchdog")
     if native_conpty:
@@ -957,12 +1118,262 @@ def setup_bridge(
     elif tmux_ready:
         out("Setup complete. Claude tmux session is ready.")
         out(f"Attach with: {attach_command}")
+        if options.like_author:
+            out(f"From now on, any terminal: {ATTACH_COMMAND}")
         out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
     else:
         out(f"Setup complete. Start Claude in: {manual_command}")
+        if options.like_author:
+            out(f"Or simply run: {ATTACH_COMMAND}")
         out("Then send /ping to your bot. Run `claude-telegram-bridge doctor` any time.")
+    if options.like_author and not native_conpty:
+        if tmux_ready and options.install_service and options.start_service:
+            author_self_check(
+                token=token,
+                chat_id=chat_id,
+                config=load_env_file(options.config_file),
+                state_dir=options.state_dir,
+                os_name=os_name,
+                api_call=api_call,
+                run=run,
+                bot_message_sent=options.send_test,
+            )
+        else:
+            setup_note("Self-check skipped: it needs the running service and the tmux session.")
     show_cli_path_fallback("setup")
     return 0
+
+
+def claude_sessions_outside_bridge(pane_tty: str, ps_text: str) -> list[tuple[str, str]]:
+    """(pid, tty) of Claude CLI processes whose tty is not the bridge pane's tty.
+
+    `ps_text` is `ps -Ao pid=,tty=,comm=` output; the command is the last field,
+    so a wider column set (ppid, ...) still parses. Daemons without a tty and the
+    desktop app (command basename is not `claude`) are ignored.
+    """
+    pane = (pane_tty or "").strip()
+    if not pane:
+        return []
+    pane_name = pane[len("/dev/"):] if pane.startswith("/dev/") else pane
+    found: list[tuple[str, str]] = []
+    for raw in ps_text.splitlines():
+        parts = raw.split()
+        if len(parts) < 3:
+            continue
+        pid, tty, command = parts[0], parts[-2], parts[-1]
+        if os.path.basename(command) != "claude":
+            continue
+        if tty in {"?", "??", "-", ""} or tty in {pane_name, pane}:
+            continue
+        found.append((pid, tty))
+    return found
+
+
+def warn_sessions_outside_bridge(*, run: RunCommand = run_command) -> int:
+    pane = run(["tmux", "-L", "default", "display-message", "-p", "-t", "claude", "#{pane_tty}"])
+    processes = run(["ps", "-Ao", "pid=,tty=,comm="])
+    outside = claude_sessions_outside_bridge(pane.stdout or "", processes.stdout or "")
+    if not outside:
+        return 0
+    listed = ", ".join(f"pid {pid} on {tty}" for pid, tty in outside)
+    warn(
+        f"a Claude session is running outside the bridge tmux session ({listed}); "
+        f"use {ATTACH_COMMAND} so your phone and terminal share one session"
+    )
+    return 1
+
+
+def attach_command(
+    config_file: Path,
+    *,
+    run: RunCommand = run_command,
+    exec_fn: Callable[[str, list[str]], Any] = os.execvp,
+    create_missing: bool = True,
+) -> int:
+    """Attach this terminal to the Claude session the bridge controls (`claude-tg`)."""
+    config = load_env_file(config_file)
+    if (config.get("CLB_REPL_TRANSPORT") or "tmux").strip().lower() == "conpty":
+        fail("attach works with the tmux transport; the native host owns its own window")
+        return 2
+    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
+    socket = config.get("CLB_TMUX_SOCKET") or "default"
+    session = config.get("CLB_TMUX_SESSION") or "claude"
+    probe = run([tmux_bin, "-L", socket, "has-session", "-t", f"={session}"])
+    if probe.returncode != 0:
+        if not create_missing:
+            fail(f"tmux session missing: {socket}/{session}")
+            return 2
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            fail(f"Claude CLI not found on PATH; install Claude Code, then run {ATTACH_COMMAND} again")
+            return 2
+        started = run([tmux_bin, "-L", socket, "new-session", "-d", "-s", session, claude_bin])
+        if started.returncode != 0:
+            detail = (started.stderr or started.stdout or f"exit {started.returncode}").strip()
+            fail(f"could not start Claude tmux session: {detail}")
+            return 2
+        ok(f"started Claude tmux session: {socket}/{session}")
+    clients = run([tmux_bin, "-L", socket, "list-clients", "-t", f"={session}"])
+    if (clients.stdout or "").strip():
+        setup_note(
+            "another terminal is already attached; this one joins it. The pane keeps the "
+            "smaller size until the other terminal detaches (Ctrl+B then D)."
+        )
+    exec_fn(tmux_bin, [tmux_bin, "-L", socket, "attach", "-t", session])
+    return 0
+
+
+def attach_main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=ATTACH_COMMAND,
+        description="Attach this terminal to the Claude session the bridge controls",
+    )
+    parser.add_argument("--config", type=expand_path, default=default_config_file())
+    parser.add_argument("--no-create", action="store_true", help="fail instead of starting a missing session")
+    args = parser.parse_args(argv)
+    try:
+        return attach_command(args.config, create_missing=not args.no_create)
+    except SetupError as exc:
+        fail(str(exc))
+        return 2
+
+
+def queue_records_since(path: Path, since: float) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return records
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        try:
+            stamp = float(record.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        if stamp >= since:
+            records.append(record)
+    return records
+
+
+class BridgeLogTail:
+    """New bridge log text since construction: launchd log file on macOS, journal on Linux."""
+
+    def __init__(self, os_name: str, *, run: RunCommand = run_command, since: float | None = None) -> None:
+        self.os_name = os_name
+        self.run = run
+        self.since = time.time() if since is None else since
+        self.path = Path("/tmp") / f"{LAUNCHD_LABEL}.log" if os_name == "Darwin" else None
+        self.offset = self.path.stat().st_size if self.path is not None and self.path.exists() else 0
+
+    def read_new(self) -> str:
+        if self.path is not None:
+            if not self.path.exists():
+                return ""
+            with self.path.open("rb") as handle:
+                handle.seek(self.offset)
+                data = handle.read()
+            self.offset += len(data)
+            return data.decode("utf-8", "replace")
+        if self.os_name == "Linux":
+            proc = self.run(
+                ["journalctl", "--user", "-u", SERVICE_NAME, "--since", f"@{int(self.since)}", "-o", "cat", "--no-pager"]
+            )
+            return proc.stdout or ""
+        return ""
+
+
+def author_self_check(
+    *,
+    token: str,
+    chat_id: str,
+    config: dict[str, str],
+    state_dir: Path,
+    os_name: str,
+    api_call: ApiCall = telegram_call,
+    run: RunCommand = run_command,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
+    log_tail: Any = None,
+    phone_timeout: float = SELF_CHECK_PHONE_TIMEOUT,
+    terminal_timeout: float = SELF_CHECK_TERMINAL_TIMEOUT,
+    bot_message_sent: bool = True,
+) -> list[str]:
+    """Three live checks after an author-preset install; results go to the terminal and the phone."""
+    out("")
+    out("Self-check: bot -> phone, phone -> terminal -> phone, terminal -> phone")
+    lines = [
+        "1/3 bot -> phone: ok (setup message delivered)"
+        if bot_message_sent
+        else "1/3 bot -> phone: skipped (test message disabled)"
+    ]
+    node = config.get("CLB_NODE") or "claude"
+    queue_path = Path(config.get("CLB_QUEUE_PATH") or state_dir / f"claude-telegram-bridge-{node}.queue.jsonl").expanduser()
+    tail = log_tail if log_tail is not None else BridgeLogTail(os_name, run=run, since=clock())
+
+    started = clock()
+    api_call(
+        token,
+        "sendMessage",
+        chat_id=chat_id,
+        text=(
+            f"Self-check 2/3: send any text to this bot within {int(phone_timeout)} s. "
+            "It should appear in the Claude terminal and the answer should come back here."
+        ),
+    )
+    setup_note(f"waiting up to {int(phone_timeout)}s for a message from your phone ...")
+    arrived = answered = False
+    while clock() - started < phone_timeout:
+        records = queue_records_since(queue_path, started)
+        arrived = arrived or any(record.get("status") == "injected" for record in records)
+        answered = any(record.get("status") == "sent" for record in records)
+        if answered:
+            break
+        sleep(2)
+    if answered:
+        lines.append("2/3 phone -> terminal -> phone: ok")
+    elif arrived:
+        lines.append(
+            "2/3 phone -> terminal -> phone: the message reached the terminal but no answer came back "
+            "in time; look at the Claude session, then run `claude-telegram-bridge doctor`"
+        )
+    else:
+        lines.append(
+            f"2/3 phone -> terminal -> phone: no phone message within {int(phone_timeout)} s; "
+            "send any text to the bot later and run `claude-telegram-bridge doctor`"
+        )
+
+    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
+    socket = config.get("CLB_TMUX_SOCKET") or "default"
+    session = config.get("CLB_TMUX_SESSION") or "claude"
+    target = f"={session}"
+    run([tmux_bin, "-L", socket, "send-keys", "-t", target, "-l", SELF_CHECK_PROBE])
+    run([tmux_bin, "-L", socket, "send-keys", "-t", target, "Enter"])
+    setup_note(f"typed a probe into the Claude session; waiting up to {int(terminal_timeout)}s for its phone card ...")
+    started = clock()
+    mirrored = False
+    while clock() - started < terminal_timeout:
+        chunk = tail.read_new()
+        if any(marker in chunk for marker in TERMINAL_MIRROR_MARKERS):
+            mirrored = True
+            break
+        sleep(2)
+    if mirrored:
+        lines.append("3/3 terminal -> phone: ok")
+    else:
+        lines.append(
+            f"3/3 terminal -> phone: no terminal mirror card within {int(terminal_timeout)} s; "
+            "confirm CLB_FLOW_MIRROR=1 in bridge.env and that the service restarted, then run "
+            "`claude-telegram-bridge doctor`"
+        )
+    for line in lines:
+        out(line)
+    api_call(token, "sendMessage", chat_id=chat_id, text="Setup self-check\n" + "\n".join(lines))
+    return lines
 
 
 def read_token(path: Path) -> str:
@@ -1107,6 +1518,7 @@ def doctor(
         proc = run(["tmux", "-L", "default", "has-session", "-t", "=claude"])
         if proc.returncode == 0:
             ok("tmux session found: default/claude")
+            warnings += warn_sessions_outside_bridge(run=run)
         else:
             warn("tmux session missing: default/claude")
             warnings += 1
@@ -1164,15 +1576,18 @@ def uninstall(
     uninstall_watchdog()
     uninstall_service()
     runner_file.unlink(missing_ok=True)
-    change = remove_session_start_hook(settings_file, hook_file)
-    if change.changed:
-        ok("removed SessionStart registration")
-        if change.backup:
-            ok(f"backed up Claude settings: {change.backup}")
+    for spec in PUBLIC_HOOKS:
+        change = remove_hook(settings_file, preset_hook_path(hook_file, spec), event=spec.event)
+        if change.changed:
+            ok(f"removed {spec.event} registration: {spec.name}")
+            if change.backup:
+                ok(f"backed up Claude settings: {change.backup}")
     if purge:
         for path in (config_file, token_file, registry_file, hook_file):
             path.unlink(missing_ok=True)
-        ok("purged private config and installed hook")
+        for spec in PUBLIC_HOOKS:
+            preset_hook_path(hook_file, spec).unlink(missing_ok=True)
+        ok("purged private config and installed hooks")
     else:
         out(f"kept private config: {config_file.parent}")
     return 0
@@ -1189,6 +1604,11 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_parser = subparsers.add_parser("uninstall", help="remove service, runner, and hook registration")
     subparsers.add_parser("run", help="start the bridge daemon")
     subparsers.add_parser("host", add_help=False, help="start the native Windows owned Claude host")
+    attach_parser = subparsers.add_parser(
+        "attach", help=f"attach this terminal to the bridge's Claude tmux session (same as {ATTACH_COMMAND})"
+    )
+    attach_parser.add_argument("--config", type=expand_path, default=default_config_file())
+    attach_parser.add_argument("--no-create", action="store_true", help="fail instead of starting a missing session")
 
     for child in (setup_parser, doctor_parser, uninstall_parser):
         child.add_argument("--config", type=expand_path, default=default_config_file())
@@ -1212,6 +1632,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="create a missing tmux Claude session (opt-in for non-interactive setup)",
     )
     setup_parser.add_argument("-y", "--yes", action="store_true")
+    setup_parser.add_argument(
+        "--like-author",
+        action="store_true",
+        help="author preset: flow card with Stop button, question cards, busy-time injection, "
+        "suggested-reply loop, every bridge hook, the claude-tg command, and a self-check",
+    )
+    setup_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what setup would write and register, without touching files or Telegram",
+    )
     setup_parser.add_argument(
         "--transport",
         choices=("tmux", "conpty"),
@@ -1281,10 +1712,12 @@ def main(argv: list[str] | None = None) -> int:
         run_parser.add_argument("--config", type=expand_path, default=default_config_file())
         run_args, daemon_args = run_parser.parse_known_args(values[1:])
         return run_bridge_with_config(run_args.config, daemon_args)
-    if values[0] not in {"setup", "doctor", "uninstall", "-h", "--help"}:
+    if values[0] not in {"setup", "doctor", "uninstall", "attach", "-h", "--help"}:
         return run_bridge_daemon()
     args = build_parser().parse_args(values)
     try:
+        if args.command == "attach":
+            return attach_command(args.config, create_missing=not args.no_create)
         if args.command == "setup":
             return setup_bridge(
                 SetupOptions(
@@ -1307,6 +1740,8 @@ def main(argv: list[str] | None = None) -> int:
                     conpty_state_path=args.conpty_state,
                     create_session=args.create_session,
                     language=args.language,
+                    like_author=args.like_author,
+                    dry_run=args.dry_run,
                 )
             )
         if args.command == "doctor":
