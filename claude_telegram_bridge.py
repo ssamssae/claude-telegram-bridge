@@ -4550,6 +4550,13 @@ def read_askq_sidecar(session_id) -> dict | None:
 
 ASKQ_SETTLE_SCAN_BYTES = 512 * 1024
 ASKQ_SETTLE_SCAN_SECONDS = 15.0
+# T-261107-009: 미응답 질문 카드 고정 — 코덱스 PR #2745(T-261107-007)와 같은 의미.
+#   열린 카드의 원본 메시지를 소유자 개인 대화에서 조용히 고정하고, 답·만료·세션 종료면 해제한다.
+#   고정은 표시일 뿐 답변·권한이 아니다. 틱당 API 호출 1회, 행위별 재시도 60초 간격 최대 3회.
+#   클로드 카드는 1시간 뒤에도 답할 수 있어 만료 해제는 하루(코덱스 async 질문 TTL 1시간과 다른 점).
+QUESTION_PIN_TTL_SECONDS = 24 * 3600.0
+QUESTION_PIN_RETRY_SECONDS = 60.0
+QUESTION_PIN_MAX_ATTEMPTS = 3
 
 
 def askq_settled_in_transcript(path, tool_id) -> tuple[bool, dict | None]:
@@ -4635,6 +4642,27 @@ def askq_multi_screen_clipped(screen: str) -> bool:
         if matched and ASKQ_MULTI_MARK_RE.match(matched.group(3).strip()):
             return True
     return False
+
+
+def askq_preview_screen_clipped(screen: str) -> bool:
+    """보기 preview 가 있는 질문인데 머리표(☐) 줄이 화면 위로 밀린 화면인가 (T-261102-023).
+
+    11/02 11:37·11/03 19:32 제어 노드 52×18 실측: preview 상자·Notes·대화 줄이 자리를 먼저 차지해 머리표와
+    가로줄이 화면 밖으로 밀렸고, 해석기가 None 을 내 폰에는 「화면 확인 필요」만 갔다. 그 화면 고유 힌트
+    (n to add notes)가 끝줄에 있고 머리표 줄이 없을 때만 참이다.
+    """
+    rows = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+    while rows and not rows[-1].strip():
+        rows.pop()
+    for count in (1, 2, 3):
+        if len(rows) >= count and ASKQ_PREVIEW_HINT_RE.fullmatch(" ".join(line.strip() for line in rows[-count:])):
+            return not any(ASKQ_TAB_RE.match(line) for line in rows[:-count])
+    return False
+
+
+def askq_screen_needs_tall_read(screen: str) -> bool:
+    """창을 잠깐 늘려 다시 읽어야 하는 질문 화면인가 — 머리표가 밀린 여러 개 고르기·preview 질문."""
+    return askq_multi_screen_clipped(screen) or askq_preview_screen_clipped(screen)
 
 
 def askq_screen_key(screen: str) -> str:
@@ -4725,13 +4753,14 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
     else:
         # The left quote rail is painted by Claude, not part of the native title.
         # Ignore whitespace during comparison because tmux can wrap inside a word.
-        rail = False
+        rail = gap = False
         if not full_header:
             # T-261010-024: alt-screen 창도 TUI 시작 전 출력이 tmux 기록에 남아 캡처(-S -80) 위쪽에
             # 붙는다(제어 노드 history_size=20 실측). 잘린 질문 본문은 선택지 바로 위에 이어진 인용 레일 줄뿐이다.
             end = len(body)
             while end and not body[end - 1].strip():
                 end -= 1
+            gap = end < len(body)
             start = end
             while start and ASKQ_RAIL_RE.match(body[start - 1]):
                 start -= 1
@@ -4754,7 +4783,13 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
         elif len(shown) < ASKQ_CLIPPED_MIN_SUFFIX or not fragment:
             # T-261026-032: 질문이 한 줄만 남으면(10/26 22:28 「해요. 어떻게 할까요?」) 제목만으로는 같은 질문인지
             #   모른다. 레일 줄 조각이 원본에 있고, 보이는 보기 설명이 원본과 모두 같고, 합쳐 충분히 길 때만 받는다.
-            if not (rail and fragment and descriptions_match and len(shown) + verified >= ASKQ_CLIPPED_MIN_SUFFIX):
+            # T-261101-028: 질문 글이 한 줄도 안 남으면(11/01 19:27 제어 노드 52×18 — 화면이 질문과 1번 보기 사이 빈 줄부터)
+            #   대조할 레일 조각이 없다. 빈 줄 위는 TUI 시작 전 tmux 기록이라 보지 않는다. 그 빈 줄이 보이고, 보기가 1번부터
+            #   다 보이고, 보이는 설명이 원본과 모두 같고, 그 설명만으로 충분히 길 때만 받는다. 1번 보기 바로 위에 빈 줄 없이
+            #   글이 붙었거나(어디서 잘렸는지 모름) 레일 조각이 원본과 다르면 종전대로 None.
+            hidden_title = gap and not rail and descriptions_match and verified >= ASKQ_CLIPPED_MIN_SUFFIX
+            if not hidden_title and not (
+                    rail and fragment and descriptions_match and len(shown) + verified >= ASKQ_CLIPPED_MIN_SUFFIX):
                 return None
     # 화면 위로 밀린 보기 줄은 원본으로 채운다. 커서가 거기 있으면 1번에 임시로 두고, 파싱 뒤 0(안 보임)으로 돌린다.
     hidden = []
@@ -8339,12 +8374,13 @@ class TmuxClaudeTransport:
         실측 계약(Claude Code v2.1.311, 2026-10-27 제어 노드 격리 세션): 이 화면에서 숫자 1자는 커서만
         옮긴다(「2」→ ❯ 가 2번으로·상자가 2번 preview 로). 확정은 Enter 다. 숫자만 보낸 브릿지
         탭은 18분 동안 답이 안 들어갔다(10/27 12:55 메모요 실기기 확인 카드). 같은 잠금 안에서
-        재판독해 커서가 그 번호에 있을 때만 Enter 를 보낸다.
+        재판독해 커서가 그 번호에 있을 때만 Enter 를 보낸다. 머리표가 밀린 작은 창이면 늘린 창에서
+        읽고 누른다(T-261102-023 — 작은 화면을 다시 읽으면 늘 「changed」였다).
         """
         if type(number) is not int or not 1 <= number <= CHOICE_MAX_OPTIONS:
             return "invalid"
-        with self.composer_lock():
-            before = parser(self.capture_pane(80))
+        with self.composer_lock(), self.question_screen_reader(80) as read:
+            before = parser(read())
             if not before or not before.get("preview_layout") or before["signature"] != signature:
                 return "changed"
             if number not in {num for num, _ in before["options"]}:
@@ -8354,7 +8390,7 @@ class TmuxClaudeTransport:
                 self.tmux("send-keys", "-t", target, str(number))
                 for _ in range(10):
                     time.sleep(0.1)
-                    after = parser(self.capture_pane(80))
+                    after = parser(read())
                     if not after or not after.get("preview_layout") or after["signature"] != signature:
                         return "changed"
                     if after["selected"] == number:
@@ -8731,13 +8767,13 @@ class TmuxClaudeTransport:
     def capture_question_pane(self, lines: int = 80, *, fresh: bool = False) -> str:
         """질문 판독용 캡처 (T-261025-028 재착수).
 
-        머리표가 밀린 여러 개 고르기 화면이면 창 높이를 잠깐 늘려 다시 읽고 되돌린다. 작은 화면이
-        그대로면(줄 끝 공백 무시) 직전에 늘려 읽은 화면을 다시 쓴다 — 점검마다 창을 흔들지 않는다.
-        늘려 읽기에 실패하면 종전 화면을 그대로 돌려준다(카드 없음 = 종전 동작).
+        머리표가 밀린 여러 개 고르기·preview 질문 화면이면(T-261102-023) 창 높이를 잠깐 늘려 다시 읽고
+        되돌린다. 작은 화면이 그대로면(줄 끝 공백 무시) 직전에 늘려 읽은 화면을 다시 쓴다 — 점검마다 창을
+        흔들지 않는다. 늘려 읽기에 실패하면 종전 화면을 그대로 돌려준다(카드 없음 = 종전 동작).
         """
         with self._askq_tall_lock:
             screen = self.capture_pane(lines)
-            if not askq_multi_screen_clipped(screen):
+            if not askq_screen_needs_tall_read(screen):
                 self._askq_tall_cache = None
                 return screen
             key = askq_screen_key(screen)
@@ -8746,7 +8782,7 @@ class TmuxClaudeTransport:
                 return cached[1]
             with self.temporary_window_height() as resized:
                 tall = self.wait_for_tall_question(lines) if resized else ""
-            if not tall or askq_multi_screen_clipped(tall):
+            if not tall or askq_screen_needs_tall_read(tall):
                 self._askq_tall_cache = None
                 return screen
             self._askq_tall_cache = (key, tall)
@@ -8756,13 +8792,13 @@ class TmuxClaudeTransport:
     def question_screen_reader(self, lines: int = 80):
         """체크·넘기기 거래 동안 화면을 읽는 함수를 준다 (T-261025-028 재착수).
 
-        평소엔 종전 캡처 그대로다(첫 캡처를 다시 찍지 않는다). 머리표가 밀린 여러 개 고르기 화면이면
-        거래가 끝날 때까지 창을 늘려 둔다 — 화면 밖 보기의 체크도 다시 읽어 확인한다(실측: 숫자 키는
+        평소엔 종전 캡처 그대로다(첫 캡처를 다시 찍지 않는다). 머리표가 밀린 여러 개 고르기·preview 질문
+        화면이면 거래가 끝날 때까지 창을 늘려 둔다 — 화면 밖 보기의 체크도 다시 읽어 확인한다(실측: 숫자 키는
         안 보이는 보기도 체크한다). 끝나면 감시용 재사용 화면을 버린다.
         """
         with self._askq_tall_lock:
             first = self.capture_pane(lines)
-            if not askq_multi_screen_clipped(first):
+            if not askq_screen_needs_tall_read(first):
                 pending = [first]
                 yield lambda: pending.pop() if pending else self.capture_pane(lines)
                 return
@@ -10407,6 +10443,9 @@ class Bridge:
     question_receipts = ()
     askq_done_tool_ids = frozenset()
     askq_settle_checked_at = float("-inf")
+    # T-261107-009 스텁 바닥 — 고정 장부와 그 잠금.
+    question_pins = ()
+    question_pin_lock = None
 
     def __init__(self, config: Config, telegram: TelegramClient, repl: ClaudeReplTransport, token: str) -> None:
         self.config = config
@@ -10460,6 +10499,9 @@ class Bridge:
         self.askq_done_tool_ids: frozenset[str] = frozenset()
         # T-261024-023: 결과를 놓친 열린 질문의 기록 재확인 시각(15초 간격).
         self.askq_settle_checked_at = float("-inf")
+        # T-261107-009: 미응답 질문 카드 고정 장부 [{message_id, chat_id, session_id, created_at, pin_*}].
+        self.question_pins: list[dict[str, Any]] = []
+        self.question_pin_lock = threading.RLock()
         self.approval_cards: list[dict[str, Any]] = []
         self.completed_reply: dict[str, Any] | None = None
         self.background_flows: dict[str, dict[str, Any]] = {}
@@ -11841,6 +11883,7 @@ class Bridge:
             "orphaned_confirmed_turns": dict(getattr(self, "orphaned_confirmed_turns", {}) or {}),
             "question_tool": self.question_tool,
             "question_receipts": list(self.question_receipts),
+            "question_pins": list(getattr(self, "question_pins", []) or []),  # T-261107-009
             "approval_cards": list(getattr(self, "approval_cards", [])),
             "completed_reply": getattr(self, "completed_reply", None),
             "go_question_card": getattr(self, "go_question_card", None),
@@ -12054,6 +12097,12 @@ class Bridge:
             if card.get("session_id") != session_id and not card.get("completion"):
                 card["completion"] = self.tr('그 선택창이 이미 닫혔어요')
             self.question_receipts.append(card)
+        # T-261107-009: 고정 장부도 재기동을 넘긴다 — 확정된 고정은 다시 고정하지 않고, 닫힌 카드는 해제한다.
+        self.question_pins = []
+        for entry in state.get("question_pins") if isinstance(state.get("question_pins"), list) else []:
+            if (isinstance(entry, dict) and type(entry.get("message_id")) is int and entry["message_id"] > 0
+                    and isinstance(entry.get("chat_id"), str)):
+                self.question_pins.append(entry)
         self.question_card = None
 
     def _restore_orphaned_confirmed_turns(self, payload: Any) -> None:
@@ -15598,6 +15647,91 @@ class Bridge:
             log("CHOICE", f"question card completed message_id={card['message_id']}")
             self.persist_state()
 
+    def sync_question_pins(self, now: float | None = None) -> None:
+        """T-261107-009: 우리 질문 카드의 고정만 관리한다 — 틱당 네트워크 호출 1회.
+
+        고정 장부(question_pins)는 카드 목록과 따로 둔다. 열린 카드(답 없음·같은 세션·하루 안)는
+        고정하고, 답·만료·세션 변경이면 그 카드만 해제한다. 고정은 표시일 뿐 답변·권한이 아니다.
+        텔레그램을 부르기 전에 소유 필드를 먼저 저장해 응답이 유실돼도 주인 없는 고정이 남지
+        않게 하고, 네트워크 I/O 는 잠금 밖에서 해 답변 처리가 기다리지 않게 한다(코덱스 sync_pins 와 같은 의미).
+        """
+        pins = getattr(self, "question_pins", None)
+        if not isinstance(pins, list) or not pins:
+            return
+        binding = getattr(self, "session_binding", None)
+        session_id = getattr(binding, "session_id", None) if binding is not None else None
+        chat_id = str(getattr(getattr(self, "config", None), "chat_id", "") or "")
+        if not session_id or not chat_id.isdecimal() or int(chat_id) <= 0:
+            return
+        lock = getattr(self, "question_pin_lock", None)
+        if lock is None:
+            lock = self.question_pin_lock = threading.RLock()
+        now = time.time() if now is None else now
+        target = None
+        with lock:
+            cards = {}
+            for item in getattr(self, "question_receipts", ()) or ():
+                if isinstance(item, dict) and type(item.get("message_id")) is int:
+                    cards.setdefault(item["message_id"], item)
+            for entry in list(pins):
+                mid = entry.get("message_id")
+                if type(mid) is not int or mid <= 0 or entry.get("chat_id") != chat_id:
+                    continue
+                created = entry.get("created_at")
+                card = cards.get(mid)
+                open_card = card is not None and not card.get("completion")  # pin follows the native answer
+                pending = (
+                    open_card and card.get("session_id") == session_id
+                    and isinstance(created, (int, float)) and not isinstance(created, bool)
+                    and 0 <= now - created < QUESTION_PIN_TTL_SECONDS
+                )
+                if pending and entry.get("pin_confirmed") is True:
+                    continue
+                if not pending and not entry.get("pin_managed"):
+                    pins.remove(entry)  # never pinned by us — nothing to release
+                    self.persist_state()
+                    continue
+                action = "pinChatMessage" if pending else "unpinChatMessage"
+                same_action = entry.get("pin_action") == action
+                if same_action and entry.get("pin_attempts", 0) >= QUESTION_PIN_MAX_ATTEMPTS:
+                    if not pending:
+                        # 해제 상한 소진: 더는 부르지 않고 장부에서 뗀다(답변·카드는 무관).
+                        pins.remove(entry)
+                        self.persist_state()
+                        log("CHOICE", f"question card unpin abandoned message_id={mid}")
+                    continue
+                if same_action and now < entry.get("pin_retry_at", 0):
+                    continue
+                attempt = entry.get("pin_attempts", 0) + 1 if same_action else 1
+                entry.update(pin_managed=True, pin_confirmed=None, pin_action=action,
+                             pin_attempts=attempt, pin_retry_at=now + QUESTION_PIN_RETRY_SECONDS)
+                self.persist_state()
+                target = (entry, mid, action, attempt, pending)
+                break
+        if target is None:
+            return
+        entry, mid, action, attempt, pending = target
+        params: dict[str, Any] = {"chat_id": self.config.chat_id, "message_id": mid}
+        if pending:
+            params["disable_notification"] = True
+        try:
+            result = self.telegram.call(action, _request_timeout=5, _attempts=1, _wait_on_flood=False, **params)
+        except Exception as exc:  # noqa: BLE001
+            log("CHOICE", f"question card {action} failed: {type(exc).__name__} message_id={mid} attempt={attempt}")
+            result = None
+        if not (isinstance(result, dict) and result.get("ok") is True and result.get("result") is True):
+            return  # 상한 있는 재시도와 소유 표시는 그대로 두고, 답변은 건드리지 않는다.
+        with lock:
+            if (not any(item is entry for item in pins) or entry.get("message_id") != mid
+                    or entry.get("pin_action") != action or entry.get("pin_attempts") != attempt):
+                return
+            if pending:
+                entry["pin_confirmed"] = True
+            else:
+                pins.remove(entry)
+            self.persist_state()
+        log("CHOICE", f"question card {action} ok message_id={mid}")
+
     def release_approval_light(self, card: dict[str, Any]) -> None:
         """Public builds start no speaker request, so none is released."""
         return None
@@ -15626,6 +15760,7 @@ class Bridge:
         self.recover_late_question_cards()
         self.settle_open_question_from_transcript()
         self.refresh_question_cards()
+        self.sync_question_pins()
         try:
             screen = self.capture_question_screen(80)
         except Exception:  # noqa: BLE001
@@ -15772,6 +15907,13 @@ class Bridge:
             self.question_card.update(tool_id=tool["tool_id"], review=True)
         if isinstance(self.question_card["message_id"], int):
             self.question_receipts = [*self.question_receipts, self.question_card]
+            # T-261107-009: 고정 장부 — 어느 대화의 몇 번 메시지인지와 생성 시각만 적는다.
+            self.question_pins = [*getattr(self, "question_pins", []), {
+                "message_id": self.question_card["message_id"],
+                "chat_id": str(self.config.chat_id),
+                "session_id": self.question_card.get("session_id"),
+                "created_at": time.time(),
+            }]
             self.persist_state()
             self.maybe_announce_approval(self.question_card, parsed)
         log(
