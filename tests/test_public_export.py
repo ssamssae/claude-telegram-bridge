@@ -27,6 +27,68 @@ class PublicExportTest(unittest.TestCase):
                 self.assertEqual(record["questions"], questions)
                 self.assertEqual(record["tool_id"], "question-1")
 
+    def bridge_as_setup_configures_it(self, home):
+        """The bridge module and Config under the environment the setup wizard's runner exports."""
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("CLB_")}
+        environment.update(HOME=home, CLB_STATE_DIR=str(Path(home) / ".local" / "state" / "claude-telegram-bridge"))
+        with mock.patch.dict(os.environ, environment, clear=True):
+            mod = self.load_delivery_bridge()
+            return mod, mod.Config.from_env()
+
+    @staticmethod
+    def hook_environment(home, **extra):
+        # Claude Code runs the hooks; it never loads bridge.env, so no CLB_* reaches them.
+        environment = {key: value for key, value in os.environ.items()
+                       if not key.startswith("CLB_") and key != "CLAUDE_CODE_ENTRYPOINT"}
+        environment.update(HOME=home, **extra)
+        return environment
+
+    @unittest.skipIf(os.name == "nt", "POSIX hook; use WSL for tmux")
+    def test_session_start_hook_writes_the_session_file_the_bridge_reads(self):
+        root = Path(__file__).resolve().parents[1]
+        session_id = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"
+        with tempfile.TemporaryDirectory() as home:
+            transcript = Path(home) / ".claude" / "projects" / "demo" / f"{session_id}.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(root / "hooks" / "claude-telegram-bridge-session-start.sh")],
+                input=json.dumps({"transcript_path": str(transcript), "session_id": session_id}),
+                text=True, capture_output=True,
+                env=self.hook_environment(home, TMUX_PANE="%0", CLB_TMUX_BIN="false"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            _mod, config = self.bridge_as_setup_configures_it(home)
+            self.assertTrue(config.session_sidecar_path.is_file(), f"bridge reads {config.session_sidecar_path}")
+            sessions = json.loads(config.session_sidecar_path.read_text(encoding="utf-8"))["sessions"]
+            self.assertIn(f"{transcript}|{session_id}", sessions)
+
+    @unittest.skipIf(os.name == "nt", "POSIX hook; use WSL for tmux")
+    def test_egress_guard_hook_reads_the_ownership_file_the_bridge_writes(self):
+        root = Path(__file__).resolve().parents[1]
+        session_id = "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0"
+        with tempfile.TemporaryDirectory() as home:
+            transcript = Path(home) / ".claude" / "projects" / "demo" / f"{session_id}.jsonl"
+            mod, config = self.bridge_as_setup_configures_it(home)
+            config.pid_file.parent.mkdir(parents=True, exist_ok=True)
+            config.pid_file.write_text(json.dumps(mod.daemon_identity(config.pid_file)), encoding="utf-8")
+            bridge = mod.Bridge.__new__(mod.Bridge)
+            bridge.config = config
+            bridge.session_binding = mod.ClaudeSessionBinding(transcript, session_id, 0)
+            bridge.active_turn = SimpleNamespace(nonce="clb-egress-test", queue_id="queue-1")
+            bridge.question_card_capability = lambda: {}
+            bridge.write_egress_sidecar()
+            result = subprocess.run(
+                ["bash", str(root / "hooks" / "claude-telegram-bridge-pretool-block.sh")],
+                input=json.dumps({"tool_name": "mcp__plugin_telegram_telegram__reply",
+                                  "transcript_path": str(transcript), "session_id": session_id}),
+                text=True, capture_output=True, env=self.hook_environment(home),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("deny", result.stdout, f"guard hook did not see {config.egress_sidecar_path}")
+            decision = json.loads(result.stdout)["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+
     def load_delivery_bridge(self):
         path = Path(__file__).resolve().parents[1] / "claude_telegram_bridge.py"
         spec = importlib.util.spec_from_file_location("claude_public_delivery", path)

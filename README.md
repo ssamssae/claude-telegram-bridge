@@ -24,6 +24,10 @@ instead.)
 pipx install claude-telegram-bridge
 ```
 
+No `pipx` yet? On Ubuntu, Debian or WSL run `sudo apt update && sudo apt install pipx`
+and `pipx ensurepath`, then reopen the terminal ([Step 3](#step-3---install-the-bridge)
+has macOS and older-distro variants).
+
 **2. Create your private bot and copy its token.** In Telegram, open a chat with
 [`@BotFather`](https://t.me/BotFather), send `/newbot`, pick any name, and copy
 the token it hands back — it looks like `1234567890:AbCd...`. Keep it private:
@@ -139,7 +143,14 @@ The wizard validates the hidden BotFather token, waits for `/start` to detect
 your chat id, writes `token.json` and `token-registry.json`, installs the
 SessionStart hook, backs up and merges `~/.claude/settings.json`, installs the
 local service/watchdog, and sends one test message. It preserves unrelated
-Claude settings and does not replace an existing hook chain. In interactive
+Claude settings and does not replace an existing hook chain. The hooks are
+copied from the installed package, so they match your installed version and
+setup downloads nothing. A same-name service file that this setup did not
+create is first copied to the bridge config folder as `<name>.bak-<time>`,
+outside the service folder so launchd or systemd never loads the copy, and then
+replaced; interactive setup asks first. `uninstall` removes only the service files this
+setup created and keeps every backup. `setup --dry-run` lists the service files
+and every existing file setup would replace. In interactive
 `tmux` setup, a missing `CLB_TMUX_SOCKET`/`CLB_TMUX_SESSION` target prompts
 `Start the Claude tmux session now? [Y/n]` and defaults to yes. For
 non-interactive setup, opt in with `--create-session`; without that flag the
@@ -219,12 +230,18 @@ pipx install claude-telegram-bridge
 ```
 
 If `pipx` is not installed yet (`pipx: command not found`), install it once and
-reopen your terminal so it lands on PATH:
+reopen your terminal so it lands on PATH. On Debian, Ubuntu and the default WSL
+distro, use the system package:
 
 ```bash
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
+sudo apt update && sudo apt install pipx
+pipx ensurepath
 ```
+
+On macOS with Homebrew: `brew install pipx && pipx ensurepath`. Only on an older
+distro without a `pipx` package, use `python3 -m pip install --user pipx` and
+then `python3 -m pipx ensurepath` (Ubuntu 24.04 and newer stop that command with
+`error: externally-managed-environment`, PEP 668).
 
 On Windows PowerShell there is usually no `python3` command — use the `py`
 launcher instead:
