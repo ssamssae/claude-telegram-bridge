@@ -2252,6 +2252,50 @@ def node_defaults() -> tuple[str, str]:
     return "claude", "\U0001f916"
 
 
+# The fleet node alias table is private, so public node tokens have no mapped
+# label. ("", robot) is the answer callers already handle for an unknown node:
+# they fall back to the raw token for the label and keep the default emoji.
+def node_label_emoji(token: str) -> tuple[str, str]:
+    raw = (token or "").strip()
+    if raw and raw == node_defaults()[0]:
+        return node_defaults()
+    return "", "\U0001f916"
+
+
+def _label_for_emoji(emoji: str) -> str:
+    return ""  # No alias table to map an emoji back to a label.
+
+
+def alt3_narrative_enabled() -> bool:
+    return False  # Narrative directive cards are a private canary; public keeps the v0.1 cards.
+
+
+def subject_particle(name: str) -> str:
+    # Korean subject particle (이/가), chosen by the batchim of the final syllable.
+    if not name:
+        return "이"
+    code = ord(name[-1])
+    if 0xAC00 <= code <= 0xD7A3:
+        return "이" if (code - 0xAC00) % 28 else "가"
+    return "이"
+
+
+RELAY_ALERT_BIN_ENV = "CLB_RELAY_ALERT_BIN"
+
+
+def relay_alert_bin() -> Path:
+    # Optional operator script that relays a final answer when Telegram egress
+    # fails. Callers check exists() first and skip the relay when it is absent.
+    override = os.environ.get(RELAY_ALERT_BIN_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path("~/.config/claude-telegram-bridge/relay-alert.sh").expanduser()
+
+
+def reap_inflight_mesh_send_children() -> None:
+    return None  # No mesh send children on the direct Telegram API path.
+
+
 # T-260701-68: the internal mesh bus/ledger layer is stripped from the public
 # export, but call sites survive newer internal commits. Documented no-op stubs
 # keep the public bridge on the direct Telegram API path (None => legacy send).
