@@ -93,8 +93,11 @@ class HookSpec:
     timeout: int | None = None
 
 
-HOOK_BASE_URL = "https://raw.githubusercontent.com/ssamssae/claude-telegram-bridge/main/hooks/"
 SESSION_START_HOOK_NAME = "claude-telegram-bridge-session-start.sh"
+# Every service file setup writes starts with this marker. A same-name file without it was not
+# created by this setup: setup backs it up before replacing it, and uninstall leaves it alone.
+SETUP_MARKER = "Managed by claude-telegram-bridge setup"
+SERVICE_KINDS = {"Linux": "systemd user units", "Darwin": "launchd agents"}
 # Every hook the public repository ships. The plain wizard registers only the
 # first one; the author preset registers all of them (each is self-filtering:
 # the AskUserQuestion sidecar only reacts to that tool, the egress guard only
@@ -219,6 +222,14 @@ def default_runner_file() -> Path:
 
 def default_state_dir() -> Path:
     return Path.home() / ".local" / "state" / APP_NAME
+
+
+def hook_session_sidecar_file() -> Path:
+    """The session file the SessionStart hook writes when CLB_SESSION_SIDECAR is unset.
+
+    The hook runs inside Claude Code and never reads bridge.env, so the bridge reads this file too.
+    """
+    return Path.home() / ".claude" / "state" / "claude-telegram-bridge-sessions.json"
 
 
 def default_conpty_state_path() -> Path:
@@ -451,15 +462,22 @@ def load_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def tmux_target(config: dict[str, str]) -> tuple[str, str, str]:
+    """The tmux binary, socket and session in bridge.env: the session the bridge itself drives."""
+    return (
+        config.get("CLB_TMUX_BIN") or "tmux",
+        config.get("CLB_TMUX_SOCKET") or "default",
+        config.get("CLB_TMUX_SESSION") or "claude",
+    )
+
+
 def ensure_setup_tmux_session(
     options: SetupOptions,
     *,
     run: RunCommand = run_command,
 ) -> tuple[bool, str, str]:
     config = load_env_file(options.config_file)
-    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
-    socket = config.get("CLB_TMUX_SOCKET") or "default"
-    session = config.get("CLB_TMUX_SESSION") or "claude"
+    tmux_bin, socket, session = tmux_target(config)
     target = f"={session}"
     attach_command = shlex.join([tmux_bin, "-L", socket, "attach", "-t", session])
     manual_command = shlex.join([tmux_bin, "-L", socket, "new", "-s", session])
@@ -493,21 +511,22 @@ def ensure_setup_tmux_session(
     return False, attach_command, manual_command
 
 
-def download_hook(name: str) -> str:
+def packaged_hook(name: str) -> str:
+    """A hook from the installed package: the same release as this setup, read without network."""
     if name not in {spec.name for spec in PUBLIC_HOOKS}:
         raise SetupError(f"unknown hook: {name}")
+    path = REPO_DIR / "hooks" / name
     try:
-        with urllib.request.urlopen(HOOK_BASE_URL + name, timeout=30) as response:
-            text = response.read().decode("utf-8")
-    except Exception as exc:
-        raise SetupError(f"hook download failed ({name}): {exc}") from exc
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SetupError(f"packaged hook missing: {path}; reinstall claude-telegram-bridge") from exc
     if not text.startswith("#!/") or "claude-telegram-bridge" not in text:
-        raise SetupError(f"hook download returned unexpected content ({name})")
+        raise SetupError(f"packaged hook has unexpected content: {path}; reinstall claude-telegram-bridge")
     return text
 
 
-def download_session_start_hook() -> str:
-    return download_hook(SESSION_START_HOOK_NAME)
+def packaged_session_start_hook() -> str:
+    return packaged_hook(SESSION_START_HOOK_NAME)
 
 
 def preset_hook_path(hook_file: Path, spec: HookSpec) -> Path:
@@ -517,7 +536,7 @@ def preset_hook_path(hook_file: Path, spec: HookSpec) -> Path:
     return hook_file.with_name(spec.name)
 
 
-def install_session_start_hook(path: Path, loader: HookLoader = download_session_start_hook) -> None:
+def install_session_start_hook(path: Path, loader: HookLoader = packaged_session_start_hook) -> None:
     text = loader()
     if not text.endswith("\n"):
         text += "\n"
@@ -740,6 +759,7 @@ def install_runner(runner_file: Path, config_file: Path) -> None:
 def systemd_unit_content(runner_file: Path) -> str:
     return "\n".join(
         [
+            f"# {SETUP_MARKER} (uninstall removes this file)",
             "[Unit]",
             "Description=Claude Telegram Bridge",
             "After=network-online.target",
@@ -762,6 +782,7 @@ def watchdog_systemd_service_content() -> str:
     python_bin = sys.executable or shutil.which("python3") or "python3"
     return "\n".join(
         [
+            f"# {SETUP_MARKER} (uninstall removes this file)",
             "[Unit]",
             "Description=Claude Telegram Bridge watchdog",
             "After=network-online.target",
@@ -777,6 +798,7 @@ def watchdog_systemd_service_content() -> str:
 def watchdog_systemd_timer_content() -> str:
     return "\n".join(
         [
+            f"# {SETUP_MARKER} (uninstall removes this file)",
             "[Unit]",
             "Description=Run Claude Telegram Bridge watchdog",
             "",
@@ -804,6 +826,7 @@ def launchd_plist_content(label: str, arguments: list[str], *, interval: int | N
         [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+            f"<!-- {SETUP_MARKER} (uninstall removes this file) -->",
             '<plist version="1.0">',
             "<dict>",
             "    <key>Label</key>",
@@ -826,17 +849,92 @@ def launchd_plist_content(label: str, arguments: list[str], *, interval: int | N
     )
 
 
+def watchdog_launchd_plist_content() -> str:
+    python_bin = sys.executable or shutil.which("python3") or "python3"
+    return launchd_plist_content(WATCHDOG_LAUNCHD_LABEL, [python_bin, str(WATCHDOG_SCRIPT)], interval=60)
+
+
+def without_setup_marker(text: str) -> str:
+    return "".join(line for line in text.splitlines(keepends=True) if SETUP_MARKER not in line)
+
+
+def service_files(runner_file: Path, *, os_name: str) -> list[tuple[Path, str]]:
+    """(path, content) of each service file setup writes on this platform."""
+    if os_name == "Linux":
+        return [
+            (default_systemd_unit_file(), systemd_unit_content(runner_file)),
+            (default_watchdog_systemd_service_file(), watchdog_systemd_service_content()),
+            (default_watchdog_systemd_timer_file(), watchdog_systemd_timer_content()),
+        ]
+    if os_name == "Darwin":
+        return [
+            (default_launchd_plist_file(), launchd_plist_content(LAUNCHD_LABEL, [str(runner_file)])),
+            (default_watchdog_launchd_plist_file(), watchdog_launchd_plist_content()),
+        ]
+    return []
+
+
+def created_by_setup(path: Path, content: str) -> bool:
+    """True when the file carries this setup's marker or is exactly what an earlier release wrote."""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return SETUP_MARKER in existing or existing == without_setup_marker(content)
+
+
+def foreign_service_files(runner_file: Path, *, os_name: str) -> list[Path]:
+    """Existing same-name service files that this setup did not create."""
+    return [
+        path
+        for path, content in service_files(runner_file, os_name=os_name)
+        if path.exists() and not created_by_setup(path, content)
+    ]
+
+
+def service_backup_dir(backup_dir: Path | None) -> Path:
+    """Backups of replaced service files live in the bridge config folder, never in a service folder:
+    launchd and systemd must not load the copy next to the replacement."""
+    return backup_dir or default_config_dir()
+
+
+def write_service_file(path: Path, content: str, *, backup_dir: Path | None = None) -> None:
+    """Write a service file; one this setup did not create is copied to the config folder first."""
+    if path.exists() and not created_by_setup(path, content):
+        backup = backup_path(service_backup_dir(backup_dir) / path.name)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, backup)
+        warn(f"{path} was not created by this setup; saved a copy as {backup} before replacing it")
+    write_text_atomic(path, content, mode=0o644)
+
+
+def removable_service_file(path: Path, content: str) -> bool:
+    """True for a service file this setup created; a same-name file it did not create is kept."""
+    if not path.exists():
+        return False
+    if created_by_setup(path, content):
+        return True
+    warn(f"kept {path}: it was not created by this setup")
+    return False
+
+
+def note_kept_backups(path: Path, backup_dir: Path | None = None) -> None:
+    for backup in sorted(service_backup_dir(backup_dir).glob(path.name + ".bak-*")):
+        setup_note(f"kept backup: {backup}")
+
+
 def install_service(
     runner_file: Path,
     *,
     start: bool,
     os_name: str | None = None,
     run: RunCommand = run_command,
+    backup_dir: Path | None = None,
 ) -> Path | None:
     os_name = os_name or platform.system()
     if os_name == "Linux":
         path = default_systemd_unit_file()
-        write_text_atomic(path, systemd_unit_content(runner_file), mode=0o644)
+        write_service_file(path, systemd_unit_content(runner_file), backup_dir=backup_dir)
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", SERVICE_NAME])
         if start:
@@ -844,7 +942,7 @@ def install_service(
         return path
     if os_name == "Darwin":
         path = default_launchd_plist_file()
-        write_text_atomic(path, launchd_plist_content(LAUNCHD_LABEL, [str(runner_file)]), mode=0o644)
+        write_service_file(path, launchd_plist_content(LAUNCHD_LABEL, [str(runner_file)]), backup_dir=backup_dir)
         if start:
             domain = f"gui/{os.getuid()}"
             run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"])
@@ -859,13 +957,14 @@ def install_watchdog(
     start: bool,
     os_name: str | None = None,
     run: RunCommand = run_command,
+    backup_dir: Path | None = None,
 ) -> Path | None:
     os_name = os_name or platform.system()
     if os_name == "Linux":
         service = default_watchdog_systemd_service_file()
         timer = default_watchdog_systemd_timer_file()
-        write_text_atomic(service, watchdog_systemd_service_content(), mode=0o644)
-        write_text_atomic(timer, watchdog_systemd_timer_content(), mode=0o644)
+        write_service_file(service, watchdog_systemd_service_content(), backup_dir=backup_dir)
+        write_service_file(timer, watchdog_systemd_timer_content(), backup_dir=backup_dir)
         run(["systemctl", "--user", "daemon-reload"])
         run(["systemctl", "--user", "enable", WATCHDOG_TIMER_NAME])
         if start:
@@ -873,16 +972,7 @@ def install_watchdog(
         return timer
     if os_name == "Darwin":
         path = default_watchdog_launchd_plist_file()
-        python_bin = sys.executable or shutil.which("python3") or "python3"
-        write_text_atomic(
-            path,
-            launchd_plist_content(
-                WATCHDOG_LAUNCHD_LABEL,
-                [python_bin, str(WATCHDOG_SCRIPT)],
-                interval=60,
-            ),
-            mode=0o644,
-        )
+        write_service_file(path, watchdog_launchd_plist_content(), backup_dir=backup_dir)
         if start:
             domain = f"gui/{os.getuid()}"
             run(["launchctl", "bootout", f"{domain}/{WATCHDOG_LAUNCHD_LABEL}"])
@@ -892,27 +982,59 @@ def install_watchdog(
     return None
 
 
-def uninstall_service(*, os_name: str | None = None, run: RunCommand = run_command) -> None:
+def uninstall_service(
+    *,
+    os_name: str | None = None,
+    run: RunCommand = run_command,
+    runner_file: Path | None = None,
+    backup_dir: Path | None = None,
+) -> None:
+    """Stop and remove the bridge service only when this setup created its file; keep backups."""
     os_name = os_name or platform.system()
+    runner_file = runner_file or default_runner_file()
     if os_name == "Linux":
-        run(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
-        default_systemd_unit_file().unlink(missing_ok=True)
-        run(["systemctl", "--user", "daemon-reload"])
+        unit = default_systemd_unit_file()
+        if removable_service_file(unit, systemd_unit_content(runner_file)):
+            run(["systemctl", "--user", "disable", "--now", SERVICE_NAME])
+            unit.unlink(missing_ok=True)
+            run(["systemctl", "--user", "daemon-reload"])
+        note_kept_backups(unit, backup_dir)
     elif os_name == "Darwin":
-        run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"])
-        default_launchd_plist_file().unlink(missing_ok=True)
+        plist = default_launchd_plist_file()
+        if removable_service_file(plist, launchd_plist_content(LAUNCHD_LABEL, [str(runner_file)])):
+            run(["launchctl", "bootout", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"])
+            plist.unlink(missing_ok=True)
+        note_kept_backups(plist, backup_dir)
 
 
-def uninstall_watchdog(*, os_name: str | None = None, run: RunCommand = run_command) -> None:
+def uninstall_watchdog(
+    *,
+    os_name: str | None = None,
+    run: RunCommand = run_command,
+    backup_dir: Path | None = None,
+) -> None:
+    """Stop and remove the watchdog only when this setup created its files; keep backups."""
     os_name = os_name or platform.system()
     if os_name == "Linux":
-        run(["systemctl", "--user", "disable", "--now", WATCHDOG_TIMER_NAME])
-        default_watchdog_systemd_service_file().unlink(missing_ok=True)
-        default_watchdog_systemd_timer_file().unlink(missing_ok=True)
-        run(["systemctl", "--user", "daemon-reload"])
+        service = default_watchdog_systemd_service_file()
+        timer = default_watchdog_systemd_timer_file()
+        own_timer = removable_service_file(timer, watchdog_systemd_timer_content())
+        own_service = removable_service_file(service, watchdog_systemd_service_content())
+        if own_timer:
+            run(["systemctl", "--user", "disable", "--now", WATCHDOG_TIMER_NAME])
+            timer.unlink(missing_ok=True)
+        if own_service:
+            service.unlink(missing_ok=True)
+        if own_timer or own_service:
+            run(["systemctl", "--user", "daemon-reload"])
+        note_kept_backups(service, backup_dir)
+        note_kept_backups(timer, backup_dir)
     elif os_name == "Darwin":
-        run(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCHDOG_LAUNCHD_LABEL}"])
-        default_watchdog_launchd_plist_file().unlink(missing_ok=True)
+        plist = default_watchdog_launchd_plist_file()
+        if removable_service_file(plist, watchdog_launchd_plist_content()):
+            run(["launchctl", "bootout", f"gui/{os.getuid()}/{WATCHDOG_LAUNCHD_LABEL}"])
+            plist.unlink(missing_ok=True)
+        note_kept_backups(plist, backup_dir)
 
 
 def service_status(*, os_name: str | None = None, run: RunCommand = run_command) -> str:
@@ -937,8 +1059,39 @@ def watchdog_status(*, os_name: str | None = None, run: RunCommand = run_command
     return "manual"
 
 
-def setup_plan_lines(options: SetupOptions) -> list[str]:
-    """What `setup --dry-run` would do: files, switches, hooks, session. No I/O."""
+def existing_file_lines(options: SetupOptions, services: list[tuple[Path, str]]) -> list[str]:
+    """Files setup would replace that already exist, each with what happens to it first."""
+    interactive = not options.yes and not options.non_interactive
+    config_note = "backed up first" if options.like_author else ("asks first" if interactive else "replaced")
+    planned: list[tuple[Path, str]] = [
+        (options.config_file, config_note),
+        (options.token_file, "replaced"),
+        (options.registry_file, "replaced"),
+    ]
+    if options.transport != "conpty":
+        hooks = PUBLIC_HOOKS if options.like_author else PUBLIC_HOOKS[:1]
+        planned.extend((preset_hook_path(options.hook_file, spec), "replaced with the packaged copy") for spec in hooks)
+        planned.append((options.settings_file, "merged; backed up first"))
+        planned.append((options.runner_file, "replaced"))
+    copy_to = options.config_file.parent
+    foreign_note = "not created by this setup; " + (
+        f"asks, then saves a copy in {copy_to}" if interactive else f"a copy is saved in {copy_to} first"
+    )
+    lines = [f"  {path} ({note})" for path, note in planned if path.exists()]
+    lines.extend(
+        f"  {path} ({'replaced' if created_by_setup(path, content) else foreign_note})"
+        for path, content in services
+        if path.exists()
+    )
+    return lines
+
+
+def setup_plan_lines(options: SetupOptions, *, os_name: str | None = None) -> list[str]:
+    """What `setup --dry-run` would do: files, switches, hooks, services, session.
+
+    It only reads the disk to list files that already exist; it writes nothing and uses no network.
+    """
+    os_name = os_name or platform.system()
     lines = [
         "Dry run: nothing is written and Telegram is not contacted.",
         f"config: {options.config_file}",
@@ -948,7 +1101,7 @@ def setup_plan_lines(options: SetupOptions) -> list[str]:
     if options.like_author:
         lines.append("author preset switches (bridge.env):")
         lines.extend(f"  {key}={value}" for key, value in AUTHOR_PRESET_ENV)
-        lines.append("hooks (downloaded, then merged into Claude settings):")
+        lines.append("hooks (copied from the installed package, then merged into Claude settings):")
         for spec in PUBLIC_HOOKS:
             where = f"{spec.event} ({spec.matcher})" if spec.matcher else spec.event
             lines.append(f"  {where}: {preset_hook_path(options.hook_file, spec)}")
@@ -960,11 +1113,25 @@ def setup_plan_lines(options: SetupOptions) -> list[str]:
         f"runner: {options.runner_file}; service + watchdog: "
         + ("install" if options.install_service else "skip")
     )
+    services = (
+        service_files(options.runner_file, os_name=os_name)
+        if options.install_service and options.transport != "conpty"
+        else []
+    )
+    if services:
+        lines.append(f"service files ({SERVICE_KINDS.get(os_name, os_name)}):")
+        lines.extend(f"  {path}" for path, _content in services)
     if options.transport == "conpty":
         lines.append("transport: native ConPTY host (no tmux session)")
     else:
         lines.append("tmux session: default/claude, Claude started inside it")
         lines.append(f"attach any time with: {ATTACH_COMMAND}")
+    replaced = existing_file_lines(options, services)
+    if replaced:
+        lines.append("existing files setup would replace:")
+        lines.extend(replaced)
+    else:
+        lines.append("existing files setup would replace: none")
     if options.like_author:
         lines.append("self-check after install: bot -> phone, phone -> terminal -> phone, terminal -> phone")
     return lines
@@ -974,8 +1141,8 @@ def setup_bridge(
     options: SetupOptions,
     *,
     api_call: ApiCall = telegram_call,
-    hook_loader: HookLoader = download_session_start_hook,
-    hook_source: HookSource = download_hook,
+    hook_loader: HookLoader = packaged_session_start_hook,
+    hook_source: HookSource = packaged_hook,
     run: RunCommand = run_command,
 ) -> int:
     os_name = platform.system()
@@ -983,7 +1150,7 @@ def setup_bridge(
     native_conpty = os_name == "Windows" and transport == "conpty"
     if options.dry_run:
         out("Claude Telegram Bridge setup (dry run)")
-        for line in setup_plan_lines(options):
+        for line in setup_plan_lines(options, os_name=os_name):
             out(line)
         return 0
     out("Claude Telegram Bridge setup")
@@ -1083,9 +1250,20 @@ def setup_bridge(
     else:
         install_runner(options.runner_file, options.config_file)
         ok(f"installed runner: {options.runner_file}")
+    if options.install_service and not native_conpty and not options.yes and not options.non_interactive:
+        foreign = foreign_service_files(options.runner_file, os_name=os_name)
+        if foreign:
+            listed = ", ".join(str(path) for path in foreign)
+            answer = input(f"Not created by this setup: {listed}. Back up and replace? [y/N]: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                warn(f"kept {listed}; the bridge service and watchdog were not installed")
+                options = dataclasses.replace(options, install_service=False)
     if options.install_service and not native_conpty:
-        installed = install_service(options.runner_file, start=options.start_service)
-        watchdog = install_watchdog(start=options.start_service)
+        backup_dir = options.config_file.parent
+        installed = install_service(
+            options.runner_file, start=options.start_service, os_name=os_name, run=run, backup_dir=backup_dir
+        )
+        watchdog = install_watchdog(start=options.start_service, os_name=os_name, run=run, backup_dir=backup_dir)
         if installed:
             ok(f"installed service: {installed}")
         if watchdog:
@@ -1169,8 +1347,9 @@ def claude_sessions_outside_bridge(pane_tty: str, ps_text: str) -> list[tuple[st
     return found
 
 
-def warn_sessions_outside_bridge(*, run: RunCommand = run_command) -> int:
-    pane = run(["tmux", "-L", "default", "display-message", "-p", "-t", "claude", "#{pane_tty}"])
+def warn_sessions_outside_bridge(config: dict[str, str] | None = None, *, run: RunCommand = run_command) -> int:
+    tmux_bin, socket, session = tmux_target(config or {})
+    pane = run([tmux_bin, "-L", socket, "display-message", "-p", "-t", session, "#{pane_tty}"])
     processes = run(["ps", "-Ao", "pid=,tty=,comm="])
     outside = claude_sessions_outside_bridge(pane.stdout or "", processes.stdout or "")
     if not outside:
@@ -1195,9 +1374,7 @@ def attach_command(
     if (config.get("CLB_REPL_TRANSPORT") or "tmux").strip().lower() == "conpty":
         fail("attach works with the tmux transport; the native host owns its own window")
         return 2
-    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
-    socket = config.get("CLB_TMUX_SOCKET") or "default"
-    session = config.get("CLB_TMUX_SESSION") or "claude"
+    tmux_bin, socket, session = tmux_target(config)
     probe = run([tmux_bin, "-L", socket, "has-session", "-t", f"={session}"])
     if probe.returncode != 0:
         if not create_missing:
@@ -1347,9 +1524,7 @@ def author_self_check(
             "send any text to the bot later and run `claude-telegram-bridge doctor`"
         )
 
-    tmux_bin = config.get("CLB_TMUX_BIN") or "tmux"
-    socket = config.get("CLB_TMUX_SOCKET") or "default"
-    session = config.get("CLB_TMUX_SESSION") or "claude"
+    tmux_bin, socket, session = tmux_target(config)
     target = f"={session}"
     run([tmux_bin, "-L", socket, "send-keys", "-t", target, "-l", SELF_CHECK_PROBE])
     run([tmux_bin, "-L", socket, "send-keys", "-t", target, "Enter"])
@@ -1515,12 +1690,13 @@ def doctor(
             failures += 1
         setup_note("Native ConPTY health checks complete.")
     else:
-        proc = run(["tmux", "-L", "default", "has-session", "-t", "=claude"])
+        tmux_bin, socket, session = tmux_target(config)
+        proc = run([tmux_bin, "-L", socket, "has-session", "-t", f"={session}"])
         if proc.returncode == 0:
-            ok("tmux session found: default/claude")
-            warnings += warn_sessions_outside_bridge(run=run)
+            ok(f"tmux session found: {socket}/{session}")
+            warnings += warn_sessions_outside_bridge(config, run=run)
         else:
-            warn("tmux session missing: default/claude")
+            warn(f"tmux session missing: {socket}/{session}")
             warnings += 1
 
         try:
@@ -1540,7 +1716,7 @@ def doctor(
             fail(f"SessionStart hook not registered: {settings_file}")
             failures += 1
 
-        sidecar = Path(config.get("CLB_SESSION_SIDECAR", "") or state_dir / "claude-telegram-bridge-sessions.json")
+        sidecar = Path(config.get("CLB_SESSION_SIDECAR", "") or hook_session_sidecar_file()).expanduser()
         if sidecar.exists():
             ok(f"transcript sidecar exists: {sidecar}")
         else:
@@ -1573,8 +1749,8 @@ def uninstall(
         answer = input(f"Stop and remove {APP_NAME}? [Y/n]: ").strip().lower()
         if answer not in {"", "y", "yes"}:
             raise SetupError("uninstall cancelled")
-    uninstall_watchdog()
-    uninstall_service()
+    uninstall_watchdog(backup_dir=config_file.parent)
+    uninstall_service(runner_file=runner_file, backup_dir=config_file.parent)
     runner_file.unlink(missing_ok=True)
     for spec in PUBLIC_HOOKS:
         change = remove_hook(settings_file, preset_hook_path(hook_file, spec), event=spec.event)

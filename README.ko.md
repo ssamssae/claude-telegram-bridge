@@ -12,6 +12,12 @@ pipx install claude-telegram-bridge
 claude-telegram-bridge setup --language ko
 ```
 
+`pipx`가 없으면 먼저 설치하고 터미널을 다시 여세요.
+우분투·데비안·WSL은 `sudo apt update && sudo apt install pipx`를 실행한 뒤 `pipx ensurepath`를 실행합니다.
+macOS(Homebrew)는 `brew install pipx && pipx ensurepath`를 실행합니다.
+`pipx` 패키지가 없는 옛 배포판에서만 `python3 -m pip install --user pipx`와 `python3 -m pipx ensurepath`를 쓰세요.
+우분투 24.04 이상은 이 명령을 PEP 668(`externally-managed-environment`)로 막습니다.
+
 설정 안내에 따라 BotFather에서 만든 토큰을 입력하고, 본인 봇에 `/start`를 보내세요.
 설정 도구가 본인 채팅을 연결하고 서비스와 필요한 세션 연결을 준비합니다.
 이미 설치했다면 새로 설정할 필요 없이 봇에 `/language ko`를 보내면 됩니다.
@@ -36,7 +42,11 @@ pipx install claude-telegram-bridge && claude-telegram-bridge setup --like-autho
 
 그다음부터는 어느 터미널에서든 `claude-tg`를 치면 브릿지가 보는 바로 그 Claude 세션에 붙습니다. 폰과 터미널이 같은 세션을 씁니다.
 따로 연 Claude 창은 폰과 연결되지 않으며, `claude-telegram-bridge doctor`가 그런 창을 보면 경고합니다.
-`setup --like-author --dry-run`은 아무것도 바꾸지 않고 할 일만 보여 줍니다.
+`setup --like-author --dry-run`은 아무것도 바꾸지 않고 할 일만 보여 줍니다. 서비스 파일 경로와 이미 있어서 바꿀 파일 목록도 보여 줍니다.
+훅은 설치한 패키지에 든 파일을 복사하므로 설치한 버전과 같고, 설정 도구는 아무것도 내려받지 않습니다.
+같은 이름의 서비스 파일을 이 설정 도구가 만들지 않았으면, 설정 폴더에 `<이름>.bak-<시각>` 사본을 남긴 뒤 바꿉니다. 대화식 설정은 먼저 묻습니다.
+사본은 서비스 폴더 밖에 두므로 launchd·systemd가 사본을 다시 읽지 않습니다.
+`uninstall`은 이 설정 도구가 만든 서비스 파일만 지우고 백업은 남깁니다.
 
 ## 언어와 기본 사용
 

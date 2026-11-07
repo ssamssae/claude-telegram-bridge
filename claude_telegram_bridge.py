@@ -7809,10 +7809,10 @@ class Config:
             outbox_path=Path(env("CLB_OUTBOX_PATH", str(state_dir / f"{default_name}.outbox.json")) or "").expanduser(),
             quarantine_path=Path(env("CLB_QUARANTINE_PATH", str(state_dir / f"{default_name}.quarantine.jsonl")) or "").expanduser(),
             session_sidecar_path=Path(
-                env("CLB_SESSION_SIDECAR", str(state_dir / "claude-telegram-bridge-sessions.json")) or ""
+                env("CLB_SESSION_SIDECAR", "~/.claude/state/claude-telegram-bridge-sessions.json") or ""
             ).expanduser(),
             egress_sidecar_path=Path(
-                env("CLB_EGRESS_SIDECAR", str(state_dir / "claude-telegram-bridge-egress.json")) or ""
+                env("CLB_EGRESS_SIDECAR", "~/.claude/state/claude-telegram-bridge-egress.json") or ""
             ).expanduser(),
             token_registry_path=Path(
                 env("CLB_TOKEN_REGISTRY", "~/.config/claude-telegram-bridge/token-registry.json") or ""
