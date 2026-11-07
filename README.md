@@ -44,6 +44,36 @@ session, and Claude's finished answer comes back to your phone.
 That is the whole happy path. Everything below is reference — the full guided
 walkthrough, what each feature does, optional switches, and manual setup.
 
+### Like the author, in one command
+
+Want the maintainer's own setup instead of the bare defaults? Run setup with
+the author preset:
+
+```bash
+pipx install claude-telegram-bridge && claude-telegram-bridge setup --like-author
+```
+
+Only two steps still need a human: create the bot in `@BotFather` and send
+`/start` to it. Everything else is done for you: the private config, the four
+switches below, every bridge hook, the background service and watchdog, a tmux
+session with Claude started inside it, and a short self-check that sends one
+message from your phone to the terminal and back, then mirrors one terminal
+prompt to your phone. The interactive wizard asks the same thing as its first
+question, `Use the author's setup (recommended)? [Y/n]`, and defaults to yes.
+
+| Switch | What it turns on |
+| --- | --- |
+| `CLB_BUSY_INJECT=1` | A phone message lands in the Claude input line even while Claude is busy, with a "send now" button when it has to wait |
+| `CLB_FLOW_MIRROR=1` | The live work-flow card with its Stop button, and the "terminal input" / result cards for prompts typed at the keyboard |
+| `CLB_ASKUSER_CARDS_ENABLED=1` | Claude's terminal question boxes arrive on your phone as answerable cards |
+| `CLB_SUGGESTED_LOOP=1` | The suggested follow-up is sent for you after a cancel window; see [Suggested-reply auto-send](#suggested-reply-auto-send-clb_suggested_loop) |
+
+From then on, type `claude-tg` in any terminal to land in the one Claude
+session the bridge controls. Phone and terminal share that session. A Claude
+window opened anywhere else is not connected to your phone, and
+`claude-telegram-bridge doctor` warns when it sees one. Add `--dry-run` to
+`setup --like-author` to print what would be written without touching anything.
+
 ## Features At A Glance
 
 Everything in the first table works out of the box. Everything in the second
@@ -96,7 +126,9 @@ both surfaces.
 
 ### Recommended - run the setup wizard
 
-Install the package, then run the six-step wizard:
+Install the package, then run the six-step wizard (its first question offers
+the [author preset](#like-the-author-in-one-command); answer `n` for the bare
+defaults described here):
 
 ```bash
 pipx install claude-telegram-bridge
