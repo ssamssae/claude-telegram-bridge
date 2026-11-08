@@ -81,6 +81,7 @@ class SetupOptions:
     language: str = "en"
     like_author: bool = False
     dry_run: bool = False
+    session_workdir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -401,6 +402,7 @@ def write_private_config(
     conpty_state_path: Path | None = None,
     language: str = "en",
     like_author: bool = False,
+    session_workdir: Path | None = None,
 ) -> None:
     if language not in {"en", "ko"}:
         raise SetupError("language must be en or ko")
@@ -427,6 +429,8 @@ def write_private_config(
             "CLB_TMUX_SESSION=claude",
             ]
         )
+        if session_workdir is not None:
+            config_lines.append(f"CLB_SESSION_WORKDIR={shell_quote(session_workdir)}")
     if like_author:
         config_lines.extend(author_preset_lines())
     config_lines.extend(
@@ -471,10 +475,68 @@ def tmux_target(config: dict[str, str]) -> tuple[str, str, str]:
     )
 
 
+SESSION_WORKSPACE_NAME = "claude-workspace"
+# T-261108-015 ②④: 자체 점검이 멈춘 클로드 화면을 읽고 무엇을 누를지 알려 준다.
+TRUST_PROMPT_MARKERS = (
+    "Is this a project you created or one you trust",
+    "Yes, I trust this folder",
+    "Do you trust the files in this folder",
+)
+LOGIN_SCREEN_MARKERS = ("Select login method", "Please run /login", "Invalid API key", "Not logged in")
+API_BILLING_BANNER = "API Usage Billing"
+
+
+def session_workdir(config: dict[str, str], *, cwd: Path | None = None, home: Path | None = None) -> Path:
+    """Folder the Claude tmux session starts in (T-261108-015 ①).
+
+    Claude Code does not remember folder trust for the home folder, so a session started there stops
+    at the trust question on every start. Order: CLB_SESSION_WORKDIR, then the current folder unless it
+    is the home or root folder, then ~/claude-workspace.
+    """
+    configured = (config.get("CLB_SESSION_WORKDIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    home_dir = (home or Path.home()).expanduser()
+    current = (cwd or Path.cwd()).expanduser()
+    try:
+        resolved = current.resolve()
+        blocked = {home_dir.resolve(), Path(resolved.anchor)}
+    except OSError:
+        resolved, blocked = current, {home_dir}
+    if resolved in blocked:
+        return home_dir / SESSION_WORKSPACE_NAME
+    return current
+
+
+def session_screen_hint(screen: str) -> str:
+    """One line telling the user what to press when Claude waits on a screen (T-261108-015 ②④)."""
+    if any(marker in screen for marker in TRUST_PROMPT_MARKERS):
+        return (
+            "Claude is waiting at the folder-trust question: tap 'Yes, I trust this folder' on the "
+            "Telegram card, or attach to the session and choose it"
+        )
+    if any(marker in screen for marker in LOGIN_SCREEN_MARKERS):
+        return "Claude Code is not logged in: attach to the session and run /login (choose your Claude subscription)"
+    if API_BILLING_BANNER in screen:
+        return (
+            "the Claude banner shows API Usage Billing: if you use a Claude subscription, attach to "
+            "the session and run /login"
+        )
+    return ""
+
+
+def capture_session_screen(config: dict[str, str], *, run: RunCommand = run_command) -> str:
+    tmux_bin, socket, session = tmux_target(config)
+    result = run([tmux_bin, "-L", socket, "capture-pane", "-p", "-t", f"={session}"])
+    return (result.stdout or "") if result.returncode == 0 else ""
+
+
 def ensure_setup_tmux_session(
     options: SetupOptions,
     *,
     run: RunCommand = run_command,
+    cwd: Path | None = None,
+    home: Path | None = None,
 ) -> tuple[bool, str, str]:
     config = load_env_file(options.config_file)
     tmux_bin, socket, session = tmux_target(config)
@@ -500,11 +562,17 @@ def ensure_setup_tmux_session(
         warn("Claude CLI not found on PATH; tmux session creation skipped")
         return False, attach_command, manual_command
 
+    workdir = session_workdir(config, cwd=cwd, home=home)
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warn(f"could not create the session folder {workdir}: {exc}; start the session manually")
+        return False, attach_command, manual_command
     started = run(
-        [tmux_bin, "-L", socket, "new-session", "-d", "-s", session, claude_bin]
+        [tmux_bin, "-L", socket, "new-session", "-d", "-s", session, "-c", str(workdir), claude_bin]
     )
     if started.returncode == 0:
-        ok(f"started Claude tmux session: {socket}/{session}")
+        ok(f"started Claude tmux session: {socket}/{session} in {workdir}")
         return True, attach_command, manual_command
     detail = (started.stderr or started.stdout or f"exit {started.returncode}").strip()
     warn(f"could not start Claude tmux session: {detail}; start it manually")
@@ -1206,6 +1274,10 @@ def setup_bridge(
         previous = backup_path(options.config_file)
         shutil.copy2(options.config_file, previous)
         ok(f"backed up previous config: {previous}")
+    workdir = None
+    if transport != "conpty":
+        previous_config = load_env_file(options.config_file) if options.config_file.exists() else {}
+        workdir = options.session_workdir or session_workdir(previous_config)
     write_private_config(
         config_file=options.config_file,
         token_file=options.token_file,
@@ -1217,6 +1289,7 @@ def setup_bridge(
         conpty_state_path=options.conpty_state_path,
         language=options.language,
         like_author=options.like_author,
+        session_workdir=workdir,
     )
     ok(f"wrote private config: {options.config_file}")
     if options.like_author:
@@ -1258,6 +1331,12 @@ def setup_bridge(
             if answer not in {"y", "yes"}:
                 warn(f"kept {listed}; the bridge service and watchdog were not installed")
                 options = dataclasses.replace(options, install_service=False)
+    tmux_ready = False
+    attach_command = ""
+    manual_command = ""
+    if not native_conpty:
+        # T-261108-015 ③: 세션을 먼저 만든다. 서비스가 먼저 켜지면 브릿지가 세션을 못 찾고 재시작을 반복했다.
+        tmux_ready, attach_command, manual_command = ensure_setup_tmux_session(options, run=run)
     if options.install_service and not native_conpty:
         backup_dir = options.config_file.parent
         installed = install_service(
@@ -1279,12 +1358,6 @@ def setup_bridge(
             warn("test message failed; run doctor")
     else:
         setup_note("Test message skipped by option.")
-
-    tmux_ready = False
-    attach_command = ""
-    manual_command = ""
-    if not native_conpty:
-        tmux_ready, attach_command, manual_command = ensure_setup_tmux_session(options, run=run)
 
     out("")
     if native_conpty:
@@ -1384,12 +1457,18 @@ def attach_command(
         if not claude_bin:
             fail(f"Claude CLI not found on PATH; install Claude Code, then run {ATTACH_COMMAND} again")
             return 2
-        started = run([tmux_bin, "-L", socket, "new-session", "-d", "-s", session, claude_bin])
+        workdir = session_workdir(config)
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            fail(f"could not create the session folder {workdir}: {exc}")
+            return 2
+        started = run([tmux_bin, "-L", socket, "new-session", "-d", "-s", session, "-c", str(workdir), claude_bin])
         if started.returncode != 0:
             detail = (started.stderr or started.stdout or f"exit {started.returncode}").strip()
             fail(f"could not start Claude tmux session: {detail}")
             return 2
-        ok(f"started Claude tmux session: {socket}/{session}")
+        ok(f"started Claude tmux session: {socket}/{session} in {workdir}")
     clients = run([tmux_bin, "-L", socket, "list-clients", "-t", f"={session}"])
     if (clients.stdout or "").strip():
         setup_note(
@@ -1492,13 +1571,17 @@ def author_self_check(
     queue_path = Path(config.get("CLB_QUEUE_PATH") or state_dir / f"claude-telegram-bridge-{node}.queue.jsonl").expanduser()
     tail = log_tail if log_tail is not None else BridgeLogTail(os_name, run=run, since=clock())
 
+    first_hint = session_screen_hint(capture_session_screen(config, run=run))
+    if first_hint:
+        out(f"note: {first_hint}")
     started = clock()
     api_call(
         token,
         "sendMessage",
         chat_id=chat_id,
         text=(
-            f"Self-check 2/3: send any text to this bot within {int(phone_timeout)} s. "
+            (f"First: {first_hint}.\n" if first_hint else "")
+            + f"Self-check 2/3: send any text to this bot within {int(phone_timeout)} s. "
             "It should appear in the Claude terminal and the answer should come back here."
         ),
     )
@@ -1523,6 +1606,10 @@ def author_self_check(
             f"2/3 phone -> terminal -> phone: no phone message within {int(phone_timeout)} s; "
             "send any text to the bot later and run `claude-telegram-bridge doctor`"
         )
+    if not answered:
+        hint = session_screen_hint(capture_session_screen(config, run=run))
+        if hint:
+            lines[-1] += f"; {hint}"
 
     tmux_bin, socket, session = tmux_target(config)
     target = f"={session}"
@@ -1545,6 +1632,9 @@ def author_self_check(
             "confirm CLB_FLOW_MIRROR=1 in bridge.env and that the service restarted, then run "
             "`claude-telegram-bridge doctor`"
         )
+        hint = session_screen_hint(capture_session_screen(config, run=run))
+        if hint:
+            lines[-1] += f"; {hint}"
     for line in lines:
         out(line)
     api_call(token, "sendMessage", chat_id=chat_id, text="Setup self-check\n" + "\n".join(lines))
@@ -1807,6 +1897,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="create a missing tmux Claude session (opt-in for non-interactive setup)",
     )
+    setup_parser.add_argument(
+        "--workdir",
+        type=expand_path,
+        default=None,
+        help="folder the Claude tmux session starts in (default: the current folder, or "
+        "~/claude-workspace when run from the home folder)",
+    )
     setup_parser.add_argument("-y", "--yes", action="store_true")
     setup_parser.add_argument(
         "--like-author",
@@ -1918,6 +2015,7 @@ def main(argv: list[str] | None = None) -> int:
                     language=args.language,
                     like_author=args.like_author,
                     dry_run=args.dry_run,
+                    session_workdir=args.workdir,
                 )
             )
         if args.command == "doctor":

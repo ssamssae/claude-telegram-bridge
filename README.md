@@ -157,6 +157,16 @@ non-interactive setup, opt in with `--create-session`; without that flag the
 wizard keeps the manual start guidance. A ready session prints its attach
 command, for example `tmux -L default attach -t claude`.
 
+Setup starts that session before the service, so the bridge finds it on its first
+start. Claude starts in the folder you run setup from; from your home folder it
+starts in `~/claude-workspace` instead, because Claude Code asks the folder-trust
+question on every start in the home folder. Choose another folder with
+`setup --workdir <folder>`; setup saves it as `CLB_SESSION_WORKDIR` and
+`claude-telegram-bridge attach` reuses it. If the bridge service starts while the
+session is missing (for example after a reboot), it waits for the session instead
+of exiting. When the self-check finds Claude waiting at the folder-trust question,
+the login screen, or an `API Usage Billing` banner, it says what to press.
+
 Native Windows remains fail-closed by default: `tmux` mode must run inside WSL.
 When the bridge runs inside WSL, you can still watch the live Claude session
 from a plain PowerShell window:
