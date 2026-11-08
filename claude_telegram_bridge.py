@@ -6634,6 +6634,54 @@ def answer_outbox_key(nonce: str, assistant_uuid: str, answer: str) -> str:
     return copy_payload_dedup_key(answer) or outbox_key(nonce, assistant_uuid, answer)
 
 
+# T-261108-014 — 텔레그램 서비스 메시지(고정 알림 등)는 사람이 쓴 입력이 아니다.
+#   실사고 2026-11-08 16:39(macOS 노드): 브릿지가 승인 카드를 pinChatMessage 하자 텔레그램이
+#   「Claude macOS 노드님이 … 고정했습니다」 알림을 메시지 업데이트로 넘겼고, 글자 없는 메시지로
+#   처리돼 「처리할 텍스트나 media caption이 없습니다.」 답이 붙었다.
+#   키 목록 = Bot API Message 의 서비스 알림 필드. 사람이 버튼으로 고른 값(users_shared·
+#   chat_shared·web_app_data)과 결제·여권 데이터는 넣지 않는다 — 입력일 수 있다.
+TELEGRAM_SERVICE_MESSAGE_KEYS = (
+    "pinned_message",
+    "message_auto_delete_timer_changed",
+    "chat_background_set",
+    "write_access_allowed",
+    "new_chat_members",
+    "left_chat_member",
+    "new_chat_title",
+    "new_chat_photo",
+    "delete_chat_photo",
+    "group_chat_created",
+    "supergroup_chat_created",
+    "channel_chat_created",
+    "migrate_to_chat_id",
+    "migrate_from_chat_id",
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_closed",
+    "forum_topic_reopened",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "video_chat_scheduled",
+    "video_chat_started",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+    "proximity_alert_triggered",
+    "boost_added",
+)
+
+
+def telegram_service_message_kind(message: Any) -> str:
+    """서비스 알림이면 그 필드 이름, 사람이 쓴 메시지면 빈 문자열."""
+    if not isinstance(message, dict):
+        return ""
+    if message.get("text") or message.get("caption"):
+        return ""
+    for key in TELEGRAM_SERVICE_MESSAGE_KEYS:
+        if key in message:
+            return key
+    return ""
+
+
 def message_update_key(update: dict[str, Any], bot_token_hash: str) -> str:
     message = update.get("message") or update.get("edited_message") or {}
     if not isinstance(message, dict):
@@ -13056,6 +13104,8 @@ class Bridge:
                 assistant_uuid=active.pending_assistant_uuid or active.assistant_uuid or "",
                 recovered_from="outbox_sent",
             )
+        # T-261108-008: 이 턴보다 먼저 들어온 질문의 고아 기억은 더는 주인이 될 수 없다.
+        self.forget_orphans_older_than(active.user_seen_at, reason=f"after completed queue={active.queue_id[:10]}")
         self.persist_state()
         self.write_egress_sidecar()
         log(
@@ -16964,6 +17014,11 @@ class Bridge:
                 return
             self.note_unknown_chat(update, "chat_not_registered")
             return
+        service_kind = telegram_service_message_kind(message)
+        if service_kind:
+            # T-261108-014: 고정 알림 같은 서비스 메시지에는 답하지 않는다(위 상수 주석의 실사고).
+            log("QUEUE", f"ignore service message kind={service_kind} update={update.get('update_id')}")
+            return
         language = getattr(self, "language", None)
         language_reply = language.command(message.get("text") or "") if language else None
         if language_reply is not None:
@@ -18814,6 +18869,31 @@ class Bridge:
             return None
         return active
 
+    def forget_orphans_older_than(self, seen_at: float, *, reason: str = "") -> int:
+        """T-261108-008 — 더 새 텔레그램 턴이 정상 완료되면, 그보다 먼저 들어온 질문의 고아 기억은
+        주인이 될 수 없다. 클로드는 질문을 차례로 처리하므로 새 턴이 끝났다면 옛 턴의 진짜 답은
+        이미 지나갔다. 남겨 두면 sequence_matches_orphaned_turn 의 시간창(기본 2시간)이 그 뒤
+        주인 없는 답을 옛 질문에 붙인다(11/08 12:31 mid=38949, 1시간 전 질문에 답장)."""
+        orphans = getattr(self, "orphaned_confirmed_turns", None)  # T-260809-016 테스트 더블 방어와 같다
+        try:
+            seen_at = float(seen_at or 0.0)
+        except (TypeError, ValueError):
+            seen_at = 0.0
+        if not orphans or seen_at <= 0:
+            return 0
+        stale = []
+        for key, value in orphans.items():
+            if not isinstance(value, dict):
+                continue
+            seen = float(value.get("user_seen_at") or 0.0) or float(value.get("orphaned_at") or 0.0)
+            if 0 < seen < seen_at:
+                stale.append(key)
+        for key in stale:
+            orphans.pop(key, None)
+        if stale:
+            log("TURN", f"forgot {len(stale)} older orphaned turn(s)" + (f" {reason}" if reason else ""))
+        return len(stale)
+
     def _remember_orphaned_confirmed_turn(self, active: ActiveTurn) -> None:
         """T-260809-016 — stale-release 로 소유권을 놓기 직전 호출. user_uuid 가 실제로
         확인된(=진짜 텔레그램 질문이었음이 확정된) 턴만 기억한다 — 미확인 주입까지
@@ -20280,11 +20360,21 @@ class Bridge:
             return
         active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
         if not active:
+            # T-261108-008: 바쁠 때 보낸 텔레그램 메시지(대기 항목)가 이 답의 가장 가까운 사람
+            #   입력이면 그 메시지가 주인이다. 아래 ambient 최종답변 경로가 그 메시지의 답장으로
+            #   보낸다(T-261023-021). 고아 매칭이 먼저 돌면 시간창 폴백이 옛 질문에 붙인다
+            #   (11/08 12:31 mid=38949 — 1시간 전 질문의 답장으로 감).
+            #   대기 항목이 없으면 판정 함수(잠금 사용)를 부르지 않는다 — Bridge.__new__() 테스트 더블 방어.
+            queued_anchor = (
+                self.queued_telegram_reply_anchor(record)
+                if record.get("isSidechain") is False and getattr(self, "pending", None) else None
+            )
             # T-260809-016: 소유권을 잃은(stale release) 뒤 도착한 진짜 최종답장 —
             # ambient(노드발/cron) 미러와 달리 flow_mirror_enabled() 플래그와 무관하게
             # 반드시 착지시킨다. 진짜 텔레그램 질문의 답이었음이 user_uuid 로 이미
             # 확인된 턴만 대상이라, 터미널 직접입력 등 무관한 답변을 잘못 끌어오지 않는다.
-            if message.get("stop_reason") == "end_turn" and record.get("isSidechain") is False:
+            if (message.get("stop_reason") == "end_turn" and record.get("isSidechain") is False
+                    and queued_anchor is None):
                 orphan = self.match_orphaned_confirmed_turn(record.get("parentUuid"))
                 if orphan is None:
                     orphan = self.sequence_matches_orphaned_turn(record)
@@ -20322,7 +20412,10 @@ class Bridge:
                 self, "ambient_final_direct_deliver", False
             )
             handoff_active = bool(getattr(self, "ambient_handoff", None))
-            if flow_mirror_enabled() or mirror_final_direct or handoff_active:
+            # T-261108-008: 대기열 텔레그램 메시지의 답은 운영 미러가 아니라 사용자 질문의 답이다 —
+            #   flow mirror 가 꺼진 노드에서도 아래 mirror_ambient_final 이 그 메시지의 답장으로 보낸다.
+            queued_reply = queued_anchor is not None
+            if flow_mirror_enabled() or mirror_final_direct or handoff_active or queued_reply:
                 if message.get("stop_reason") != "end_turn":
                     if flow_mirror_enabled() or handoff_active:
                         if priority_lane_active():
@@ -21105,6 +21198,9 @@ class Bridge:
         if status != "interrupt":
             self.queue.append_status(self.queue_item_for_active(active), status)
             self.release_batched_busy_pending(active, status)
+        if status in {"sent", "answered"}:
+            # T-261108-008: 이 턴보다 먼저 들어온 질문의 고아 기억은 더는 주인이 될 수 없다.
+            self.forget_orphans_older_than(active.user_seen_at, reason=f"after {status} queue={active.queue_id[:10]}")
         self.persist_state()
         self.write_egress_sidecar()
         self.drain_queue()
@@ -21821,8 +21917,34 @@ class Bridge:
             self.service_suggested_loop_once()
             self.service_external_queue_once()
 
+    def wait_for_repl_session(self, poll_seconds: float = 5.0) -> bool:
+        # T-261108-015 ③: 클로드 tmux 세션이 아직 없으면 죽지 말고 기다린다. 공개판 새 설치(2026-11-08
+        #   작업 노드 ctb-fresh)에서 서비스가 세션보다 먼저 켜져 「tmux session not found」로 죽고 systemd 가
+        #   다섯 번 다시 켰다. 재부팅 뒤 세션을 늦게 켤 때도 같다. 다른 오류는 그대로 올린다.
+        announced = False
+        while not self.stop_event.is_set():
+            try:
+                self.repl.verify()
+            except Exception as exc:  # noqa: BLE001
+                if not is_tmux_session_lost_error(exc):
+                    raise
+                if not announced:
+                    log(
+                        "WAIT",
+                        f"{exc}; waiting for it (start Claude: tmux -L {self.config.tmux_socket} "
+                        f"new -s {self.config.tmux_session} claude)",
+                    )
+                    announced = True
+                self.stop_event.wait(poll_seconds)
+                continue
+            if announced:
+                log("START", "tmux session found; continuing")
+            return True
+        return False
+
     def run(self) -> None:
-        self.repl.verify()
+        if not self.wait_for_repl_session():
+            return
         self.load_pending_queue()
         self.acquire_lock()
         threads = [

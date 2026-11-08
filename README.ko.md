@@ -47,6 +47,11 @@ pipx install claude-telegram-bridge && claude-telegram-bridge setup --like-autho
 같은 이름의 서비스 파일을 이 설정 도구가 만들지 않았으면, 설정 폴더에 `<이름>.bak-<시각>` 사본을 남긴 뒤 바꿉니다. 대화식 설정은 먼저 묻습니다.
 사본은 서비스 폴더 밖에 두므로 launchd·systemd가 사본을 다시 읽지 않습니다.
 `uninstall`은 이 설정 도구가 만든 서비스 파일만 지우고 백업은 남깁니다.
+설정 도구는 서비스보다 tmux 세션을 먼저 만들어, 브릿지가 처음 켜질 때 세션을 바로 찾습니다.
+Claude는 설정 도구를 실행한 폴더에서 켜집니다. 홈 폴더에서 실행하면 대신 `~/claude-workspace`에서 켜집니다. Claude Code는 홈 폴더에서는 켤 때마다 폴더 신뢰를 다시 묻기 때문입니다.
+다른 폴더를 쓰려면 `setup --workdir <폴더>`를 씁니다. 설정 도구가 이 폴더를 `CLB_SESSION_WORKDIR`로 저장하고 `claude-telegram-bridge attach`도 같은 폴더를 씁니다.
+재부팅 뒤처럼 세션이 없을 때 서비스가 켜지면, 브릿지는 꺼지지 않고 세션이 생길 때까지 기다립니다.
+자가 점검은 Claude가 폴더 신뢰 질문·로그인 화면·`API Usage Billing` 배너에서 멈춰 있으면 무엇을 누를지 알려 줍니다.
 
 ## 언어와 기본 사용
 
