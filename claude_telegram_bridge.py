@@ -736,6 +736,15 @@ ACTIVE_SPINNER_RE = re.compile(
 ACTIVE_ROTATING_SPINNER_RE = re.compile(
     r"(?im)^\s*[·✶✻✳✢✽*]\s*[A-Za-z][A-Za-z'-]*…",
 )
+# T-261113-044: Claude Code 는 쉬는 중에도 스스로 대화를 압축한다(「Compacted while idle, before the
+# prompt cache expired」). 압축하는 동안 화면에는 「✳ Compacting conversation… (3m 38s · ↓ 5.8k tokens)」
+# 만 돌고 「esc to interrupt」가 없다. 낱말 둘 뒤에 말줄임표가 붙어 위 돌림판 규칙(낱말 하나 + …)에도
+# 안 걸려 idle 로 읽혔다. 그 사이 붙여 넣은 글은 Claude 대기열로 들어가지만 대기열 기록
+# (queue-operation enqueue)에 내용이 없어 제출 증거가 안 남고, 입력 칸의 흐린 대기열 안내 글을
+# 남은 글자로 읽어 「브릿지 제출 실패」를 냈다(제어 노드 2026-11-13 16:09, residual_len=32).
+COMPACTING_SPINNER_RE = re.compile(
+    r"(?im)^\s*[·✶✻✳✢✽*]\s*Compacting\s+conversation\s*(?:…|\.{3})",
+)
 ACTIVE_INTERRUPT_RE = re.compile(
     r"(?i)\b(?:esc\s+to\s+inter\s*rupt|inter\s*rupt\s+to\s+stop|still\s+thinking)\b",
 )
@@ -745,16 +754,37 @@ ACTIVE_FOREGROUND_TOOL_RE = re.compile(
 ACTIVE_BACKGROUND_HINT_RE = re.compile(
     r"(?i)\bctrl\+b\b.{0,80}\brun\s+in\s+background\b",
 )
-# T-260719-060: the Claude Code usage-limit banner freezes the live REPL in place
-# (pane-only; never surfaced in transcript JSONL). Without matching it, busy_state()
-# falls through to "idle" and drain_queue() feeds the frozen REPL → 0-second death +
-# lost message + infinite redrain. Kept tight + status-region-only so assistant answer
-# prose about "limits" cannot wedge the bridge (same lesson as APPROVAL_WAIT_RE).
+# T-260719-060: the Claude Code usage-limit banner freezes the live REPL in place.
+# busy_state() reads that banner from the pane. Without a match it falls through to
+# "idle" and drain_queue() feeds the frozen REPL → 0-second death + lost message +
+# infinite redrain. Status-region only, so scrollback prose about "limits" cannot
+# wedge the bridge (same lesson as APPROVAL_WAIT_RE).
+# T-261111-031: Claude Code 2.1.322 also writes the same limit into the transcript
+# JSONL as a synthetic assistant record (isApiErrorMessage, model "<synthetic>",
+# stop_reason stop_sequence). That record is a turn end (finish_synthetic_limit_turn).
+# The phrase is "reached your <one word> limit" — model names are not listed here.
+# The same sentence can stay above the live prompt together with a /model hint.
+# That hint is not the freeze banner; screen_has_usage_limit excludes it.
 USAGE_LIMIT_RE = re.compile(
     r"(?i)"
     r"\busage\s+limit\s+reached\b"
-    r"|\breached\s+your\s+(?:usage|weekly|\d+-hour)\s+limit\b"
+    r"|\breached\s+your\s+\S+\s+limit\b"
     r"|\blimit\s+reached\s*[·∙・]\s*resets\b",
+)
+# Frozen REPL only. "reached your <word> limit" is not enough on its own.
+USAGE_LIMIT_FREEZE_RE = re.compile(
+    r"(?i)"
+    r"\busage\s+limit\s+reached\b"
+    r"|\blimit\s+reached\s*[·∙・]\s*resets\b",
+)
+# Synthetic turn-end line: reached-your-<word>-limit plus /model guidance.
+# (?s) lets a narrow pane wrap before /model. The joined status path uses this too.
+MODEL_SWITCH_LIMIT_GUIDANCE_RE = re.compile(
+    r"(?is)\breached\s+your\s+\S+\s+limit\b.{0,400}/model\b",
+)
+SYNTHETIC_LIMIT_TURN_NOTICE = (
+    "모델 한도에 걸려 이 턴이 끝났어요. "
+    "/model 로 바꾸거나 한도가 풀린 뒤 다시 보내 주세요."
 )
 FEEDBACK_SURVEY_HEADERS = {
     "How is Claude doing this session?",
@@ -1778,7 +1808,7 @@ def composer_input_line(screen: str) -> tuple[str | None, str | None]:
     for index in range(len(lines) - 2, 0, -1):
         stripped = lines[index].strip()
         if not stripped.startswith("❯") or not (
-                CHOICE_RULE_RE.match(lines[index - 1].strip()) and CHOICE_RULE_RE.match(lines[index + 1].strip())):
+                COMPOSER_TOP_RULE_RE.match(lines[index - 1].strip()) and CHOICE_RULE_RE.match(lines[index + 1].strip())):
             continue
         menu = next((line.strip() for line in lines[index + 2:] if line.strip()), "")
         words = menu[1:].split() if menu.startswith("❯") else []
@@ -1825,7 +1855,7 @@ def send_now_composer_has_draft(ansi_screen: str) -> bool:
     lines = ansi_screen.splitlines()
     plain = [strip_ansi_control(line) for line in lines]
     for idx in range(len(lines) - 2, -1, -1):
-        if (not CHOICE_RULE_RE.match(plain[idx])
+        if (not COMPOSER_TOP_RULE_RE.match(plain[idx])
                 or not plain[idx + 1].lstrip().startswith(CHOICE_SELECTED_MARK)
                 or CHOICE_OPTION_RE.match(plain[idx + 1])):
             continue
@@ -1881,7 +1911,7 @@ def send_now_screen_ready(screen: str) -> bool:
     # put a Tip below the spinner, with indented continuations on narrow panes.
     lines = strip_ansi_control(screen).splitlines()
     for idx in range(len(lines) - 2, -1, -1):
-        if (CHOICE_RULE_RE.match(lines[idx])
+        if (COMPOSER_TOP_RULE_RE.match(lines[idx])
                 and lines[idx + 1].lstrip().startswith(CHOICE_SELECTED_MARK)):
             status = [line for line in lines[max(0, idx - 10):idx] if line.strip()]
             for hint_idx in range(len(status) - 2, -1, -1):
@@ -2884,6 +2914,35 @@ def fresh_context_cache(data: dict[str, Any], path: Path) -> bool:
     return (time.time() - timestamp) <= max_age
 
 
+def synthetic_limit_reset_kst(record: dict[str, Any]) -> str:
+    """KST reset hint from a synthetic limit record, or "" when the record has none."""
+    params = record.get("apiErrorParams")
+    info = params.get("rate_limit_info") if isinstance(params, dict) else None
+    if not isinstance(info, dict):
+        top = record.get("rate_limit_info")
+        info = top if isinstance(top, dict) else None
+    if not isinstance(info, dict):
+        return ""
+    raw = info.get("resetsAt")
+    if raw is None:
+        raw = info.get("resets_at")
+    hint = context_limit_reset_text(raw)
+    return f"{hint} KST" if hint else ""
+
+
+def format_synthetic_limit_notice(record: dict[str, Any]) -> str:
+    """One phone notice: original line, Korean guidance, KST reset when present."""
+    message = record.get("message") if isinstance(record.get("message"), dict) else {}
+    line = " ".join(content_text(message.get("content")).split())
+    if len(line) > 300:
+        line = line[:300].rstrip()
+    parts = [part for part in (line, SYNTHETIC_LIMIT_TURN_NOTICE) if part]
+    reset = synthetic_limit_reset_kst(record)
+    if reset:
+        parts.append(f"풀리는 시각 {reset}")
+    return "\n".join(parts)
+
+
 def usage_limit_reset_hint() -> str:
     """Best-effort HH:MM reset time for whichever rate-limit bucket is exhausted.
 
@@ -3496,6 +3555,10 @@ CHOICE_ANY_NUMBER_RE = re.compile(r"^\s*(?:❯\s+)?\d{1,3}\.\s+\S")
 CHOICE_HINT_RE = re.compile(r"(?i)\besc\s+to\s+cancel\b")
 # 가로줄 — U+2500(대화 입력줄 테두리) · U+2594(픽커 상단)
 CHOICE_RULE_RE = re.compile(r"^[─▔]{8,}\s*$")
+# 대화 입력줄 윗 테두리 — 이름 붙은 대화(/rename·백그라운드 세션)는 「──── 이름 ─」처럼 이름을
+# 윗 테두리 안에 그린다. 아래 테두리는 그대로 가로줄만이다. 11/15 작업 노드 실측: 이름 붙은 대화로
+# 다시 연 뒤 입력줄을 못 알아봐 쉬는 중이 D200 「확인 필요」로 떴다(T-261115-020).
+COMPOSER_TOP_RULE_RE = re.compile(r"^(?:[─▔]{8,}|─{8,} [^─▔]+? ─+)\s*$")
 CHOICE_MAX_OPTIONS = 9
 CHOICE_TITLE_MAX = 120
 
@@ -3538,7 +3601,7 @@ def pane_composer_visible(lines) -> bool:
     뜨면 입력줄이 통째로 사라지고, 유휴 화면에는 가로줄-❯-가로줄 3줄이 남는다.
     """
     for idx in range(len(lines) - 1, -1, -1):
-        if not CHOICE_RULE_RE.match(lines[idx]):
+        if not COMPOSER_TOP_RULE_RE.match(lines[idx]):
             continue
         nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
         stripped = nxt.lstrip()
@@ -4079,7 +4142,10 @@ FEEDBACK_DISCLAIMER = "Drafts live only on this machine"
 FEEDBACK_NEW_ROW_RE = re.compile(r"^(❯\s+)?\+ Write new feedback$")
 FEEDBACK_SEND_ROW_RE = re.compile(r"^(❯\s+)?Send feedback$")
 FEEDBACK_TRANSCRIPT_ROW_RE = re.compile(r"^(❯\s+)?Send\s+\S")
-FEEDBACK_ROW_RE = re.compile(r"^(❯\s+)?(?P<title>\S.*?)\s{2,}(?P<meta>[a-z][a-z _-]{0,30} · \S{1,8})$")
+# 120열 목록은 나이 뒤에 「 · /home/… · transcript available」이 더 붙는다 (T-261104-035).
+# 그 칸이 없어도 예전 「bug · 6d」는 그대로다. 나이 토큰은 8자 안이다.
+FEEDBACK_ROW_RE = re.compile(
+    r"^(❯\s+)?(?P<title>\S.*?)\s{2,}(?P<meta>[a-z][a-z _-]{0,30} · \S{1,8}(?: · .+)?)$")
 FEEDBACK_SENT_RE = re.compile(r"Feedback sent \(receipt\s+(?P<receipt>[0-9A-Za-z][0-9A-Za-z-]{7,63})\)")
 FEEDBACK_ENV_RE = re.compile(r"Environment info \((?P<env>[^)]*)\)")
 FEEDBACK_SCROLL_MARK_RE = re.compile(r"\s+[↑↓]$")
@@ -4106,6 +4172,19 @@ FEEDBACK_DRAFTED_BOX_MAX = 12  # 꼬리표 위로 머리줄을 찾는 최대 줄
 FEEDBACK_DRAFTED_TAIL_MAX = 2  # 상자 아래 허용 줄 수 — 힌트 줄(「Ctrl+Y to paste deleted text」) 실측 1줄
 FEEDBACK_DRAFTED_KEYS = {"send": "2", "review": "1", "dismiss": "0"}
 FEEDBACK_DRAFTED_DISMISSED_TEXT = "초안 상자를 닫았어요. 아무것도 보내지 않았어요. 초안은 이 노드에 그대로 있어요. 보내려면 /feedback 을 보내 주세요."
+# ── 초안 상자 보내기 확인 단계 (T-261115-022) ─────────────────────────────────────────────
+# 실측 2026-11-15 16:14 KST 작업 노드 Claude Code 2.1.325(tmux 55열): 상자에서 2 를 누르면 바로 보내지 않고 같은 상자(같은
+#   머리줄·요약) 안 꼬리표만 「Send without reviewing (full draft + env, no transcript)? 2 to send · Esc to back」로 바뀐다.
+#   좁은 창은 이 꼬리표가 상자 줄 두 개로 접힌다. 그 화면에서 2 를 한 번 더 누르자 1초 안에 초안 파일이 사라지고 입력줄이 돌아왔다.
+# 설치본 바이너리 2.1.325 문자열(상태 "confirmSend"): "Send without reviewing" + " " + "(full draft + env, no transcript)" + "?" + " "
+#   + 입력칸이 비었거나 숫자 하나면 「2 to send · Esc to back」, 아니면 "clear text to answer it". 대화 기록을 넣는 문구 변형은 이
+#   판에 없다(상자 보내기 = includeTranscript:!1 고정). 이 단계의 키: 2 = 보내기(「Sending…」→「Sent」→ 상자 닫힘), 0·Esc = 상자 첫
+#   화면, 1 = 검토 창. 값 True = 키를 받을 수 있는 꼬리표 — False 꼬리표 화면에는 2 를 누르지 않는다.
+FEEDBACK_DRAFTED_CONFIRM_FOOTERS = {
+    "Send without reviewing (full draft + env, no transcript)? 2 to send · Esc to back": True,
+    "Send without reviewing (full draft + env, no transcript)? clear text to answer it": False,
+}
+FEEDBACK_DRAFTED_FOOTER_LINES = 3  # 상자 꼬리표가 접힐 수 있는 최대 상자 줄 수
 
 
 def feedback_wait_seconds() -> float:
@@ -4127,6 +4206,15 @@ def feedback_sent_wait_seconds() -> float:
 def feedback_unconfirmed_hold_seconds() -> float:
     # 보내기 엔터 뒤 결과 화면을 못 읽었으면 그 화면이 아직 보내는 중일 수 있다 — 그동안 큐를 잡는다.
     return float_env("CLB_FEEDBACK_UNCONFIRMED_HOLD_SEC", 60.0)
+
+
+# Claude Code 2.1.310 은 검토 창이 열리거나 커서가 보내기 줄로 온 뒤 500ms 안의 엔터를 버린다.
+# 1.2초를 쉬고 누른 엔터는 전송됐다 (T-261104-035, 2026-11-04 작업 노드).
+FEEDBACK_SEND_ENTER_DELAY_SEC = 1.2
+
+
+def feedback_send_enter_delay() -> float:
+    return FEEDBACK_SEND_ENTER_DELAY_SEC
 
 
 def _feedback_lines(screen: str) -> list[str]:
@@ -4283,26 +4371,54 @@ def _feedback_box_text(line: str) -> str:
     return text.strip()
 
 
+def _feedback_drafted_footer(lines: list[str], bottom: int) -> tuple[str, bool, int]:
+    """상자 아래 테두리 바로 위 1~3개 상자 줄(안쪽 세로줄 없는 줄)을 이어 붙인 꼬리표 (T-261115-022).
+
+    (화면 종류 drafted·drafted_confirm 또는 "", 키 준비 여부, 꼬리표 첫 줄). 좁은 창은 확인 단계 꼬리표가 두 줄로 접힌다.
+    """
+    joined = ""
+    for count in range(1, FEEDBACK_DRAFTED_FOOTER_LINES + 1):
+        index = bottom - count
+        if index < 1 or not lines[index].startswith("│"):
+            break
+        text = _feedback_box_text(lines[index])
+        if not text or text.startswith("│"):
+            break  # 초안 요약 줄(안쪽 세로줄) 위로는 꼬리표가 아니다
+        joined = text if not joined else f"{text} {joined}"
+        if joined == FEEDBACK_DRAFTED_FOOTER:
+            return "drafted", True, index
+        if joined in FEEDBACK_DRAFTED_CONFIRM_FOOTERS:
+            return "drafted_confirm", FEEDBACK_DRAFTED_CONFIRM_FOOTERS[joined], index
+    return "", False, -1
+
+
 def _feedback_drafted(lines: list[str]) -> dict[str, Any] | None:
     """화면 맨 아래 초안 상자(「✻ … drafted:」 + 「1 to review · 2 to send · 0 to dismiss」)면 그 구조 (T-261031-014).
 
     규칙은 셸 검출기(tmux-repl-busy.sh detect_feedback_screen ⑤)와 같다: 끝 1~3줄 안에 상자 아래 테두리 ╰─╯, 그 바로 위
-    줄이 꼬리표, 위로 12줄 안에 「✻ <종류> drafted: <제목>」 머리줄과 그 바로 위 상자 위 테두리 ╭─╮, 사이 줄은 전부 상자
-    줄(│). 상자 아래 줄은 힌트 2줄까지만 — 입력줄(❯)·가로줄·상자 줄이 아래에 있으면 상자가 아니다(기록 인용).
+    1~3개 상자 줄이 꼬리표, 위로 12줄 안에 「✻ <종류> drafted: <제목>」 머리줄과 그 바로 위 상자 위 테두리 ╭─╮, 사이 줄은 전부
+    상자 줄(│). 상자 아래 줄은 힌트 2줄까지만 — 입력줄(❯)·가로줄·상자 줄이 아래에 있으면 상자가 아니다(기록 인용).
+    T-261115-022: 꼬리표가 「Send without reviewing … 2 to send · Esc to back」(2.1.325 보내기 확인 단계)이면 screen=drafted_confirm.
+    서명은 머리줄·요약만으로 만든다 — 같은 초안의 상자와 확인 단계는 서명이 같다.
+    T-261115-022 2차(11/15 17:37 작업 노드 55×23 실측): 확인 단계 꼬리표가 두 줄로 접혀 상자가 한 줄 길어지면 아래 테두리가 화면 밖으로
+    잘린다. 테두리가 없고 화면 마지막 줄이 양쪽 세로줄이 다 보이는 상자 줄이면 테두리가 화면 바로 밑에 있다고 보고 같은 규칙으로 읽는다.
     """
     bottom = -1
     for offset in range(1, min(FEEDBACK_DRAFTED_TAIL_MAX + 1, len(lines)) + 1):
         if FEEDBACK_BOX_BOTTOM_RE.match(lines[len(lines) - offset]):
             bottom = len(lines) - offset
             break
+    if bottom < 0 and lines and len(lines[-1]) > 1 and lines[-1].startswith("│") and lines[-1].endswith("│"):
+        bottom = len(lines)  # 아래 테두리 잘림 — 화면 바로 밑 가상의 테두리
     if bottom < 2:
         return None
     for line in lines[bottom + 1:]:
         if line.startswith(("❯", "╭", "╰", "│")) or CHOICE_RULE_RE.match(line):
             return None
-    if _feedback_box_text(lines[bottom - 1]) != FEEDBACK_DRAFTED_FOOTER:
+    screen, ready, footer_at = _feedback_drafted_footer(lines, bottom)
+    if not screen:
         return None
-    for index in range(bottom - 2, max(-1, bottom - 2 - FEEDBACK_DRAFTED_BOX_MAX), -1):
+    for index in range(footer_at - 1, max(-1, footer_at - 1 - FEEDBACK_DRAFTED_BOX_MAX), -1):
         if not lines[index].startswith("│"):
             return None
         match = FEEDBACK_DRAFTED_HEAD_RE.match(_feedback_box_text(lines[index]))
@@ -4311,12 +4427,15 @@ def _feedback_drafted(lines: list[str]) -> dict[str, Any] | None:
         if index == 0 or not FEEDBACK_BOX_TOP_RE.match(lines[index - 1]):
             return None
         title = match.group("title").strip()
-        summary = [_feedback_box_text(line).lstrip("│").strip() for line in lines[index + 1:bottom - 1]]
+        summary = [_feedback_box_text(line).lstrip("│").strip() for line in lines[index + 1:footer_at]]
         identity = "\n".join([match.group("type"), title, *summary])
-        return {
-            "kind": "feedback", "screen": "drafted", "type": match.group("type"), "title": title,
+        parsed = {
+            "kind": "feedback", "screen": screen, "type": match.group("type"), "title": title,
             "summary": summary, "signature": hashlib.sha256(identity.encode()).hexdigest()[:16],
         }
+        if screen == "drafted_confirm":
+            parsed["ready"] = ready
+        return parsed
     return None
 
 
@@ -4388,14 +4507,27 @@ def feedback_draft_matches_row(draft: dict[str, Any], row_title: str | None) -> 
 
 
 def feedback_draft_matches_env(draft: dict[str, Any], env: str | None) -> bool:
-    """검토 창 「Environment info」가 그 초안 파일의 버전·턴 수·모델과 같은가 (아래쪽 화면의 신원)."""
+    """검토 창 「Environment info」가 그 초안 파일의 버전·턴 수·모델과 같은가 (아래쪽 화면의 신원).
+
+    하위 에이전트가 있으면 턴 칸이 「turn 142/1335 with 3 subagents」다 (T-261104-035).
+    꼬리의 수가 초안 subagent_count 와 같으면 맞다. 턴 수·버전·모델·그 수가 다르면 불일치.
+    꼬리가 없으면 턴 수만 본다. subagent_count 가 없으면 0으로 본다.
+    """
     version, turns, messages = draft.get("cli_version"), draft.get("assistant_turn_count"), draft.get("message_count")
     if not env or not isinstance(version, str) or not version or type(turns) is not int or type(messages) is not int:
         return False
-    parts = {part.strip() for part in re.sub(r"\s+", " ", env).split(",")}
+    parts = [part.strip() for part in re.sub(r"\s+", " ", env).split(",") if part.strip()]
+    part_set = set(parts)
     model = draft.get("model")
-    return (f"v{version}" in parts and f"turn {turns}/{messages}" in parts
-            and (not isinstance(model, str) or not model or model in parts))
+    if f"v{version}" not in part_set:
+        return False
+    if isinstance(model, str) and model and model not in part_set:
+        return False
+    subs = draft.get("subagent_count")
+    if type(subs) is not int or subs < 0:
+        subs = 0
+    turn_re = re.compile(rf"^turn {turns}/{messages}(?: with {subs} subagents?)?$")
+    return any(turn_re.fullmatch(part) for part in parts)
 
 
 def feedback_card_details(card: dict[str, Any]) -> str:
@@ -4445,10 +4577,12 @@ def feedback_card_text(card: dict[str, Any], translate=lambda text: text) -> str
         head = translate("피드백 초안이 저장됐어요. 아직 보내지 않았어요.")
     elif kind == "drafted":
         head = translate("터미널에 피드백 초안 상자가 떠 있어요. 아직 보내지 않았어요.")
+    elif kind == "drafted_confirm":
+        head = translate("터미널 초안 상자가 보내기 확인 단계예요. 아직 보내지 않았어요.")
     else:
         head = translate("터미널에 피드백 검토 창이 열려 있어요. 아직 보내지 않았어요.")
     rows = [head, ""]
-    if kind == "drafted":
+    if kind in {"drafted", "drafted_confirm"}:
         rows += [f"✻ {card.get('box_type') or ''} drafted: {card.get('box_title') or ''}".rstrip(), ""]
     meta = [f"{translate('종류')}: {draft['type']}" if draft.get("type") else ""]
     for key, label in (("area", "분야"), ("failure_mode", "실패 유형"), ("task_category", "작업")):
@@ -4471,6 +4605,15 @@ def feedback_card_text(card: dict[str, Any], translate=lambda text: text) -> str
             rows.append(translate("어떤 초안인지 화면과 초안 파일로 확인하지 못해 폰에서는 보낼 수 없어요. 검토나 닫기만 돼요."))
         rows.append(translate("검토 = 터미널에 1을 눌러 검토 창을 열어요. 그다음 새 카드를 드려요."))
         rows.append(translate("닫기 = 터미널에 0을 눌러 상자만 닫아요. 초안은 이 노드에 남아요."))
+        rows.append(translate("상자가 떠 있는 동안 새 메시지는 기다려요. 글을 넣으면 첫 글자가 이 상자의 키로 먹혀요."))
+        return "\n".join(rows)
+    if kind == "drafted_confirm":
+        # T-261115-022: 2.1.325 상자의 두 번째 단계. 화면 문구 그대로 = 초안 전체 + 환경 정보, 대화 기록 없음.
+        if card.get("sendable"):
+            rows.append(translate("보내기 = 터미널에 2를 한 번 더 눌러요. 화면 표시대로 초안 전체와 환경 정보가 Anthropic 에 가요(대화 기록은 안 간다고 표시돼요)."))
+        else:
+            rows.append(translate("어떤 초안인지 화면과 초안 파일로 확인하지 못해 폰에서는 보낼 수 없어요. 돌아가기만 돼요."))
+        rows.append(translate("돌아가기 = 터미널에 Esc를 눌러 상자 첫 화면(1 검토 · 2 보내기 · 0 닫기)으로 돌아가요. 그다음 새 카드를 드려요."))
         rows.append(translate("상자가 떠 있는 동안 새 메시지는 기다려요. 글을 넣으면 첫 글자가 이 상자의 키로 먹혀요."))
         return "\n".join(rows)
     if not card.get("sendable"):
@@ -4501,6 +4644,9 @@ def feedback_card_keyboard(card: dict[str, Any], translate=lambda text: text) ->
     if card.get("kind") == "drafted":
         row = [button(translate("검토"), "review"), button(translate("닫기"), "dismiss")]
         return [[button(translate("보내기"), "send"), *row] if card.get("sendable") else row]
+    if card.get("kind") == "drafted_confirm":
+        back = button(translate("돌아가기"), "back")
+        return [[button(translate("보내기"), "send"), back] if card.get("sendable") else [back]]
     if not card.get("sendable"):
         return [[button(translate("나중에"), "later")]]
     return [[button(translate("보내기"), "send"), button(translate("나중에"), "later")]]
@@ -4532,6 +4678,14 @@ ASKQ_CLIPPED_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\
 ASKQ_FULL_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*(?:ctrl\+g to edit in Vim\s*·\s*)?Esc to cancel$")
 # T-261027-007: 보기에 preview 가 있으면 터미널이 오른쪽에 본문 상자를 그리고 끝줄에 「n to add notes」를 더한다.
 ASKQ_PREVIEW_HINT_RE = re.compile(r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*n to add notes\s*·\s*Esc to cancel$")
+# T-261108-016: 질문 여러 개(탭+Submit) 화면의 힌트. macOS 노드 55열 창은 이 줄을 「… Esc to」/「cancel」로 접는다
+#   (2026-11-08 클로드 2.1.319 55×23 실측). 접힌 줄을 못 이어 읽어 폰 카드가 안 갔다.
+ASKQ_TABS_HINT_RE = re.compile(r"^Enter to select\s*·\s*Tab/Arrow keys to navigate\s*·\s*(?:ctrl\+g to edit in Vim\s*·\s*)?Esc to cancel$")
+# T-261109-025: 질문 여러 개(탭)인데 보기에 preview 가 있으면 힌트가 또 다르다(2026-11-09 클로드 2.1.319 작업 노드 격리 세션
+#   실측). 80열 창은 「… Tab to switch questions ·」/「Esc to cancel」, 55열 창은 「… n to add notes ·」/「Tab to switch
+#   questions · Esc to cancel」로 접는다. 이 힌트를 못 읽어 제어 노드 승인 질문 3개 카드가 폰에 3시간 안 갔다(11/09 12:31).
+ASKQ_TABS_PREVIEW_HINT_RE = re.compile(
+    r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*n to add notes\s*·\s*Tab to switch questions\s*·\s*Esc to cancel$")
 ASKQ_PREVIEW_BOX_RE = re.compile(r"\s{2,}┌─+")
 ASKQ_PREVIEW_SELECTED_RE = re.compile(r"^\s*❯\s*([1-9])\.")
 # preview 상자 화면의 대화 줄은 번호가 없다(v2.1.311 제어 노드 격리 세션 실측, T-261027-007).
@@ -4650,7 +4804,8 @@ def _askq_body_above_hint(screen: str) -> list[str] | None:
     for count in (2, 3):
         if len(lines) >= count:
             footer = " ".join(line.strip() for line in lines[-count:])
-            if ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer):
+            if (ASKQ_TABS_PREVIEW_HINT_RE.fullmatch(footer) or ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer)
+                    or ASKQ_TABS_HINT_RE.fullmatch(footer)):
                 lines[-count:] = [footer]
                 break
     for idx in range(len(lines) - 1, max(-1, len(lines) - 8), -1):
@@ -4659,9 +4814,25 @@ def _askq_body_above_hint(screen: str) -> list[str] | None:
     return None
 
 
+def _askq_body_above_review(screen: str) -> list[str] | None:
+    """여러 개 고르기·질문 여러 개의 마지막 제출 확인 화면에서 「Ready to submit your answers?」 위 줄들. 아니면 None (T-261108-016).
+
+    그 화면은 하단 선택 힌트 없이 끝난다(실측) — parse_ask_question 과 같은 범위(끝 다섯 줄)에서 제목을 찾는다.
+    """
+    lines = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for idx in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
+        if lines[idx].strip() == ASKQ_REVIEW_TITLE:
+            return lines[:idx]
+    return None
+
+
 def askq_question_header_visible(screen: str) -> bool:
-    """머리표(☐/☒) 줄과 하단 선택 힌트가 둘 다 보이는 질문 화면인가 — 늘린 창이 다 그려졌다는 신호."""
+    """머리표(☐/☒) 줄과 하단 선택 힌트(제출 확인 화면은 그 제목)가 둘 다 보이는 질문 화면인가 — 늘린 창이 다 그려졌다는 신호."""
     body = _askq_body_above_hint(screen)
+    if body is None:
+        body = _askq_body_above_review(screen)
     return body is not None and any(ASKQ_TAB_RE.match(line) for line in body)
 
 
@@ -4704,9 +4875,29 @@ def askq_preview_screen_clipped(screen: str) -> bool:
     return False
 
 
+def askq_tabs_screen_clipped(screen: str) -> bool:
+    """질문 여러 개(탭+Submit) 화면인데 탭 줄(☐ 머리표들)이 화면 위로 밀린 화면인가 (T-261108-016).
+
+    그 화면 고유 힌트(Tab/Arrow keys to navigate)가 끝줄에 있고 탭 줄이 없을 때만 참이다. 탭 줄이 없으면
+    어느 질문인지 못 가려 카드를 못 만든다 — 창을 잠깐 늘려 다시 읽는다. 단일 질문 화면은 힌트가 달라 안 걸린다.
+    마지막 제출 확인 화면은 힌트 없이 끝나는데, 창이 낮으면(55×12 실측) 그 위 탭 줄도 밀린다 — 같이 본다.
+    보기에 preview 가 있는 질문 여러 개 화면은 힌트가 달라(↑/↓ · n to add notes · Tab to switch questions) 같이 본다
+    (T-261109-025).
+    """
+    lines = [line.rstrip() for line in strip_ansi_control(screen or "").splitlines()]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for count in (1, 2, 3):
+        footer = " ".join(line.strip() for line in lines[-count:]) if len(lines) >= count else ""
+        if ASKQ_TABS_HINT_RE.fullmatch(footer) or ASKQ_TABS_PREVIEW_HINT_RE.fullmatch(footer):
+            return not any(ASKQ_TAB_RE.match(line) for line in lines[:-count])
+    above = _askq_body_above_review(screen)
+    return above is not None and not any(ASKQ_TAB_RE.match(line) for line in above)
+
+
 def askq_screen_needs_tall_read(screen: str) -> bool:
-    """창을 잠깐 늘려 다시 읽어야 하는 질문 화면인가 — 머리표가 밀린 여러 개 고르기·preview 질문."""
-    return askq_multi_screen_clipped(screen) or askq_preview_screen_clipped(screen)
+    """창을 잠깐 늘려 다시 읽어야 하는 질문 화면인가 — 머리표가 밀린 여러 개 고르기·preview·질문 여러 개 화면."""
+    return askq_multi_screen_clipped(screen) or askq_preview_screen_clipped(screen) or askq_tabs_screen_clipped(screen)
 
 
 def askq_screen_key(screen: str) -> str:
@@ -4891,9 +5082,10 @@ def fold_ask_question_freeform(lines):
     return None
 
 
-def parse_preview_ask_question(body, header: str, question_tool, session_id):
+def parse_preview_ask_question(body, header: str, question_tool, session_id, index: int | None = None):
     """T-261027-007: preview 상자가 있는 질문 화면은 보기 줄이 상자와 섞여 깨진다(macOS 노드 10/27 11:42 실측).
-    묶인 native 질문 원본으로만 읽는다 — 상자와 ❯ 줄이 화면에 보이고 원본에 preview 가 있을 때만."""
+    묶인 native 질문 원본으로만 읽는다 — 상자와 ❯ 줄이 화면에 보이고 원본에 preview 가 있을 때만.
+    index 를 주면 질문 여러 개(탭) 중 그 질문을 읽는다(T-261109-025 — 어느 질문인지는 호출부가 질문 글로 가린다)."""
     if (
         not isinstance(question_tool, dict) or not session_id
         or question_tool.get("session_id") != session_id or question_tool.get("completed")
@@ -4901,9 +5093,15 @@ def parse_preview_ask_question(body, header: str, question_tool, session_id):
     ):
         return None
     questions = question_tool.get("questions")
-    if not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict):
-        return None
-    question = questions[0]
+    if index is None:
+        if not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict):
+            return None
+        question = questions[0]
+    else:
+        if (type(index) is not int or not isinstance(questions, list) or not 0 <= index < len(questions)
+                or not isinstance(questions[index], dict)):
+            return None
+        question = questions[index]
     title, native_options = question.get("question"), question.get("options")
     if (
         question.get("multiSelect", False) is not False
@@ -4972,6 +5170,42 @@ def parse_clipped_preview_ask_question(lines, hint_idx: int, question_tool, sess
     return parse_preview_ask_question(lines[first_option:hint_idx], "☐ " + header.strip(), question_tool, session_id)
 
 
+def parse_tabs_preview_ask_question(body, header: str, question_tool, session_id):
+    """T-261109-025: 질문 여러 개(탭)에 보기 preview 가 있는 화면(2026-11-09 클로드 2.1.319 작업 노드 격리 세션 실측).
+
+    보기 줄 오른쪽에 preview 상자가 같은 줄로 그려져(「❯ 1. 승인 … ┌──┐」) 일반 해석은 상자 글자를 보기 이름에
+    붙인다. 탭 줄에는 지금 어느 질문인지가 글자로 안 남으므로(색으로만 표시) 탭 줄 바로 아래 인용 레일 질문 글이
+    묶인 native 질문 하나와 정확히 같을 때만 그 질문의 원본으로 읽는다. 이 화면도 숫자는 커서만 옮기고 Enter 가
+    확정한다(실측) — parse_preview_ask_question 과 같은 계약이라 그 해석기를 그 질문 번호로 부른다.
+    탭 줄 아래에 다른 장면이 끼어 있으면(옛 화면 기록 — 대화 줄 둘·힌트 줄·보기 번호 반복) 읽지 않는다.
+    """
+    questions = question_tool.get("questions") if isinstance(question_tool, dict) else None
+    if not isinstance(questions, list) or len(questions) < 2:
+        return None
+    first_option = next((idx for idx, raw in enumerate(body) if CHOICE_OPTION_RE.match(raw)), None)
+    if first_option is None:
+        return None
+    if (sum(1 for raw in body if ASKQ_PREVIEW_CHAT_ROW_RE.match(raw)) > 1
+            or any(ASKQ_HINT_RE.search(raw) for raw in body)):
+        return None
+    rail = [raw for raw in body[:first_option] if raw.strip()]
+    if not rail or not all(ASKQ_RAIL_RE.match(raw) for raw in rail):
+        return None
+    visible = askq_text_key("".join(re.sub(r"^\s*│\s?", "", raw) for raw in rail))
+    matches = [
+        idx for idx, question in enumerate(questions)
+        if isinstance(question, dict) and isinstance(question.get("question"), str)
+        and askq_text_key(question["question"]) == visible
+    ]
+    if len(matches) != 1:
+        return None
+    native_options = questions[matches[0]].get("options")
+    numbers = [int(m.group(2)) for m in (CHOICE_OPTION_RE.match(raw) for raw in body[first_option:]) if m]
+    if not isinstance(native_options, list) or numbers != list(range(1, len(native_options) + 1)):
+        return None
+    return parse_preview_ask_question(body[first_option:], header, question_tool, session_id, index=matches[0])
+
+
 def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
     """AskUserQuestion 화면을 구조로 읽는다. 못 읽으면 조용히 None (오탐 버튼 < 폴백)."""
     text = strip_ansi_control(screen or "")
@@ -4982,10 +5216,12 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
         return None
     # Narrow fullscreen terminals wrap the extra Vim hint after freeform focus.
     # Fold only an exact native footer at the screen end, never arbitrary text.
+    # T-261108-016: the multi-question (tabs) footer wraps the same way at 55 columns.
+    # T-261109-025: so does the tabs footer with option previews, at 80 and 55 columns.
     for count in (2, 3):
         if len(lines) >= count:
             footer = " ".join(line.strip() for line in lines[-count:])
-            if ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer):
+            if ASKQ_TABS_PREVIEW_HINT_RE.fullmatch(footer) or ASKQ_FULL_HINT_RE.fullmatch(footer) or ASKQ_PREVIEW_HINT_RE.fullmatch(footer) or ASKQ_TABS_HINT_RE.fullmatch(footer):
                 lines[-count:] = [footer]
                 break
     wrapped = fold_ask_question_freeform(lines)
@@ -5021,6 +5257,10 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
             return parse_clipped_preview_ask_question(lines, hint_idx, question_tool, session_id)
         return parse_clipped_ask_question(lines, hint_idx, question_tool, session_id) if review_idx < 0 else None
     header = " ".join(lines[tab_idx].split())
+    if review_idx < 0 and ASKQ_TABS_PREVIEW_HINT_RE.fullmatch(lines[hint_idx].strip()):
+        # T-261109-025: 질문 여러 개+preview 화면은 보기 줄에 상자가 붙어 일반 해석이 상자 글자를 보기 이름에 넣는다.
+        #   native 원본으로만 읽고, 못 읽으면 깨진 카드 대신 None.
+        return parse_tabs_preview_ask_question(lines[tab_idx + 1:hint_idx], header, question_tool, session_id)
     # Use the same native identity when a resize brings the header back. This
     # keeps the card and callback signature stable across clipped/full frames.
     native_questions = question_tool.get("questions", []) if isinstance(question_tool, dict) else []
@@ -5160,6 +5400,36 @@ def native_option_previews(question) -> list[str]:
         if isinstance(text, str) and text.strip() and text.strip() not in previews:
             previews.append(text.strip())
     return previews
+
+
+def question_card_kept_preview(parsed, translate=lambda text: text) -> str:
+    """T-261113-014: 답을 고른 뒤 카드에 남길 원문 칸(라벨+원문). 원문이 없는 카드는 빈 글이다.
+
+    카드를 처음 보낼 때와 같은 글을 기록해 두고, 답이 오면 완료 글에 다시 싣는다 —
+    사용자이 무엇을 승인했는지가 카드에서 사라지지 않게 한다(2026-11-13 사용자 요청).
+    """
+    preview = question_card_preview_text(parsed.get("preview") or [], parsed.get("preview_tail"))
+    if not preview:
+        return ""
+    return translate(parsed.get("preview_label") or "보낼 원문:") + "\n" + preview
+
+
+QUESTION_CARD_COMPLETION_BUDGET = 4000  # UTF-16 units, under Telegram's 4096 message limit
+
+
+def question_card_completion_text(title: str, completion: str, kept_preview: str = "") -> str:
+    """답 뒤 카드 글 = 제목 + (남긴 원문) + 결과. 한 장(4096) 안에 들도록 원문만 줄인다."""
+    def units(value: str) -> int:
+        return len(value.encode("utf-16-le")) // 2
+    head = f"❓ {title[:1500]}\n\n"
+    if not kept_preview:
+        return head + completion
+    room = QUESTION_CARD_COMPLETION_BUDGET - units(head) - units(completion) - 2
+    if units(kept_preview) > room:
+        tail = "\n…"
+        kept = split_by_utf16_budget(kept_preview, max(room - units(tail), 0) or 1)[0] if room > units(tail) else ""
+        kept_preview = (kept.rstrip() + tail) if kept else ""
+    return head + (kept_preview + "\n\n" if kept_preview else "") + completion
 
 
 def ask_question_card_text(parsed, translate=lambda text: text) -> str:
@@ -5338,6 +5608,13 @@ def format_reasoning_mirror(text: str) -> str:
 # T-260818-026: ambient 미러가 이 시간 이상 연속 차단되면 1줄 남긴다(도배 방지 겸 rate-limit).
 #   300s = 정상적인 긴 턴은 넘기고, 「구조적으로 막혔다」만 잡히는 값.
 AMBIENT_MIRROR_BLOCKED_WARN_SEC = float(os.environ.get("CLB_AMBIENT_MIRROR_BLOCKED_WARN_SEC", "300"))
+
+# T-261108-018: 최종 답이 자기 텔레그램 질문까지 부모 사슬을 거슬러 오를 수 있게 남기는 칸 수.
+#   종전 1000칸 초과 → 최근 700칸은 700단계보다 긴 턴의 답을 주인 없는 답으로 만들었다
+#   (11/08 macOS 노드 1,621단계·10/22 제어 노드 1,306줄 → 「ambient final 미러 차단」으로 폰 미착).
+#   한 칸은 uuid 문자열 두 개라 2만 칸도 수 MB 안이다.
+PARENT_MAP_MAX = 20000
+PARENT_MAP_KEEP = 15000
 
 
 def flow_mirror_enabled() -> bool:
@@ -6368,9 +6645,11 @@ def screen_has_question_wait(screen: str) -> bool:
         return True
     # T-261027-007: preview 상자 화면은 대화 줄에 번호가 없다 — 그 화면 고유 힌트(n to add notes)가
     # 끝줄에 있을 때만 받는다. 놓치면 멈춤 자가복구가 답 대기 중인 턴을 풀어 「버려졌어요」를 보낸다.
+    # T-261109-025: 질문 여러 개+preview 화면의 힌트(… n to add notes · Tab to switch questions …)도 같다
+    #   (11/09 제어 노드 — 이 화면이 12:31~15:41 열려 있는 동안 12:41 「버려졌어요」 안내가 갔다).
+    footers = [" ".join(line.strip() for line in lines[-count:]) for count in (1, 2, 3) if len(lines) >= count]
     preview_footer = any(
-        ASKQ_PREVIEW_HINT_RE.fullmatch(" ".join(line.strip() for line in lines[-count:]))
-        for count in (1, 2, 3) if len(lines) >= count)
+        ASKQ_PREVIEW_HINT_RE.fullmatch(footer) or ASKQ_TABS_PREVIEW_HINT_RE.fullmatch(footer) for footer in footers)
     if preview_footer and any(ASKQ_PREVIEW_CHAT_ROW_RE.match(line) for line in lines):
         return True
     # 「Ready to submit」 검토 화면은 힌트 없이 끝나지만(실측), 힌트가 붙어도 놓치지 않는다(리뷰 #4).
@@ -6454,19 +6733,49 @@ def screen_has_active_work(screen: str, *, rotating_words: bool = True) -> bool:
     )
 
 
+def screen_has_compaction(screen: str) -> bool:
+    """T-261113-044: 화면 아래쪽에 대화 압축 돌림판이 살아 있으면 True.
+
+    압축 중에는 붙여 넣지 않는다. 지난 압축 문구가 스크롤백 위로 밀려났거나 본문 글 속에
+    낱말만 나오는 경우는 상태 영역·줄머리 돌림판 조건으로 거른다.
+    """
+    region = strip_ansi_control(screen_status_region(screen))
+    return bool(COMPACTING_SPINNER_RE.search(region))
+
+
+def _status_text_is_usage_limited(text: str) -> bool:
+    """True when this status text is the frozen-REPL usage banner.
+
+    A reached-your-<word>-limit line that also tells the user to switch with
+    /model is the synthetic turn-end notice above a live prompt. Hold the queue
+    only for the freeze banner (usage limit reached / limit reached ∙ resets),
+    or for reached-your-<word>-limit without that /model hint.
+    """
+    if USAGE_LIMIT_FREEZE_RE.search(text):
+        return True
+    if not USAGE_LIMIT_RE.search(text):
+        return False
+    if MODEL_SWITCH_LIMIT_GUIDANCE_RE.search(text):
+        return False
+    return True
+
+
 def screen_has_usage_limit(screen: str) -> bool:
     """True when the live pane shows the Claude Code usage-limit banner.
 
-    The banner (pane-only, never in transcript JSONL) leaves an idle-looking prompt
-    beneath it, so without this busy_state() would read the pane as idle and feed the
-    frozen REPL. Status-region + joined two-pass mirrors screen_has_active_work so
-    narrow-pane wrapping still matches.
+    The pane banner leaves an idle-looking prompt beneath it, so without this
+    busy_state() would read the pane as idle and feed the frozen REPL. The same
+    limit can also appear as a synthetic assistant record in the transcript JSONL;
+    that path is finish_synthetic_limit_turn, not this pane check. A copy of that
+    sentence left above the prompt with /model guidance is not the freeze banner.
+    Status-region + joined two-pass mirrors screen_has_active_work so narrow-pane
+    wrapping still matches, and both passes use the same /model exclusion.
     """
     region = strip_ansi_control(screen_status_region(screen))
-    if USAGE_LIMIT_RE.search(region):
+    if _status_text_is_usage_limited(region):
         return True
     joined = " ".join(region.splitlines())
-    return bool(USAGE_LIMIT_RE.search(joined))
+    return _status_text_is_usage_limited(joined)
 
 
 def strip_inline_node_emoji_header(text: str) -> str:
@@ -10605,6 +10914,8 @@ class Bridge:
         self.session_identity: SessionIdentity | None = None
         self.session_pos = 0
         self.parent_map: dict[str, str | None] = {}
+        # T-261108-018: 압축 요약 user 레코드 uuid — 경계 목록엔 들어가지만 사람 입력이 아니다.
+        self.compact_summary_uuids: set[str] = set()
         self.native_queue_nonce_by_timestamp: dict[str, str] = {}
         self.pending: list[QueueItem] = []
         self.active_turn: ActiveTurn | None = None
@@ -12952,6 +13263,12 @@ class Bridge:
         if (screen is not None and screen_has_feedback_dialog(screen)) or time.time() < getattr(
                 self, "feedback_hold_until", 0.0):
             return "approval_wait"
+        # T-261113-044: 대화 압축 중에는 우리 턴이 있어도 「generating」으로 돌려주지 않는다.
+        #   generating 이면 busy-inject 가 붙여 넣는데, 압축 중 대기열 기록에는 내용이 없어 제출
+        #   증거가 안 남고(→ 다시 붙여 넣어 같은 글 두 번) 확인 단계가 「제출 실패」로 끝난다.
+        #   idle·generating 이 아닌 상태라 drain_queue 는 주입 없이 기다리고, 입력중은 유지한다.
+        if screen is not None and screen_has_compaction(screen):
+            return "compacting"
         with self.lock:
             if self.active_turn:
                 return "generating"
@@ -13041,7 +13358,7 @@ class Bridge:
             return True
         if screen_has_hook_block(screen):
             return True
-        if screen_has_active_work(screen):
+        if screen_has_active_work(screen) or screen_has_compaction(screen):  # T-261113-044
             return True
         return False
 
@@ -13463,6 +13780,28 @@ class Bridge:
             stamp /= 1000.0
         return stamp
 
+    def session_status_busy(self) -> bool:
+        """T-261110-030: 바인딩된 세션의 sessions/<pane_pid>.json 이 status=busy 면 True.
+
+        session_idle_since 의 짝이다 — TUI 가 턴을 도는 동안 스스로 쓰는 표시라, 화면
+        휴리스틱이 못 읽는 진행 구간(자동 압축 등)에서도 산 턴을 알아본다. 파일이 없거나
+        못 읽거나 pid·sessionId 가 바인딩과 다르면 False(=증거 없음)다.
+        """
+        binding = self.session_binding
+        if binding is None or not binding.session_id:
+            return False
+        pane_pid = binding.pane_pid
+        if pane_pid <= 0:
+            return False
+        path = claude_sessions_dir() / f"{pane_pid}.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or data.get("status") != "busy":
+            return False
+        return data.get("pid") == pane_pid and data.get("sessionId") == binding.session_id
+
     def busy_inject_consumed_by_finished_turn(self, item: QueueItem) -> str:
         """승격 직전 판정 — 앞 턴이 이 건을 이미 처리했다는 증거가 모두 있으면 사유 문자열, 아니면 ''.
 
@@ -13556,6 +13895,14 @@ class Bridge:
         # (대응 tool_result 미도착) 릴리스를 한 틱 미룬다 — 실사고(queue=1550d0a439)
         # 재발 방지, 화면 캡처 재확인(T-260809-016)만으로는 못 잡던 구간을 덮는다.
         if not unconfirmed_submission and self.active_turn_transcript_shows_open_tool_call():
+            return False
+
+        # T-261110-030: TUI 자신이 sessions/<pane_pid>.json 에 status=busy(바인딩과 같은
+        # pid·sessionId)를 쓰고 있으면 산 턴이다. 자동 압축처럼 화면이 진행 중으로 안 읽히고
+        # transcript 도 120s 넘게 멈추는 구간은 이 아래 침묵 유예까지 전부 놓친다 — 실사고
+        # 2026-11-10 14:07:12 제어 노드: 66분 텔레그램 턴이 압축(2분 13초) 중 해제돼 「입력중」이
+        # 꺼졌다. ESC 중단·턴 종료는 status=idle 로 바뀌므로 종전 해제 경로는 그대로다.
+        if not unconfirmed_submission and self.session_status_busy():
             return False
 
         # T-260827-038 ①: transcript 가 최근까지 자라고 있었으면 나이(ttl)만으로 놓지
@@ -14917,10 +15264,11 @@ class Bridge:
     def sync_feedback_dialog_cards(self, screen: str) -> None:
         parsed = parse_feedback_dialog(screen)
         cards = [card for card in getattr(self, "feedback_cards", [])
-                 if card.get("kind") in {"list", "review", "drafted"} and card.get("state") == "open"]
+                 if card.get("kind") in {"list", "review", "drafted", "drafted_confirm"} and card.get("state") == "open"]
         if parsed is None:
             for card in cards:
-                self.finish_feedback_card(card, self.feedback_drafted_closed_text(card) if card.get("kind") == "drafted"
+                self.finish_feedback_card(card, self.feedback_drafted_closed_text(card)
+                                          if card.get("kind") in {"drafted", "drafted_confirm"}
                                           else self.tr("피드백 창이 닫혔어요. 아무것도 보내지 않았어요."), "closed")
             return
         if parsed["screen"] == "sent":
@@ -14928,11 +15276,13 @@ class Bridge:
                 self.finish_feedback_card(
                     card, self.tr("터미널에서 보냈어요. 영수증: {receipt}", receipt=parsed["receipt"]), "sent")
             return
-        if parsed["screen"] == "drafted":
+        if parsed["screen"] in {"drafted", "drafted_confirm"}:
             # T-261031-014: 초안 상자 — 머리줄 제목으로 초안 파일을 하나로 맞출 때만 보내기 버튼.
+            # T-261115-022: 보내기 확인 단계(drafted_confirm)는 키 준비 꼬리표일 때만 보내기 버튼. 나머지는 돌아가기만.
             draft = self.feedback_drafted_draft(parsed)
-            key = f"drafted:{parsed['signature']}"
-            card = {"kind": "drafted", "key": key, "signature": parsed["signature"], "sendable": draft is not None,
+            key = f"{parsed['screen']}:{parsed['signature']}"
+            sendable = draft is not None and (parsed["screen"] == "drafted" or parsed.get("ready") is True)
+            card = {"kind": parsed["screen"], "key": key, "signature": parsed["signature"], "sendable": sendable,
                     "box_type": parsed["type"], "box_title": parsed["title"],
                     "draft": self.feedback_draft_snapshot(draft) if draft else {"title": parsed["title"]}}
         elif parsed["screen"] == "list":
@@ -15038,6 +15388,8 @@ class Bridge:
             return self.feedback_drive_list_review(card, int(action[len("review"):]))
         if kind == "drafted" and action in FEEDBACK_DRAFTED_KEYS and (action != "send" or card.get("sendable")):
             return self.feedback_drive_drafted(card, action)
+        if kind == "drafted_confirm" and (action == "back" or (action == "send" and card.get("sendable"))):
+            return self.feedback_drive_drafted_confirm(card, action)
         return self.tr("버튼 값을 못 읽었어요")
 
     def feedback_key(self, key: str) -> None:
@@ -15074,6 +15426,7 @@ class Bridge:
             if parsed is None:
                 break
             # T-261031-014: 초안 상자는 Esc 가 아니라 0(닫기)으로 닫는다 — Esc 동작은 실측 전이다.
+            # T-261115-022: 확인 단계는 꼬리표대로 Esc(= 상자 첫 화면). 다음 바퀴에 상자를 0 으로 닫는다.
             self.feedback_key("0" if parsed["screen"] == "drafted" else "Escape")
             before = parsed["screen"]
             self.feedback_wait(lambda now, _screen, before=before: now is None or now["screen"] != before)
@@ -15131,6 +15484,14 @@ class Bridge:
             review = parsed
         if not review.get("send_ready") or not feedback_draft_matches_env(draft, review.get("env")):
             return "mismatch", ""
+        # 보내기 줄에 도착한 직후의 엔터는 창이 버린다. 쉰 뒤에 화면이 그대로일 때만 누른다.
+        time.sleep(feedback_send_enter_delay())
+        refreshed = parse_feedback_dialog(self.feedback_screen())
+        if (refreshed is None or refreshed.get("screen") != "review"
+                or not self.feedback_review_matches(refreshed, draft)
+                or not refreshed.get("send_ready")
+                or not feedback_draft_matches_env(draft, refreshed.get("env"))):
+            return "mismatch", ""
         card.update(state="sending", sending_at=time.time())
         self.persist_feedback_state()
         self.feedback_key("Enter")
@@ -15165,6 +15526,9 @@ class Bridge:
         draft_id = (card.get("draft") or {}).get("draft_id")
         if draft_id and self.feedback_draft_by_id(draft_id) is None:
             return self.tr("초안 상자가 사라졌고 초안 파일도 없어요. 터미널에서 보낸 것으로 보여요.")
+        if card.get("kind") == "drafted_confirm":
+            # T-261115-022: 확인 단계에서 터미널 2 를 누르면 상자가 「Sending…」으로 바뀐다 — 초안 파일은 그 뒤에 사라진다.
+            return self.tr("보내기 확인 단계 화면이 사라졌어요. 터미널에서 보내는 중일 수 있어요. 터미널을 확인해 주세요.")
         return self.tr("초안 상자가 닫혔어요. 아무것도 보내지 않았어요. 초안은 이 노드에 그대로 있어요.")
 
     def feedback_drive_drafted(self, card: dict[str, Any], action: str) -> str:
@@ -15199,12 +15563,72 @@ class Bridge:
         self.finish_feedback_card(card, self.tr("초안 상자가 닫히는 걸 확인하지 못했어요. 터미널을 확인해 주세요."), "unconfirmed")
         return self.tr("다 닫지 못했어요")
 
-    def feedback_finish_drafted_send(self, card: dict[str, Any], draft_id: object) -> str:
-        """2 를 누른 뒤: 보낸 뒤 화면(영수증) 또는 초안 파일 소멸이 보일 때까지 기다린다. 상자가 그대로면 보냈다고 하지 않는다."""
-        ok, now, screen = self.feedback_wait(
-            lambda now, _screen: (now is not None and now["screen"] == "sent") or self.feedback_draft_by_id(draft_id) is None,
-            timeout=feedback_sent_wait_seconds())
-        if not ok and now is not None and now["screen"] == "drafted":
+    def feedback_confirm_drafted_send(self, card: dict[str, Any]) -> bool:
+        """T-261115-022: 보내기 확인 단계에 2 를 한 번 누른다. 잠금 안에서 화면을 다시 읽고 다 맞을 때만 누른다.
+
+        맞음 = 확인 단계 화면 + 키 준비 꼬리표(「2 to send · Esc to back」) + 카드와 같은 서명(머리줄·요약) + 초안 파일이 아직 있음.
+        하나라도 다르면 아무 키도 누르지 않고 False.
+        """
+        draft_id = (card.get("draft") or {}).get("draft_id")
+        with self.repl.composer_lock():  # 확인 단계 재확인과 두 번째 2 를 한 잠금 안에서
+            now = parse_feedback_dialog(self.feedback_screen())
+            if (now is None or now["screen"] != "drafted_confirm" or now.get("ready") is not True
+                    or now["signature"] != card.get("signature") or self.feedback_draft_by_id(draft_id) is None):
+                log("FEEDBACK", "drafted confirm step not matched: no key pressed")
+                return False
+            self.repl._submit_prompt_unlocked(FEEDBACK_DRAFTED_KEYS["send"])
+        log("FEEDBACK", "drafted confirm step matched: pressed 2 once")
+        return True
+
+    def feedback_drive_drafted_confirm(self, card: dict[str, Any], action: str) -> str:
+        """확인 단계 카드의 버튼 (T-261115-022): 보내기 = 2 한 번, 돌아가기 = Esc(상자 첫 화면). 키마다 화면을 다시 읽는다."""
+        parsed = parse_feedback_dialog(self.feedback_screen())
+        if parsed is None or parsed["screen"] != "drafted_confirm" or parsed["signature"] != card.get("signature"):
+            self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+            return self.tr("화면이 바뀌었어요")
+        draft_id = (card.get("draft") or {}).get("draft_id")
+        if action == "send":
+            if self.feedback_draft_by_id(draft_id) is None:
+                self.finish_feedback_card(card, self.tr(FEEDBACK_GONE_TEXT), "gone")
+                return self.tr("이 초안은 이제 없어요")
+            card.update(state="sending", sending_at=time.time())
+            self.persist_feedback_state()
+            if not self.feedback_confirm_drafted_send(card):
+                self.finish_feedback_card(card, self.tr(FEEDBACK_CHANGED_TEXT), "changed")
+                return self.tr("화면이 바뀌었어요")
+            return self.feedback_finish_drafted_send(card, draft_id, confirm_pressed=True)
+        self.feedback_key("Escape")
+        ok, now, screen = self.feedback_wait(lambda now, _screen: now is None or now["screen"] != "drafted_confirm")
+        if ok and now is not None and now["screen"] == "drafted":
+            self.finish_feedback_card(card, self.tr("상자 첫 화면으로 돌아갔어요. 새 카드에서 골라 주세요."), "back")
+            self.sync_feedback_dialog_cards(screen)
+            return self.tr("돌아갔어요")
+        self.finish_feedback_card(card, self.tr("상자 첫 화면으로 돌아가는 걸 확인하지 못했어요. 터미널을 확인해 주세요."), "unconfirmed")
+        return self.tr("돌아갔는지 확인하지 못했어요")
+
+    def feedback_finish_drafted_send(self, card: dict[str, Any], draft_id: object, *, confirm_pressed: bool = False) -> str:
+        """2 를 누른 뒤: 보낸 뒤 화면(영수증) 또는 초안 파일 소멸이 보일 때까지 기다린다. 상자가 그대로면 보냈다고 하지 않는다.
+
+        T-261115-022: Claude Code 2.1.325 는 첫 2 뒤 같은 상자 안에 보내기 확인 단계를 띄운다. 그 화면이 같은 초안이면
+        2 를 딱 한 번 더 누르고(feedback_confirm_drafted_send) 같은 확인을 이어 간다. 이미 확인 단계에서 누른 뒤면
+        (confirm_pressed) 다시 누르지 않는다. 다른 화면·다른 초안이면 누르지 않고 「확인 못 함」으로 끝낸다.
+        """
+        def finished(now: dict[str, Any] | None, _screen: str) -> bool:
+            return (now is not None and now["screen"] == "sent") or self.feedback_draft_by_id(draft_id) is None
+
+        if confirm_pressed:
+            ok, now, screen = self.feedback_wait(finished, timeout=feedback_sent_wait_seconds())
+        else:
+            ok, now, screen = self.feedback_wait(
+                lambda now, now_screen: finished(now, now_screen) or (now is not None and now["screen"] == "drafted_confirm"),
+                timeout=feedback_sent_wait_seconds())
+            if ok and not finished(now, screen):
+                if not self.feedback_confirm_drafted_send(card):
+                    self.feedback_hold_until = time.time() + feedback_unconfirmed_hold_seconds()
+                    self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT), "unconfirmed")
+                    return self.tr("보냈는지 확인하지 못했어요")
+                ok, now, screen = self.feedback_wait(finished, timeout=feedback_sent_wait_seconds())
+        if not ok and now is not None and now["screen"] in {"drafted", "drafted_confirm"}:
             self.feedback_hold_until = time.time() + feedback_unconfirmed_hold_seconds()
             self.finish_feedback_card(card, self.tr(FEEDBACK_UNCONFIRMED_TEXT), "unconfirmed")
             return self.tr("보냈는지 확인하지 못했어요")
@@ -15343,7 +15767,10 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             log("CHOICE", f"capture before inject failed: {exc}")
             return self.tr('지금 화면을 못 읽었어요')
-        parsed = parse_pane_choice(screen) or self.parse_question_screen(screen)
+        # T-261115-033: 카드를 보내는 쪽(check_approval_stall_notify)과 같은 순서로 읽는다 — 질문 판독이 먼저다.
+        #   미리 보기 상자가 붙은 질문은 일반 메뉴로도 읽혀(작업 노드 11/15 21:27, 실측 fixture
+        #   askq-preview-layout-wide-2) 메뉴 서명이 질문 카드 서명과 달라 탭마다 「화면이 바뀌었어요」로 거절됐다.
+        parsed = self.parse_question_screen(screen) or parse_pane_choice(screen)
         # ★핵심 안전축 = 카드를 만든 그 화면이 **아직 그대로** 일 때만 주입한다.
         #   확인창이 이미 답해졌거나 다른 창으로 바뀐 뒤 누른 탭이 엉뚱한 선택을
         #   확정시키는 길을 막는다. 서명은 제목+선택지 라벨에서 나오므로 커서만
@@ -15731,7 +16158,9 @@ class Bridge:
                 self.release_approval_light(card)
             if not card.get("completion") or time.time() < card.get("retry_at", 0):
                 continue
-            text = f"❓ {card['title'][:1500]}\n\n{card['completion']}"
+            kept = card.get("kept_preview") if "✅" in card["completion"] else ""
+            text = question_card_completion_text(card["title"], card["completion"],
+                                                 kept if isinstance(kept, str) else "")
             try:
                 self.telegram.last_send_error = ""
                 response = self.telegram.call(
@@ -16001,6 +16430,8 @@ class Bridge:
             "option_labels": [label for _, label in parsed["options"]],
             "message_id": (response.get("result") or {}).get("message_id"),
             "session_id": self.session_binding.session_id if getattr(self, "session_binding", None) else None,
+            # T-261113-014: 답 뒤 완료 글에 다시 실을 원문(승인 내역).
+            "kept_preview": question_card_kept_preview(card_parsed, self.tr),
         }
         if parsed.get("recovered"):
             self.question_card.update(recovered=True, native_tool_id=parsed["native_tool_id"],
@@ -18746,9 +19177,14 @@ class Bridge:
         uuid = record.get("uuid")
         if isinstance(uuid, str) and uuid:
             parent = record.get("parentUuid")
-            self.parent_map[uuid] = parent if isinstance(parent, str) else None
-            if len(self.parent_map) > 1000:
-                self.parent_map = dict(list(self.parent_map.items())[-700:])
+            if not (isinstance(parent, str) and parent):
+                # T-261108-018: 압축 경계(compact_boundary)는 parentUuid 가 null 이고 앞 대화를
+                #   logicalParentUuid 로 가리킨다. 이걸 버리면 압축 뒤 답이 압축 전 질문을 못 찾는다.
+                logical = record.get("logicalParentUuid")
+                parent = logical if isinstance(logical, str) and logical else None
+            self.parent_map[uuid] = parent
+            if len(self.parent_map) > PARENT_MAP_MAX:
+                self.parent_map = dict(list(self.parent_map.items())[-PARENT_MAP_KEEP:])
 
     def reply_chain_contains(self, parent: str | None, ancestor: str | None) -> bool:
         seen = set()
@@ -18927,11 +19363,19 @@ class Bridge:
         orphans = getattr(self, "orphaned_confirmed_turns", None)  # T-260809-016: 위 방어 참고
         if not orphans:
             return None
+        # T-261108-018: 고아 질문보다 더 새 사람 입력(터미널 입력·예약 재진입·다른 텔레그램 메시지)을 지나면
+        #   멈춘다 — 그 뒤 답은 그 새 입력의 답이다. 부모 사슬이 압축을 넘고 2만 칸까지 남으면서 종전엔
+        #   압축 경계·700칸이 우연히 막던 「새 입력의 답이 옛 질문 답장으로 가는」 길이 넓어졌다(PR #2778 검토).
+        #   압축 요약은 경계 목록에 있어도 사람 입력이 아니라 지나간다.
+        boundaries = getattr(self, "background_flow_boundaries", None) or {}
+        summaries = getattr(self, "compact_summary_uuids", None) or set()
         seen: set[str] = set()
         cursor = assistant_parent_uuid
         while isinstance(cursor, str) and cursor and cursor not in seen:
             if cursor in orphans:
                 return orphans.pop(cursor)
+            if cursor in boundaries and cursor not in summaries:
+                return None
             seen.add(cursor)
             cursor = self.parent_map.get(cursor)
         return None
@@ -20156,6 +20600,35 @@ class Bridge:
             #   베리 재발신 승인 카드 — 894자 스크립트가 폰에 두 문장만 왔다). 잘린 산문은 전문을 카드에 싣는다.
             self.recent_progress_copy = (time.monotonic(), [raw_text], "앞 글 전문:", False)
 
+    def finish_synthetic_limit_turn(self, record: dict[str, Any]) -> bool:
+        """End the active turn when Claude writes a synthetic API-limit assistant record.
+
+        Claude Code 2.1.322 leaves isApiErrorMessage on that record and sets
+        stop_reason to stop_sequence, so the end_turn final path never sees it.
+        One phone notice, then the same release as a finished turn: typing off,
+        flow card closed, queued message drained.
+        """
+        message = record.get("message") if isinstance(record.get("message"), dict) else {}
+        if record.get("isApiErrorMessage") is not True or record.get("isSidechain") is not False:
+            return False
+        if message.get("role") != "assistant":
+            return False
+        active = self.ancestor_matches_active_turn(record.get("parentUuid")) or self.sequence_matches_active_turn(record)
+        if not active:
+            return False
+        notice = format_synthetic_limit_notice(record)
+        anchor = active.message_id if active.source != "voice" and type(active.message_id) is int and active.message_id > 0 else None
+        try:
+            self.telegram.send(notice, reply_to_message_id=anchor)
+        except Exception as exc:  # noqa: BLE001
+            log("SEND", f"synthetic limit notice failed nonce={active.nonce}: {type(exc).__name__}")
+        log(
+            "TURN",
+            f"synthetic api error ends turn nonce={active.nonce} apiError={record.get('apiError') or '-'}",
+        )
+        self.finish_active_turn("failed", active)
+        return True
+
     def process_record(self, record: dict[str, Any]) -> None:
         binding = self.session_binding
         if not binding:
@@ -20226,6 +20699,12 @@ class Bridge:
                         self.pending_public_progress, self.recent_progress_copy = [], None
                     self.background_flow_boundaries.setdefault(uuid, "")
                     self.background_flow_boundaries = dict(list(self.background_flow_boundaries.items())[-500:])
+                    if record.get("isCompactSummary"):
+                        # T-261108-018: 압축 요약은 같은 대화의 이어짐이다 — 고아 턴 사슬 탐색이 여기서 멈추지 않게 적어 둔다.
+                        summaries = getattr(self, "compact_summary_uuids", None)  # Bridge.__new__() 테스트 더블 방어
+                        if summaries is None:
+                            summaries = self.compact_summary_uuids = set()
+                        summaries.add(uuid)
             self.observe_background_flow_results(record)
             nonce = record_contains_nonce(record)
             if nonce and self.active_turn and nonce == self.active_turn.nonce:
@@ -20351,6 +20830,10 @@ class Bridge:
         if (message.get("stop_reason") == "end_turn" and record.get("isSidechain") is False
                 and not record.get("isMeta") and record.get("sessionId") == binding.session_id):
             self.pending_public_progress = []
+        # T-261111-031: a synthetic limit error is stop_sequence, not end_turn.
+        # End the active turn before public-progress can relay the English line.
+        if self.finish_synthetic_limit_turn(record):
+            return
         # Run before final/background routing: an unconfirmed step must not let
         # later JSONL records (including the final answer) overtake it.
         self.send_public_progress(record)

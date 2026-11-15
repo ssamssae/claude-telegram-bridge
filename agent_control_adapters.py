@@ -280,8 +280,12 @@ class TerminalAdapter:
                             'options': [{'value': str(n), 'label': label} for n, label in parsed['options']]}
             busy = g['screen_has_active_work'](screen) or claude_turn_activity(path) == 'busy'
             visible = g['pane_composer_visible'](screen.splitlines())
-            draft = bool(g['composer_residual_text'](screen)) if visible else not bool(question)
-            status = 'waiting' if question else 'busy' if busy else 'idle' if visible else 'unknown'
+            # T-261115-022: /feedback 창·초안 상자·보내기 확인 단계도 사람 입력을 기다리는 화면이다. 질문 카드처럼
+            # 'waiting'으로 알린다(D200 「입력 대기」). 답하기 버튼(question)은 만들지 않는다 — 그 화면의 키는
+            # 브릿지 피드백 카드만 누른다. 예전에는 입력줄이 안 보여 'unknown'(「확인 필요」)이었다.
+            feedback = bool(g.get('screen_has_feedback_dialog', lambda _screen: False)(screen))
+            draft = bool(g['composer_residual_text'](screen)) if visible else not (question or feedback)
+            status = 'waiting' if question or feedback else 'busy' if busy else 'idle' if visible else 'unknown'
             capabilities = ['send', 'stop']
             if getattr(b, 'pending', None) or getattr(b, 'clear_watch', None):
                 capabilities.remove('send')
