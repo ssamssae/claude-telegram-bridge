@@ -562,12 +562,21 @@ PROGRESS_BOARD_DONE_LINGER_SECONDS = 60.0
 # ▓░ 고정폭 바를 낸다. subagent-progress-card.py 의 render_bar() 와 같은 시각 언어
 # (BAR_WIDTH=10) 를 그대로 따른다 — 이미 이 함대가 아는 규격이라 새로 만들지 않는다.
 PROGRESS_BOARD_BAR_WIDTH = 10
+# T-261124-041: 일꾼(서브에이전트) 기록을 렌더 직전에 이어 읽는다. 한 번에 읽는 상한 — 큰 기록도
+# 여러 번에 나눠 따라잡고, 0.5초 루프 한 바퀴를 붙잡지 않는다.
+SUBAGENT_PROGRESS_READ_LIMIT = 1024 * 1024
 ENVELOPE_SIDECAR_FLAG = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.on")).expanduser()
 ENVELOPE_SIDECAR_OFF_FLAG = Path(
     os.environ.get("CLB_ENVELOPE_SIDECAR_OFF_FLAG", "~/.config/claude-telegram-bridge/envelope-sidecar.off")
 ).expanduser()
 ENVELOPE_SIDECAR_PATH = Path(os.environ.get("CLB_ENVELOPE_SIDECAR_PATH", "~/.local/state/claude-telegram-bridge/envelope-sidecar.jsonl")).expanduser()
 ENVELOPE_SIDECAR_SCHEMA = "claude-telegram-bridge-envelope-sidecar/v1"
+# Mid-turn replies: private builds tell the agent to answer a message that arrived
+# during a running turn right away through an operator notify script. Public installs
+# ship no such script, so public builds add no instruction and the message is answered
+# in the turn's final reply.
+MID_TURN_NOTIFY_CONTEXT_KO = ""
+MID_TURN_NOTIFY_CONTEXT_EN = ""
 DEFAULT_ENVELOPE_SIDECAR_TTL_SECONDS = 120.0
 # 🚦 priority lane (T-260808-022, parent=T-260808-018 4축 중 4축) — flood 압박 신호등이
 # 켜져 있으면 카드·미러 등 장식 발신을 드랍하고 최종답장·추천답변만 시도한다. 신호등은
@@ -1899,6 +1908,65 @@ def send_now_composer_has_draft(ansi_screen: str) -> bool:
     return True
 
 
+def composer_suggestion_text(ansi_screen: str) -> str:
+    """입력줄 글자가 모두 흐림(SGR 2)이면 그 글을 돌려준다. 아니면 빈 문자열 (T-261123-017).
+
+    Claude Code 는 빈 입력줄에 「다음 할 일 제안」(prompt suggestion)과 첫 화면 안내(Try "…")를
+    흐린 글씨로 그린다. 색 없는 캡처로는 사람이 친 초안과 같아 보여서 인계가 composer_not_empty 로
+    멈췄다(2026-11-23 작업 노드: 입력줄 = ESC[2m실제 폰에서 지방 PDF 확인해 봐ESC[0m).
+    11/23 작업 노드 시험 세션 실측: 사람이 친 글과 여러 줄 붙여넣기 자리표시(「[Pasted text #1 +11 lines]」)는
+    흐리지 않다. 흐리지 않은 글자가 한 자라도 있거나, 입력줄 모양(윗·아랫 가로줄)이 다르거나, 모르는
+    글자 모양 코드가 있으면 빈 문자열이다. 호출부는 그때 지금처럼 사람 초안으로 본다(초안 보호 우선).
+    """
+    if not ansi_screen:
+        return ""
+    # tmux capture-pane -e 는 앞 줄의 글자 모양을 다음 줄로 이어 쓴다. 그래서 화면 처음부터 흐림을 따라간다.
+    rows: list[list[tuple[str, bool]]] = [[]]
+    dim = False
+    pos = 0
+    for match in [*ANSI_ESCAPE_RE.finditer(ansi_screen), None]:
+        for ch in ansi_screen[pos:match.start() if match else len(ansi_screen)]:
+            if ch == "\n":
+                rows.append([])
+            else:
+                rows[-1].append((ch, dim))
+        if match is None:
+            break
+        pos = match.end()
+        code = match.group(0)
+        if not (code.startswith("\x1b[") and code.endswith("m")):
+            continue
+        values = code[2:-1].split(";")
+        if any(value and not value.isdigit() for value in values):
+            return ""
+        parts = [int(value or "0") for value in values]
+        j = 0
+        while j < len(parts):
+            part = parts[j]
+            if part in (0, 22):
+                dim = False
+            elif part == 2:
+                dim = True
+            elif part in (38, 48, 58) and j + 1 < len(parts):
+                # 색 값(256색·RGB)은 글자 모양이 아니다.
+                j += {5: 2, 2: 4}.get(parts[j + 1], 0)
+            j += 1
+    plain = ["".join(ch for ch, _ in row).replace(" ", " ").strip() for row in rows]
+    for index in range(len(rows) - 2, 0, -1):
+        if not plain[index].startswith("❯") or not (
+                COMPOSER_TOP_RULE_RE.match(plain[index - 1]) and CHOICE_RULE_RE.match(plain[index + 1])):
+            continue
+        row = rows[index]
+        cells = row[next(i for i, (ch, _) in enumerate(row) if ch == "❯") + 1:]
+        text = "".join(ch for ch, _ in cells).replace(" ", " ").strip()
+        if not text or COMPOSER_PASTED_PLACEHOLDER_RE.search(text):
+            return ""
+        if any(not is_dim for ch, is_dim in cells if not ch.isspace()):
+            return ""
+        return text
+    return ""
+
+
 def send_now_screen_ready(screen: str) -> bool:
     # T-261011-050: the general detector now knows rotating activity words, but
     # that alone does not prove the native send-now hint is on screen. Keep this
@@ -1934,6 +2002,16 @@ def now_ts() -> str:
 
 def log(label: str, message: str) -> None:
     print(f"[{now_ts()}] {label:<6} {message}", flush=True)
+
+
+# T-261118-098: macOS bridge exits after its own file stays changed, so launchd KeepAlive
+# starts the new code. Linux stays off — the watchdog already restarts those nodes.
+SELF_RESTART_EXIT_CODE = 75
+SELF_RESTART_HASH_INTERVAL_SECONDS = 60
+SELF_RESTART_COALESCE_DEFAULT_SECONDS = 120
+SELF_RESTART_COALESCE_MIN_SECONDS = 30
+SELF_RESTART_REPEAT_SECONDS = 600
+_SELF_RESTART_LOCK_GUARD = threading.Lock()
 
 
 # ⚠️ 제거 금지 (DO NOT REMOVE) — 미등록 chat 수신의 무기록 폐기 봉합 (T-260728-043, 2026-07-28).
@@ -4029,6 +4107,9 @@ QUESTION_MULTI_NOTICES = {
 }
 # T-261014-008: 질문 카드 미전달 안전망 알림 — 질문 본문을 싣지 않는다(운영필터·사생활).
 QUESTION_STALL_NOTICE = "A question is open in the terminal, but its card was not delivered. Please answer it in the terminal."
+# T-261117-114: 질문 창 뒤에 묶인 사용자 채팅 안내 — 전달된 질문 카드 뒤에 카드당 한 번. 채팅은 대기열에 그대로 둔다.
+QUESTION_HOLD_NOTICE = "질문 카드에 먼저 답하면 이 메시지가 들어가요."
+QUESTION_HOLD_SOURCES = frozenset({"telegram", "telegram_forwarded"})
 
 
 def choice_buttons_mode() -> str:
@@ -4072,9 +4153,197 @@ def choice_buttons_allowed(kind: str) -> bool:
     return True
 
 
+# ── 승인 카드 한국어 풀이 (T-261122-025) ──────────────────────────────────────
+# 발원 = 사용자 2026-11-22 19:0x 작업 노드 「승인카드 내용도 뭔지도 잘 모르겠고 영어라서」「보조 에이전트
+#   승인카드인지도 몰랐어」. 제어 노드 보조 에이전트의 `rm -f "$D/$f"` 승인창(Claude Code 자체 경고 「Dangerous
+#   rm operation on possibly-empty variable」)이 화면 글자 6줄 그대로 폰에 갔고, 누가 묻는지·무슨 일인지가
+#   안 보여 18분을 기다렸다(18:26:57→18:45:39).
+# ★서명(signature)은 건드리지 않는다 — 풀이는 parsed["hints"] 에만 얹고, 카드 글·버튼 글이 둘 다 같은
+#   parsed 에서 나오므로 운영필터의 본문 대조(TelegramClient.call _choice_card)도 그대로 맞는다.
+# ★한국어 화면(language=ko)에서만 붙인다. 영어 화면은 종전 그대로다.
+APPROVAL_TITLE_KO = (
+    (re.compile(r"^Do you want to proceed\?$", re.I), "진행할까요?"),
+    (re.compile(r"^Do you want to make this edit to (.+)\?$", re.I), "{0} 파일을 이렇게 고칠까요?"),
+    (re.compile(r"^Do you want to create (.+)\?$", re.I), "{0} 파일을 만들까요?"),
+    (re.compile(r"^Do you want to overwrite (.+)\?$", re.I), "{0} 파일을 덮어쓸까요?"),
+    (re.compile(r"^Do you want to allow Claude to fetch this content\?$", re.I), "이 웹 내용을 가져와도 될까요?"),
+)
+# 앞에 있는 것이 먼저다(구체적인 경고 → 일반 경고).
+APPROVAL_REASON_KO = (
+    ("dangerous rm operation on possibly-empty variable",
+     "변수가 비면 엉뚱한 파일을 지울 수 있는 rm 명령이라 클로드 코드가 확인합니다."),
+    ("command contains", "명령 안에 클로드 코드가 따로 확인하는 꼴이 들어 있어 묻습니다."),
+    ("this command requires approval", "허용 목록에 없는 명령이라 허락이 필요합니다."),
+)
+APPROVAL_RM_RE = re.compile(r"(?:^|[\s;&|(`'\"])rm\s")
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'"})
+APPROVAL_HANGUL_RE = re.compile(r"[가-힣]")
+
+
+def approval_option_ko(label: str) -> str:
+    """승인창 선택지 → 한국어 단추 글. 모르는 꼴은 원문 그대로 둔다."""
+    text = str(label or "").strip()
+    low = text.translate(_APOSTROPHES).lower()
+    if low == "yes":
+        return "예 (이번만)"
+    if low == "no":
+        return "아니오"
+    m = re.match(r"yes, and don't ask again for:?\s*(.+)$", low)
+    if m:
+        target = text[len(text) - len(m[1]):].strip()
+        return f"예, 다음부터 「{target}」는 안 묻기"
+    if low.startswith("yes, and don't ask again"):
+        return "예, 다음부터 같은 것은 안 묻기"
+    if low.startswith("yes, allow all edits"):
+        return "예, 이번 세션 동안 파일 수정은 안 묻기"
+    if low.startswith("yes, and always allow"):
+        return "예, 다음부터 이 접근은 안 묻기"
+    if low.startswith("no, and tell claude"):
+        return "아니오 (다르게 하라고 말하기)"
+    return text
+
+
+def approval_hints(parsed, origin=None) -> dict:
+    """승인 카드에 얹을 한국어 풀이. origin = approval_origin() 결과(없으면 None)."""
+    title = str(parsed.get("title") or "")
+    title_ko = None
+    for pattern, template in APPROVAL_TITLE_KO:
+        m = pattern.match(title.strip())
+        if m:
+            title_ko = template.format(*m.groups())
+            break
+    context = " ".join(parsed.get("context") or [])
+    low = context.translate(_APOSTROPHES).lower()
+    reason = next((ko for key, ko in APPROVAL_REASON_KO if key in low), None)
+    hints = {"title": title_ko, "reason": reason, "rm": bool(APPROVAL_RM_RE.search(" " + context))}
+    if origin:
+        hints["origin"] = origin.get("origin")
+        if origin.get("agent"):
+            hints["agent"] = str(origin["agent"])[:60]
+        # 하는 일 = 에이전트가 적은 명령 설명. 영어로 적은 설명은 싣지 않는다(카드를 한국어로 읽게 — 원문은 아래에 있다).
+        if origin.get("action") and APPROVAL_HANGUL_RE.search(str(origin["action"])):
+            hints["action"] = str(origin["action"])[:120]
+    return hints
+
+
+def _approval_norm(text: str) -> str:
+    return " ".join(str(text).replace("│", " ").split())
+
+
+def _jsonl_tail_rows(path: Path, max_bytes: int = 2_000_000) -> list:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            raw = fh.read()
+    except OSError:
+        return []
+    lines = raw.split(b"\n")
+    if size > max_bytes:
+        lines = lines[1:]  # 잘린 첫 줄
+    rows = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _pending_tool_inputs(rows: list) -> list:
+    """결과(tool_result)가 아직 없는 도구 호출의 입력들."""
+    uses: dict = {}
+    done = set()
+    for row in rows:
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_use" and isinstance(item.get("input"), dict):
+                uses[item.get("id")] = item["input"]
+            elif item.get("type") == "tool_result":
+                done.add(item.get("tool_use_id"))
+    return [inp for key, inp in uses.items() if key not in done]
+
+
+def approval_origin(transcript_path, context_lines, *, max_agents: int = 12):
+    """승인창이 본 세션 것인지 보조 에이전트 것인지 기록으로 가린다.
+
+    본 세션 기록과 아직 안 끝난 보조 에이전트 기록(<세션>/subagents/agent-*.jsonl)에서 결과 없는
+    도구 호출을 찾고, 그 명령에 화면 승인창 본문 줄이 들어 있는 것만 고른다. 둘 이상이 서로 다른
+    곳에서 맞으면 모른다(None) — 틀린 「누가」를 보이는 것보다 안 보이는 게 낫다.
+    """
+    if not transcript_path:
+        return None
+    path = Path(transcript_path)
+    probes = [n for n in (_approval_norm(line) for line in (context_lines or [])) if len(n) >= 10]
+    if not probes:
+        return None
+
+    def hit(inp: dict) -> bool:
+        target = _approval_norm(inp.get("command") or inp.get("file_path") or inp.get("url") or "")
+        return bool(target) and any(probe in target for probe in probes)
+
+    found = []
+    for inp in _pending_tool_inputs(_jsonl_tail_rows(path)):
+        if hit(inp):
+            found.append({"origin": "main", "action": inp.get("description")})
+    sub_dir = path.with_suffix("") / "subagents"
+    try:
+        metas = sorted(sub_dir.glob("agent-*.meta.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        metas = []
+    looked = 0
+    for meta_path in metas:
+        if looked >= max_agents:
+            break
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        # 끝난 에이전트는 기록이 다시 쓰여 위로 올라온다 — 거른 뒤에 센다(검수 지적: 끝난 12개가 도는 1개를 밀어냄).
+        if not isinstance(meta, dict) or meta.get("finished"):
+            continue
+        looked += 1
+        rows = _jsonl_tail_rows(meta_path.with_name(meta_path.name[: -len(".meta.json")] + ".jsonl"))
+        for inp in _pending_tool_inputs(rows):
+            if hit(inp):
+                found.append({"origin": "subagent", "agent": meta.get("description"), "action": inp.get("description")})
+    places = {(item["origin"], item.get("agent")) for item in found}
+    return found[-1] if len(places) == 1 else None
+
+
 def choice_card_text(parsed, translate=lambda text: text) -> str:
     """폰에 띄울 선택 카드 본문. 무엇을 고르는지 + 지금 커서가 어디인지를 같이 보여준다."""
-    rows = [f"🔽 {parsed['title']}", ""]
+    hints = parsed.get("hints")
+    if hints:
+        origin = hints.get("origin")
+        if origin == "subagent":
+            who = f"보조 에이전트 「{hints['agent']}」가" if hints.get("agent") else "보조 에이전트가"
+        elif origin == "main":
+            who = "본 화면 클로드가"
+        else:
+            who = "클로드가"
+        rows = [f"🔐 {who} 허락을 묻습니다", hints.get("title") or str(parsed["title"])]
+        if hints.get("action"):
+            rows.append(f"하는 일: {hints['action']}")
+        if hints.get("reason"):
+            rows.append(f"왜 묻나: {hints['reason']}")
+        if hints.get("rm"):
+            rows.append("주의: 파일 지우기(rm)가 들어 있어요")
+        rows.append("")
+        if parsed.get("context"):
+            rows.append("원문:")
+    else:
+        rows = [f"🔽 {parsed['title']}", ""]
     # ★T-260805-154 — 승인 대상 본문을 제목 아래에 싣는다. 이게 없으면 폰에서
     #   「무엇을」 승인하는지 모른 채 버튼만 누르게 된다(함수 _choice_context 주석).
     for line in parsed.get("context") or []:
@@ -4083,7 +4352,8 @@ def choice_card_text(parsed, translate=lambda text: text) -> str:
         rows.append("")
     for num, label in parsed["options"]:
         mark = "▸" if num == parsed["selected"] else " "
-        rows.append(f"{mark} {num}. {label}")
+        shown = approval_option_ko(label) if hints else label
+        rows.append(f"{mark} {num}. {shown}")
     rows.append("")
     rows.append(translate("버튼을 누르면 터미널에서 그 항목이 골라져요."))
     return "\n".join(rows)
@@ -4096,7 +4366,7 @@ def choice_keyboard(parsed, translate=lambda text: text):
     checked = set(parsed.get("checked") or ())
     buttons = []
     for num, label in parsed["options"]:
-        text = f"{num}. {label}"
+        text = f"{num}. {approval_option_ko(label) if parsed.get('hints') else label}"
         if multi:
             text = ("✅ " if num in checked else "⬜ ") + text
         if len(text) > 48:
@@ -4688,6 +4958,10 @@ ASKQ_TABS_PREVIEW_HINT_RE = re.compile(
     r"^Enter to select\s*·\s*↑/↓ to navigate\s*·\s*n to add notes\s*·\s*Tab to switch questions\s*·\s*Esc to cancel$")
 ASKQ_PREVIEW_BOX_RE = re.compile(r"\s{2,}┌─+")
 ASKQ_PREVIEW_SELECTED_RE = re.compile(r"^\s*❯\s*([1-9])\.")
+# T-261117-114: 좁은 창은 긴 보기 이름을 접으며 번호를 접힌 마지막 줄에 그린다(macOS 노드 11/17 22:14 55×23 —
+#   「❯   ① 해몽권·궁합권 1장  ┌──」/「 1.(추천)  │ …」). 줄 오른쪽 preview 상자 조각은 보기 글이 아니다.
+ASKQ_PREVIEW_NUMBER_ROW_RE = re.compile(r"^\s*([1-9])\.\s*(.*)$")
+ASKQ_PREVIEW_BOX_TAIL_RE = re.compile(r"\s{2,}[┌│├└].*$")
 # preview 상자 화면의 대화 줄은 번호가 없다(v2.1.311 제어 노드 격리 세션 실측, T-261027-007).
 ASKQ_PREVIEW_CHAT_ROW_RE = re.compile(r"(?i)^\s*(?:❯\s+)?chat about this\s*$")
 ASKQ_CLIPPED_MIN_SUFFIX = 32
@@ -5006,7 +5280,7 @@ def parse_clipped_ask_question(lines, hint_idx: int, question_tool, session_id, 
         suffix = askq_text_key(visible)
         native_title = askq_text_key(title)
         # T-261018-027: fullscreen caps a long question body and ends the shown window with
-        # "…" (2.1.302, vulcan 55x23 실측), so the visible text is a middle slice, not a suffix.
+        # "…" (2.1.302, node 55x23 실측), so the visible text is a middle slice, not a suffix.
         # Accept that slice only when the single "…" is the cut mark at its end.
         elided = (not full_header and suffix.endswith(ASKQ_ELLIPSIS) and suffix.count(ASKQ_ELLIPSIS) == 1
                   and not native_title.endswith(suffix))
@@ -5082,6 +5356,42 @@ def fold_ask_question_freeform(lines):
     return None
 
 
+def askq_preview_cursor_number(body, labels) -> int | None:
+    """preview 상자 화면에서 커서(❯)가 놓인 보기 번호. 못 가리면 None. 커서는 맨 아래 ❯ 줄이다(T-261123-029).
+
+    커서 줄에 번호가 없으면 접힌 보기다(T-261117-114). 아래 번호 줄까지를 한 보기로 이어, 상자 조각을 뺀 글이
+    그 번호의 원본 보기 이름과 같을 때만 그 번호로 본다 — 번호 줄이 다른 보기의 것이면 글이 달라 None.
+    """
+    cursor = [idx for idx, raw in enumerate(body) if raw.lstrip().startswith(CHOICE_SELECTED_MARK)]
+    if not cursor:
+        return None
+    # T-261123-029: 좁은 창(작업 노드 55x23)은 질문 화면을 다시 그릴 때마다 옛 화면이 스크롤 기록에 남아,
+    #   80줄 캡처에 ❯ 줄이 여럿 들어온다. 종전엔 「커서가 여럿 = 모름」으로 0 을 돌려, 폰 탭이 숫자만 보내고
+    #   커서 확인에 늘 실패해 Enter 를 못 보냈다(11/23 19:08~19:22 「승인」 8번 무반응). 옛 화면은 늘 위에
+    #   있으니 맨 아래 ❯ 줄 하나만 지금 커서로 본다. 그 줄이 번호 줄이 아니면(대화 칸 등) 아래 접힌 보기
+    #   판정으로만 읽고, 위쪽 옛 화면의 번호는 쓰지 않는다.
+    last = cursor[-1]
+    mark = ASKQ_PREVIEW_SELECTED_RE.match(body[last])
+    if mark:
+        number = int(mark.group(1))
+        return number if 1 <= number <= len(labels) else None
+    parts = [ASKQ_PREVIEW_BOX_TAIL_RE.sub("", body[last]).strip()[len(CHOICE_SELECTED_MARK):]]
+    for raw in body[last + 1:]:
+        row = ASKQ_PREVIEW_BOX_TAIL_RE.sub("", raw)
+        numbered = ASKQ_PREVIEW_NUMBER_ROW_RE.match(row)
+        if not numbered:
+            if not row.strip():
+                return None
+            parts.append(row)
+            continue
+        number = int(numbered.group(1))
+        parts.append(numbered.group(2))
+        if 1 <= number <= len(labels) and askq_text_key("".join(parts)) == askq_text_key(labels[number - 1]):
+            return number
+        return None
+    return None
+
+
 def parse_preview_ask_question(body, header: str, question_tool, session_id, index: int | None = None):
     """T-261027-007: preview 상자가 있는 질문 화면은 보기 줄이 상자와 섞여 깨진다(macOS 노드 10/27 11:42 실측).
     묶인 native 질문 원본으로만 읽는다 — 상자와 ❯ 줄이 화면에 보이고 원본에 preview 가 있을 때만.
@@ -5113,10 +5423,10 @@ def parse_preview_ask_question(body, header: str, question_tool, session_id, ind
         or not any(ASKQ_PREVIEW_BOX_RE.search(raw) for raw in body)
     ):
         return None
-    marks = [int(m.group(1)) for m in (ASKQ_PREVIEW_SELECTED_RE.match(raw) for raw in body) if m]
-    if len(marks) != 1 or not 1 <= marks[0] <= len(native_options):
-        return None
     labels = [option["label"].strip() for option in native_options]
+    selected = askq_preview_cursor_number(body, labels)
+    if selected is None:
+        return None
     descriptions = {
         number: option["description"].strip() for number, option in enumerate(native_options, start=1)
         if isinstance(option.get("description"), str) and option["description"].strip()}
@@ -5132,7 +5442,7 @@ def parse_preview_ask_question(body, header: str, question_tool, session_id, ind
         "multi": False,
         "checked": [],
         "review": False,
-        "selected": marks[0],
+        "selected": selected,
         "preview_layout": True,
         "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
     }
@@ -5346,6 +5656,104 @@ def parse_ask_question(screen: str, *, question_tool=None, session_id=None):
     }
 
 
+def parse_native_ask_question(screen: str, *, question_tool, session_id):
+    """T-261117-114: 질문 창인데 화면 판독이 끝내 실패하면 묶인 native 질문 원본으로 카드를 만든다.
+
+    macOS 노드 11/17 22:14(55×23): 보기 줄을 못 읽어 카드 대신 「화면 확인 필요」만 갔고, 사용자 채팅이 질문 창
+    뒤에 묶였다. 원본은 question_tool(훅 사이드카 — 질문이 뜨는 순간, 대화 기록 — 답 뒤)에서만 온다. 화면은
+    같은 질문이라는 증거만 댄다: 머리표 줄이나 보기 바로 위 인용 레일 질문 글이 원본과 맞아야 하고, 하나라도
+    어긋나면 None. preview 상자 화면이면 원본에도 preview 가 있어야 한다. 커서 번호를 못 읽으면 selected=0 —
+    preview 화면의 탭은 숫자 뒤 커서가 그 번호로 읽힐 때만 Enter 를 보낸다(select_preview_question_if_matches).
+    """
+    if (
+        not screen_has_question_wait(screen or "")
+        or not isinstance(question_tool, dict) or not session_id
+        or question_tool.get("session_id") != session_id or question_tool.get("completed")
+        or not isinstance(question_tool.get("tool_id"), str) or not question_tool["tool_id"]
+    ):
+        return None
+    questions = question_tool.get("questions")
+    if not isinstance(questions, list) or len(questions) != 1 or not isinstance(questions[0], dict):
+        return None
+    question = questions[0]
+    title, header, native_options = (question.get(key) for key in ("question", "header", "options"))
+    if (
+        question.get("multiSelect", False) is not False
+        or not isinstance(title, str) or not title.strip()
+        or not isinstance(header, str) or not header.strip() or "\n" in header
+        or not isinstance(native_options, list) or not 2 <= len(native_options) <= CHOICE_MAX_OPTIONS - 2
+        or any(not isinstance(option, dict) or not isinstance(option.get("label"), str)
+               or not option["label"].strip() for option in native_options)
+    ):
+        return None
+    rows = [line.rstrip() for line in strip_ansi_control(screen).splitlines()]
+    while rows and not rows[-1].strip():
+        rows.pop()
+    footers = [" ".join(line.strip() for line in rows[-count:]) for count in (1, 2, 3) if len(rows) >= count]
+    preview_screen = any(ASKQ_PREVIEW_HINT_RE.fullmatch(footer) for footer in footers)
+    if not preview_screen and not any(ASKQ_FULL_HINT_RE.fullmatch(footer) for footer in footers):
+        return None
+    if preview_screen != bool(native_option_previews(question)):
+        return None
+    body = _askq_body_above_hint(screen)
+    if body is None:
+        return None
+    first_option = next((idx for idx, raw in enumerate(body)
+                         if CHOICE_OPTION_RE.match(raw) or ASKQ_PREVIEW_BOX_RE.search(raw)
+                         or raw.lstrip().startswith(CHOICE_SELECTED_MARK)), len(body))
+    head = "☐ " + " ".join(header.split())
+    tabs = [" ".join(raw.split()) for raw in body[:first_option] if ASKQ_TAB_RE.match(raw)]
+    if tabs and tabs[-1] not in {head, "☒ " + " ".join(header.split())}:
+        return None
+    end = first_option
+    while end and not body[end - 1].strip():
+        end -= 1
+    start = end
+    while start and ASKQ_RAIL_RE.match(body[start - 1]):
+        start -= 1
+    shown = askq_text_key("".join(re.sub(r"^\s*│\s?", "", raw) for raw in body[start:end]))
+    if shown.endswith(ASKQ_ELLIPSIS):
+        shown = shown[:-len(ASKQ_ELLIPSIS)]
+    native_title = askq_text_key(title)
+    if shown and shown not in native_title:
+        return None
+    if not tabs and (not shown or (shown != native_title and len(shown) < ASKQ_CLIPPED_MIN_SUFFIX)):
+        return None
+    labels = [option["label"].strip() for option in native_options]
+    if preview_screen:
+        selected = askq_preview_cursor_number(body, labels) or 0
+    else:
+        marks = [int(m.group(2)) for m in (CHOICE_OPTION_RE.match(raw) for raw in body) if m and m.group(1)]
+        selected = marks[0] if len(marks) == 1 and 1 <= marks[0] <= len(labels) else 0
+    descriptions = {
+        number: option["description"].strip() for number, option in enumerate(native_options, start=1)
+        if isinstance(option.get("description"), str) and option["description"].strip()}
+    payload = head + "|" + title.strip() + "|" + "|".join(labels)
+    parsed = {
+        "kind": "question",
+        "header": head,
+        "title": title.strip(),
+        "context": [],
+        "options": list(enumerate(labels, start=1)),
+        "descriptions": descriptions,
+        "freeform": None,
+        "multi": False,
+        "checked": [],
+        "review": False,
+        "selected": selected,
+        "signature": hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12],
+        "native_only": True,
+        "recovered": True,
+        "native_tool_id": question_tool["tool_id"],
+        "native_session_id": session_id,
+        "native_fingerprint": hashlib.sha256(
+            json.dumps(question, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest(),
+    }
+    if preview_screen:
+        parsed["preview_layout"] = True
+    return parsed
+
+
 def question_title_matches(native: str, visible: str) -> bool:
     return bool(native and visible) and askq_text_key(native).startswith(askq_text_key(visible))
 
@@ -5417,19 +5825,67 @@ def question_card_kept_preview(parsed, translate=lambda text: text) -> str:
 QUESTION_CARD_COMPLETION_BUDGET = 4000  # UTF-16 units, under Telegram's 4096 message limit
 
 
-def question_card_completion_text(title: str, completion: str, kept_preview: str = "") -> str:
-    """답 뒤 카드 글 = 제목 + (남긴 원문) + 결과. 한 장(4096) 안에 들도록 원문만 줄인다."""
+def question_card_options(card) -> list[list]:
+    """T-261117-001: 답 뒤 카드에 다시 실을 보기 [번호, 이름, 설명]. 보기 기록이 없는 옛 카드는 이름에 1부터 번호를 붙인다."""
+    if card.get("review"):
+        return []
+    options = card.get("options")
+    if isinstance(options, list):
+        return [list(option) for option in options
+                if isinstance(option, list) and len(option) == 3 and type(option[0]) is int
+                and isinstance(option[1], str) and isinstance(option[2], str)]
+    labels = card.get("option_labels")
+    return [[num, label, ""] for num, label in enumerate(labels, 1) if isinstance(label, str)] if isinstance(labels, list) else []
+
+
+def question_card_chosen(options, answer: str, multi: bool) -> list[int]:
+    """네이티브 답과 이름이 같은 보기 번호. 여러 개 고르기 답은 「A, B」 꼴이다. 다른 글(직접 입력)은 짐작하지 않는다."""
+    joined = f", {answer}, "
+    return [num for num, label, _ in options if label == answer or (multi and f", {label}, " in joined)]
+
+
+def question_card_completion_text(title: str, completion: str, kept_preview: str = "",
+                                  options=(), chosen=()) -> str:
+    """답 뒤 카드 글 = 제목 + (남긴 원문) + 보기 목록 + 결과. 한 장(4096) 안에 들도록 원문을 먼저, 그다음 보기 설명을 줄인다.
+
+    T-261117-001: 고른 보기 줄은 「✅ 」로 시작한다 — DM 장식 정리(keep_completion_check)는 줄 첫머리 ✅ 만 남긴다.
+    """
     def units(value: str) -> int:
         return len(value.encode("utf-16-le")) // 2
+
+    def listing(cap: int | None) -> str:
+        rows = []
+        for num, label, desc in options:
+            if desc and cap is not None and units(desc) > cap:
+                desc = split_by_utf16_budget(desc, cap - 1)[0].rstrip() + "…" if cap > 1 else ""
+            rows.append(("✅ " if num in chosen else "") + f"{num}. {label}" + (f" — {desc}" if desc else ""))
+        return "\n".join(rows)
+
     head = f"❓ {title[:1500]}\n\n"
+    room = QUESTION_CARD_COMPLETION_BUDGET - units(head) - units(completion)
+    listed = listing(None)
+    if listed and units(listed) + 2 > room:
+        kept_preview = ""
+        low, high = 0, max(units(desc) for _, _, desc in options)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if units(listing(mid)) + 2 <= room:
+                low = mid
+            else:
+                high = mid - 1
+        listed = listing(low)
+        if units(listed) + 2 > room:
+            listed = split_by_utf16_budget(listed, room - 4)[0].rstrip() + "\n…" if room > 5 else ""
+    if listed:
+        room -= units(listed) + 2
     if not kept_preview:
-        return head + completion
-    room = QUESTION_CARD_COMPLETION_BUDGET - units(head) - units(completion) - 2
+        return head + (listed + "\n\n" if listed else "") + completion
+    room -= 2
     if units(kept_preview) > room:
         tail = "\n…"
         kept = split_by_utf16_budget(kept_preview, max(room - units(tail), 0) or 1)[0] if room > units(tail) else ""
         kept_preview = (kept.rstrip() + tail) if kept else ""
-    return head + (kept_preview + "\n\n" if kept_preview else "") + completion
+    return head + (kept_preview + "\n\n" if kept_preview else "") + (listed + "\n\n" if listed else "") + completion
 
 
 def ask_question_card_text(parsed, translate=lambda text: text) -> str:
@@ -5724,6 +6180,114 @@ def completed_background_agent_tools(
         except (OSError, ValueError, TypeError):
             continue
     return completed
+
+
+# T-261124-041: 일꾼 진행 표식. 일꾼이 글에 「진행 3/7」처럼 적을 때만 막대·%를 그린다.
+# 「97/97 통과」 같은 다른 분수와 섞이지 않게 「진행」 낱말을 꼭 붙인다(가짜 진행률 금지).
+SUBAGENT_PROGRESS_MARK_RE = re.compile(r"진행\s*(\d{1,4})\s*/\s*(\d{1,4})")
+_HANGUL_RE = re.compile(r"[가-힣]")
+
+
+def find_subagent_transcript(transcript: Path, tool_use_id: str) -> Path | None:
+    """Agent 도구 호출(tool_use_id)에 묶인 일꾼 기록 파일을 찾는다.
+
+    completed_background_agent_tools() 와 같은 원천(<세션>/subagents/agent-*.meta.json 의
+    toolUseId)과 같은 안전 규칙(심볼릭 링크 거부·meta 크기 상한)을 쓴다. 못 찾으면 None.
+    """
+    if not tool_use_id:
+        return None
+    folder = transcript.parent / transcript.stem / "subagents"
+    try:
+        if folder.is_symlink() or folder.parent.is_symlink() or not folder.is_dir():
+            return None
+        metas = list(folder.glob("agent-*.meta.json"))
+    except OSError:
+        return None
+    for meta_path in metas:
+        match = re.fullmatch(r"agent-([A-Za-z0-9_-]{1,128})\.meta\.json", meta_path.name)
+        if not match or meta_path.is_symlink():
+            continue
+        try:
+            with meta_path.open("rb") as handle:
+                raw_meta = handle.read(16385)
+            if len(raw_meta) > 16384:
+                continue
+            meta = json.loads(raw_meta)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict) or meta.get("toolUseId") != tool_use_id:
+            continue
+        path = folder / f"agent-{match.group(1)}.jsonl"
+        if path.is_symlink():
+            return None
+        return path
+    return None
+
+
+def subagent_activity_label(name: str, inp: Any) -> str:
+    """일꾼의 도구 한 번을 카드 한 조각으로. 설명에 한글이 있으면 그대로, 아니면 도구 종류 이름.
+
+    한국어 게이트 스위치(기본 꺼짐)와 상관없이 같은 규칙을 쓴다 — 사용자 폰 카드에 영어 설명이
+    그대로 뜨지 않게 한다(영어 초보, 기억 user_english_beginner)."""
+    detail = ""
+    if isinstance(inp, dict):
+        raw = inp.get("description")
+        detail = " ".join(str(raw).split()) if isinstance(raw, str) else ""
+    if detail and _HANGUL_RE.search(detail):
+        return flow_cap_text(detail, 50)
+    return tool_label(name)
+
+
+def scan_subagent_records(data: bytes) -> dict[str, Any]:
+    """일꾼 기록 조각(완전한 줄만)에서 도구 수·최근 동작·진행 표식을 뽑는다.
+
+    돌려주는 값: tools(새 도구 호출 수), activity(마지막 도구 조각), activity_at(그 시각),
+    current/total(마지막 「진행 n/m」, 없으면 None).
+    """
+    tools = 0
+    activity = ""
+    activity_at: float | None = None
+    current: int | None = None
+    total: int | None = None
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        at = record_timestamp_seconds(record)
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_use":
+                tools += 1
+                activity = subagent_activity_label(str(part.get("name") or ""), part.get("input"))
+                if at is not None:
+                    activity_at = at
+            elif part.get("type") == "text":
+                for match in SUBAGENT_PROGRESS_MARK_RE.finditer(str(part.get("text") or "")):
+                    done, whole = int(match.group(1)), int(match.group(2))
+                    if whole > 0 and 0 <= done <= whole:
+                        current, total = done, whole
+    return {"tools": tools, "activity": activity, "activity_at": activity_at,
+            "current": current, "total": total}
+
+
+def estimate_remaining_seconds(current: int | None, total: int | None, elapsed: float) -> float | None:
+    """끝낸 몫과 걸린 시간으로 남은 시간을 어림한다(같은 빠르기라고 보는 단순 비례).
+
+    끝낸 몫이 0 이거나 이미 다 했거나 1분도 안 지났으면 어림하지 않는다 — 너무 이른
+    어림은 틀린 숫자를 보여 준다."""
+    if not current or not total or current >= total or elapsed < 60:
+        return None
+    return elapsed * (total - current) / current
 
 
 def progress_board_enabled() -> bool:
@@ -6202,13 +6766,32 @@ def format_progress_line(item: "ProgressItem", *, now: float) -> str:
     if item.done:
         tail = f" · {item.last_activity}" if item.last_activity else ""
         return f"✅ 완료 · {item.label} · 소요 {elapsed}{tail}"
+    recent = format_subagent_recent(item, now=now) if item.kind == "subagent" else ""
     if item.total:
         current = item.current or 0
         pct = int(round(100 * current / item.total))
         bar = progress_board_bar(current, item.total)
-        return f"{kind_icon} · {item.label}\n{bar} {pct}% ({current}/{item.total}) · {elapsed}"
+        line = f"{kind_icon} · {item.label}\n{bar} {pct}% ({current}/{item.total}) · {elapsed}"
+        # T-261124-041: 끝낸 몫이 있으면 같은 빠르기로 어림한 남은 시간을 붙인다(「어림」 표시).
+        remaining = estimate_remaining_seconds(current, item.total, max(0.0, now - item.started_at))
+        if remaining is not None:
+            line += f" · 약 {format_flow_elapsed(remaining)} 남음(어림)"
+        return f"{line}\n{recent}" if recent else line
+    if recent:
+        return f"{kind_icon} · {item.label} · {elapsed} 경과\n{recent}"
     tail = f" · 최근: {item.last_activity}" if item.last_activity else ""
     return f"{kind_icon} · {item.label} · {elapsed} 경과{tail}"
+
+
+def format_subagent_recent(item: "ProgressItem", *, now: float) -> str:
+    """일꾼 줄 아래 한 줄: 최근 동작 · 도구 N번 · 마지막 움직임 N초 전. 읽은 게 없으면 빈 문자열."""
+    if not item.tool_count:
+        return ""
+    parts = [f"최근: {item.last_activity}"] if item.last_activity else []
+    parts.append(f"도구 {item.tool_count}번")
+    if item.last_activity_at:
+        parts.append(f"{format_flow_elapsed(max(0.0, now - item.last_activity_at))} 전")
+    return "   " + " · ".join(parts)
 
 
 def format_progress_board(
@@ -6217,9 +6800,12 @@ def format_progress_board(
     node: str = "",
     emoji: str = "",
     now: datetime | None = None,
+    waiting: int = 0,
 ) -> str:
     """📊 progress board 렌더 (T-260807-032). flow mirror 와 자매 헤더 규격(node·label·갱신
-    시각)이지만 본문은 도구 로그가 아니라 항목당 1줄짜리 진행 상태다."""
+    시각)이지만 본문은 도구 로그가 아니라 항목당 1줄짜리 진행 상태다.
+
+    waiting(T-261124-041) = 받았지만 아직 Claude 가 읽지 않은 텔레그램 메시지 수. 0 이면 줄이 없다."""
     if not items:
         return ""
     default_node, default_emoji = node_defaults()
@@ -6231,6 +6817,8 @@ def format_progress_board(
     timestamp = moment.strftime("%H:%M")
     header = f"{node_emoji} {label} · {PROGRESS_BOARD_HEADER} · 갱신 {timestamp}"
     lines = [format_progress_line(item, now=moment.timestamp()) for item in items]
+    if waiting > 0:
+        lines.append(f"\n📥 아직 안 들어간 메시지 {waiting}건 — 지금 일이 끝나면 차례로 들어가요")
     body = "\n".join(lines)
     available = max(1, PROGRESS_BOARD_LIMIT - len(header) - 4)
     if len(body) > available:
@@ -7080,12 +7668,7 @@ def split_by_utf16_budget(text: str, budget: int) -> list[str]:
 # TelegramClient.call() 이 Bot API·mesh_cutover·bypass 보다 앞에서 끊는다.
 # inbound(getUpdates) 는 MESH_CUTOVER_METHODS 밖이라 유지. Grok/Cursor 무접촉.
 # human_room_mute 를 읽지 않는다. #2111 helper ops-drop 과 별 축.
-CLAUDE_NODE_ROOM_CHAT_ENVS = (
-    "TELEGRAM_CHAT_ID_MACBOOK",
-    "TELEGRAM_CHAT_ID_NOTEBOOK3060",
-    "TELEGRAM_CHAT_ID_MACMINI",
-    "CLB_CHAT_ID",
-)
+CLAUDE_NODE_ROOM_CHAT_ENVS = ("CLB_CHAT_ID",)  # Add more rooms with CLB_CLAUDE_NODE_ROOM_CHATS.
 CLAUDE_OPS_OUTBOUND_DROP = "dropped_claude_node_ops"
 # T-261010-036: progress older than this is recorded as handled, not sent, so a
 # cleared send block does not flush a backlog of stale commentary at once.
@@ -8626,6 +9209,11 @@ class ProgressItem:
     current: int | None = None
     total: int | None = None
     last_activity: str = ""
+    # T-261124-041: 일꾼(subagent) 기록을 이어 읽은 자리·도구 수·마지막 움직임 시각.
+    agent_path: str = ""
+    read_pos: int = 0
+    tool_count: int = 0
+    last_activity_at: float = 0.0
 
 
 @dataclass
@@ -10840,6 +11428,12 @@ class Bridge:
     question_checked_at = float("-inf")
     question_capture_ok_at = float("-inf")
     approval_speech_job = None
+    # T-261118-056 스텁 바닥 — 무응답 카드 문자 작업과 보류 사유 로그.
+    owner_sms_job = None
+    owner_sms_skip_note = ""
+    # T-261118-060: 라이브 브릿지는 __init__ 에서 켠다. __new__ 스텁은 꺼 둔다.
+    # 30분 문자 시험이 시계를 한 시간 넘긴 뒤에도 추가 실행이 없어야 해서다.
+    notify_call_stage = False
     question_tool = None
     question_receipts = ()
     askq_done_tool_ids = frozenset()
@@ -10891,6 +11485,22 @@ class Bridge:
         # T-261004-016: 질문 화면 카드 — 보낸 질문(episode)·직전 관측 서명·마지막 확인 시각.
         self.question_card: dict[str, Any] | None = None
         self.approval_speech_job = None
+        # T-261118-056: 30분 무응답 카드의 문자 알림 작업(한 번에 1개)과 마지막 보류 사유.
+        self.owner_sms_job: dict[str, Any] | None = None
+        self.owner_sms_skip_note = ""
+        # T-261118-098: deploy self-restart bookkeeping. The gate stays off unless macOS
+        # (or CLB_SELF_RESTART_ON_DEPLOY=1) and the off-file is absent.
+        self.self_restart_artifact: Path | None = None
+        self._self_restart_baseline: str | None = None
+        self._self_restart_pending_hash = ""
+        self._self_restart_changed_at = 0.0
+        self._self_restart_hashed_at: float | None = None
+        self._self_restart_cached_digest: str | None = None
+        self._self_restart_wait_reason = ""
+        self._self_restart_repeat_note = ""
+        self._self_restart_exit_code: int | None = None
+        self._self_restart_lock = threading.Lock()
+        self.notify_call_stage = True
         self.question_pending_sig = ""
         self.question_checked_at = float("-inf")
         self.question_capture_ok_at = float("-inf")
@@ -14468,9 +15078,20 @@ class Bridge:
                 lines.append(request_context)
         if item.suggested_authorization:
             lines.append(f"suggested_authorization: {item.suggested_authorization}")
+        mid_turn_notice = self.mid_turn_notify_context(item)
+        if mid_turn_notice:
+            lines.append(mid_turn_notice)
         if stale_notice:
             lines.append(stale_notice)
         return "\n".join(lines)
+
+    def mid_turn_notify_context(self, item: QueueItem) -> str:
+        """T-261118-074: 진행 중 턴에 끼어든 사람 메시지면 notify 로 바로 답하라는 안내, 아니면 ''."""
+        if not item.busy_injected or item.auto_origin:
+            return ""
+        if self.language_code() == "en":
+            return MID_TURN_NOTIFY_CONTEXT_EN
+        return MID_TURN_NOTIFY_CONTEXT_KO
 
     def write_envelope_sidecar(self, item: QueueItem, *, visible_prompt: str) -> None:
         now = time.time()
@@ -14959,12 +15580,24 @@ class Bridge:
                 return False
             log("CHOICE", f"auto-deny notice sent expires_in={expires_in} sig={parsed['signature']}")
             return True
-        body = choice_card_text(parsed, translate=self.tr)
         tracked = parsed["kind"] in {"approval", "computer_use"}
         if tracked:
             for card in getattr(self, "approval_cards", []):
                 if card["signature"] == parsed["signature"] and not card.get("completion"):
                     return True
+        if (parsed["kind"] == "approval" and parsed.get("input_mode") != "workspace_trust"
+                and getattr(getattr(self, "language", None), "code", None) == "ko"):
+            # T-261122-025: 누가 묻는지(본 화면·보조 에이전트)·하는 일·왜 묻나 한국어 풀이. 기록을 못 읽어도 카드는 간다.
+            #   폴더 신뢰 창(workspace_trust)은 도구 승인이 아니라 종전 카드 그대로 둔다.
+            origin = None
+            try:
+                binding = getattr(self, "session_binding", None)
+                transcript = getattr(binding, "transcript_path", None) if binding else None
+                origin = approval_origin(transcript, parsed.get("context")) if transcript else None
+            except Exception as exc:  # noqa: BLE001
+                log("CHOICE", f"approval origin lookup failed: {type(exc).__name__}")
+            parsed["hints"] = approval_hints(parsed, origin)
+        body = choice_card_text(parsed, translate=self.tr)
         try:
             response = self.telegram.call(
                 "sendMessage",
@@ -14988,6 +15621,9 @@ class Bridge:
                     "message_id": result["message_id"], "chat_id": str(self.config.chat_id),
                     "signature": parsed["signature"], "kind": parsed["kind"], "body": body.rsplit("\n\n", 1)[0],
                     "session_id": self.session_binding.session_id if self.session_binding else None,
+                    # T-261122-025: 영수증도 카드와 같은 한국어 단추 글·「보조 에이전트」 안내를 쓴다.
+                    "ko_labels": bool(parsed.get("hints")),
+                    "origin": (parsed.get("hints") or {}).get("origin"),
                     # Only a native countdown expires a still-open dialog.
                     "expires_at": time.time() + parsed["expires_in"] if parsed.get("expires_in") is not None else None,
                 }
@@ -15085,8 +15721,13 @@ class Bridge:
                 return self.tr('입력 전송 여부를 확인하지 못했어요. 다시 입력하지 않았어요.')
             if outcome == "sent":
                 label = dict(parsed["options"])[number]
+                if card and card.get("ko_labels"):
+                    label = approval_option_ko(label)
                 receipt = "✅ " + self.tr('입력 전송: {number}. {label}', number=number, label=label[:200])
-                receipt += "\n" + self.tr('명령 실행 결과는 Claude 응답에서 확인해 주세요.')
+                if card and card.get("origin") == "subagent":
+                    receipt += "\n" + self.tr('보조 에이전트 일이라 본 터미널에는 결과가 안 보일 수 있어요. 끝나면 요약만 올라와요.')
+                else:
+                    receipt += "\n" + self.tr('명령 실행 결과는 Claude 응답에서 확인해 주세요.')
                 toast = self.tr('{v0}번 입력을 보냈어요', v0=number)
             else:
                 receipt = self.tr('승인창이 바뀌었거나 만료돼서 입력하지 않았어요.')
@@ -15967,6 +16608,10 @@ class Bridge:
             screen, question_tool=dict(tool, completed=False) if completed else tool,
             session_id=binding.session_id if binding else None,
         )
+        if parsed is None and not completed:
+            # T-261117-114: 화면을 끝내 못 읽어도 열린 질문의 원본이 묶여 있으면 카드는 간다.
+            parsed = parse_native_ask_question(
+                screen, question_tool=tool, session_id=binding.session_id if binding else None)
         if completed and parsed and parsed.get("recovered"):
             parsed["native_completed"] = True
         if expected_native and expected_native.get("recovered") and not (parsed or {}).get("recovered"):
@@ -16145,6 +16790,7 @@ class Bridge:
                     card["completion"] = "✅ " + self.tr('제출했어요')
                 elif not block.get("is_error") and isinstance(answer, str) and answer.strip():
                     card["completion"] = "✅ " + self.tr('선택: {answer}', answer=answer[:2000])
+                    card["chosen"] = question_card_chosen(question_card_options(card), answer, bool(card.get("multi")))
                 else:
                     card["completion"] = self.tr('그 선택창이 이미 닫혔어요')
                 card["retry_at"] = 0
@@ -16159,8 +16805,10 @@ class Bridge:
             if not card.get("completion") or time.time() < card.get("retry_at", 0):
                 continue
             kept = card.get("kept_preview") if "✅" in card["completion"] else ""
+            chosen = card.get("chosen") if "✅" in card["completion"] else []
             text = question_card_completion_text(card["title"], card["completion"],
-                                                 kept if isinstance(kept, str) else "")
+                                                 kept if isinstance(kept, str) else "", question_card_options(card),
+                                                 chosen if isinstance(chosen, list) else [])
             try:
                 self.telegram.last_send_error = ""
                 response = self.telegram.call(
@@ -16292,6 +16940,12 @@ class Bridge:
         선택지 글자가 매 키마다 바뀌므로, 서명이 아니라 episode 로 중복을 막는다.
         """
         self.poll_approval_speech()
+        if self.maybe_self_restart_on_deploy():
+            return
+        # The public export strips this private integration together with the speaker block.
+        escalate_owner_sms = getattr(self, "maybe_escalate_owner_sms", None)
+        if escalate_owner_sms is not None:
+            escalate_owner_sms()
         if not repl_supports_pane_features(self.repl):
             return
         now = time.monotonic()
@@ -16337,6 +16991,7 @@ class Bridge:
             if parsed.get("recovered") and not parsed.get("freeform"):
                 self.question_card["freeform"] = None
             self.maybe_announce_approval(self.question_card, parsed)
+            self.maybe_send_question_hold_notice(self.question_card)
             return
         if self.question_pending_sig != parsed["signature"]:
             # 반쯤 그려진 화면에 카드를 만들지 않는다 — 다음 확인에서도 같아야 보낸다.
@@ -16428,10 +17083,15 @@ class Bridge:
             "multi": parsed["multi"],
             "title": parsed["title"],
             "option_labels": [label for _, label in parsed["options"]],
+            # T-261117-001: 답 뒤 카드에 다시 실을 보기 목록(처음 카드와 같은 줄). 제출 확인 화면은 싣지 않는다.
+            "options": [] if parsed.get("review") else [
+                [num, label, card_parsed.get("descriptions", {}).get(num) or ""] for num, label in card_parsed["options"]],
             "message_id": (response.get("result") or {}).get("message_id"),
             "session_id": self.session_binding.session_id if getattr(self, "session_binding", None) else None,
             # T-261113-014: 답 뒤 완료 글에 다시 실을 원문(승인 내역).
             "kept_preview": question_card_kept_preview(card_parsed, self.tr),
+            # T-261118-056: 무응답 문자 기준 시각.
+            "created_at": time.time(),
         }
         if parsed.get("recovered"):
             self.question_card.update(recovered=True, native_tool_id=parsed["native_tool_id"],
@@ -16464,6 +17124,30 @@ class Bridge:
             f"question card sent options={len(parsed['options'])} freeform={parsed['freeform']} "
             f"multi={parsed['multi']} sig={parsed['signature']}",
         )
+        self.maybe_send_question_hold_notice(self.question_card)
+
+    def maybe_send_question_hold_notice(self, card) -> None:
+        """T-261117-114: 질문 창 뒤에 사용자 채팅이 대기 중이면 전달된 카드 뒤에 안내 한 줄(카드당 1회).
+
+        macOS 노드 11/17 22:14 — 카드 없이 채팅이 질문 창 뒤에 묶였다(QUEUE stuck pending). 질문 창이 열린 동안은
+        주입하지 않으므로(busy_state=approval_wait) 대기 중인 채팅은 질문에 답한 뒤에 들어간다. 채팅은 그대로 둔다.
+        """
+        if (not isinstance(card, dict) or card.get("hold_notice_sent") or card.get("completion")
+                or card.get("submitted") or type(card.get("message_id")) is not int or card["message_id"] <= 0):
+            return
+        with self.lock:
+            waiting = [item for item in getattr(self, "pending", ())
+                       if item.source in QUESTION_HOLD_SOURCES and not item.busy_injected and not item.user_uuid]
+        if not waiting:
+            return
+        card["hold_notice_sent"] = True
+        self.persist_state()
+        try:
+            self.telegram.send(self.tr(QUESTION_HOLD_NOTICE))
+        except Exception as exc:  # noqa: BLE001
+            log("QUEUE", f"question hold notice failed: {type(exc).__name__}")
+            return
+        log("QUEUE", f"question hold notice sent waiting={len(waiting)} card={card['message_id']}")
 
     def send_question_card_preview_parts(self, card_parsed: dict[str, Any], episode: str) -> str | None:
         """T-261027-008: 카드 한 장에 다 못 싣고 폰에도 안 간 승인 원문을 카드 바로 앞에 조각으로 보낸다.
@@ -19873,7 +20557,7 @@ class Bridge:
     def relay_final_answer_via_other_node_bot(self, answer: str, *, attempts: int, send_error: str) -> bool:
         """최종답장이 재시도 소진으로 실패 확정됐을 때 타 노드 봇 경유 대타 중계를 시도한다
         (T-260808-022, parent=T-260808-018 4축 중 4축). 신규 채널 발명 금지(원칙 8) — 이
-        노드의 발신이 죽은 상황이므로 기존 정본 scripts/notify-aniki.sh(비-telegram 턴이
+        노드의 발신이 죽은 상황이므로 기존 정본 relay-alert.sh(비-telegram 턴이
         chat_id 없이 사용자에게 직접 보고할 때 쓰는, 이미 착탄이 실증된 경로)를 그대로
         재사용한다. 착탄 여부(rc==0)를 반환하고 장부에도 남긴다.
 
@@ -19884,7 +20568,7 @@ class Bridge:
         label = label or self.config.node or "노드"
         parsed = parse_suggested_reply(answer)
         body = parsed.body if parsed.matched else answer
-        # T-260825-036: 대타는 notify-aniki 평문이라 버튼을 못 띄운다.
+        # T-260825-036: 대타는 relay-alert 평문이라 버튼을 못 띄운다.
         # 마커는 벗기고, 추천답변 본문을 「(추천답변: …)」로 다시 붙이지 않는다 (R-C8).
         relay_answer = body
         if looks_like_relay_fragment(relay_answer):
@@ -22008,6 +22692,64 @@ class Bridge:
             if last_line:
                 item.last_activity = last_line
 
+    def refresh_subagent_progress(self) -> None:
+        """실행 중 일꾼(subagent) 항목의 기록을 지난번 자리부터 이어 읽어 도구 수·최근 동작·
+        진행 표식을 갱신한다(T-261124-041). 렌더 직전에만 부른다 — 디스크 I/O 다."""
+        binding = getattr(self, "session_binding", None)
+        transcript = getattr(binding, "transcript_path", None)
+        if transcript is None:
+            return
+        for item in list(self.progress_items.values()):
+            if item.kind != "subagent" or item.done:
+                continue
+            try:
+                self._refresh_one_subagent(item, Path(transcript))
+            except Exception as exc:  # noqa: BLE001
+                # 카드 보조 정보다 — 여기서 난 예외가 jsonl_loop 의 질문 카드·하트비트를 막으면 안 된다.
+                now = time.time()
+                if now - getattr(self, "_subagent_progress_error_log_at", 0.0) >= 300.0:
+                    self._subagent_progress_error_log_at = now
+                    log("SEND", f"subagent progress refresh skipped (non-fatal): {exc!r}")
+
+    def _refresh_one_subagent(self, item: "ProgressItem", transcript: Path) -> None:
+        if not item.agent_path:
+            found = find_subagent_transcript(transcript, item.tool_use_id)
+            if found is None:
+                return
+            item.agent_path = str(found)
+        try:
+            with open(item.agent_path, "rb") as handle:
+                handle.seek(item.read_pos)
+                data = handle.read(SUBAGENT_PROGRESS_READ_LIMIT)
+        except OSError:
+            return
+        complete, sep, _partial = data.rpartition(b"\n")
+        if not sep:
+            return  # 아직 끝난 줄이 없다 — 반쯤 쓰인 줄은 다음에 읽는다.
+        item.read_pos += len(complete) + 1
+        found = scan_subagent_records(complete)
+        item.tool_count += found["tools"]
+        if found["activity"]:
+            item.last_activity = found["activity"]
+        if found["activity_at"]:
+            item.last_activity_at = found["activity_at"]
+        if found["total"] is not None:
+            item.current, item.total = found["current"], found["total"]
+
+    def progress_board_waiting_count(self) -> int:
+        """받았지만 아직 Claude 기록에 안 보인 텔레그램 메시지 수(T-261124-041). 일꾼을 기다리는
+        동안 보낸 메시지가 「사라진 것」처럼 보이지 않게 카드에 숫자로 적는다."""
+        lock = getattr(self, "lock", None)
+        try:
+            if lock is not None:
+                with lock:
+                    items = list(getattr(self, "pending", []) or [])
+            else:
+                items = list(getattr(self, "pending", []) or [])
+        except Exception:  # noqa: BLE001
+            return 0
+        return sum(1 for item in items if not getattr(item, "user_uuid", ""))
+
     def maybe_render_progress_board(self, now: float | None = None) -> bool:
         """진행판 카드를 최소 간격을 지켜 send/edit 한다(무음). 항목이 전부 빠지면(완료 +
         linger 경과) 앵커를 리셋해 다음 배치가 새 카드로 시작하게 한다 — 무관한 미래
@@ -22030,8 +22772,12 @@ class Bridge:
         if self.progress_last_render_at and (now - self.progress_last_render_at) < PROGRESS_BOARD_MIN_INTERVAL:
             return False
         self.refresh_bg_progress_from_output()
+        self.refresh_subagent_progress()
         items = sorted(self.progress_items.values(), key=lambda i: i.started_at)
-        body = format_progress_board(items, node=self.config.node, emoji=self.config.emoji)
+        body = format_progress_board(
+            items, node=self.config.node, emoji=self.config.emoji,
+            waiting=self.progress_board_waiting_count(),
+        )
         if not body:
             return False
         if priority_lane_active():
@@ -22142,9 +22888,218 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001 - 알림 실패가 감시 루프를 죽이지 않는다.
             log("TGERR", f"clear notice failed: {type(exc).__name__}")
 
+    def _self_restart_mutex(self):
+        lock = getattr(self, "_self_restart_lock", None)
+        if lock is not None:
+            return lock
+        with _SELF_RESTART_LOCK_GUARD:
+            lock = getattr(self, "_self_restart_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._self_restart_lock = lock
+            return lock
+
+    def self_restart_enabled(self) -> bool:
+        """Off-file wins, then CLB_SELF_RESTART_ON_DEPLOY, then macOS-only default."""
+        if (Path.home() / ".claude/state/bridge-self-restart.off").is_file():
+            return False
+        raw = os.environ.get("CLB_SELF_RESTART_ON_DEPLOY")
+        if raw is not None and raw.strip() != "":
+            return raw.strip() == "1"
+        return sys.platform == "darwin"  # self-restart platform default
+
+    def self_restart_artifact_path(self) -> Path:
+        override = getattr(self, "self_restart_artifact", None)
+        if override:
+            return Path(override)
+        return Path(__file__).resolve()
+
+    def self_restart_file_sha256(self, path: Path) -> str | None:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return None
+        return digest.hexdigest()
+
+    def self_restart_current_digest(self, now: float) -> str | None:
+        hashed_at = getattr(self, "_self_restart_hashed_at", None)
+        cached = getattr(self, "_self_restart_cached_digest", None)
+        if hashed_at is not None and cached is not None and (now - hashed_at) < SELF_RESTART_HASH_INTERVAL_SECONDS:
+            return cached
+        digest = self.self_restart_file_sha256(self.self_restart_artifact_path())
+        if digest is None:
+            return None
+        self._self_restart_hashed_at = now
+        self._self_restart_cached_digest = digest
+        return digest
+
+    def self_restart_stamp_path(self) -> Path:
+        node = str(getattr(getattr(self, "config", None), "node", "") or "")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", node):
+            node = "unknown"
+        return Path.home() / ".claude/state" / f"claude-telegram-bridge-{node}.self-restart.json"
+
+    def self_restart_repeat_blocked(self, now: float) -> bool:
+        path = self.self_restart_stamp_path()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        raw = payload.get("restarted_at")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return False
+        return now - float(raw) < SELF_RESTART_REPEAT_SECONDS
+
+    def self_restart_record(self, now: float) -> None:
+        try:
+            write_json_atomic(self.self_restart_stamp_path(), {"restarted_at": now})
+        except OSError as exc:
+            log("SELF_RESTART", f"stamp write failed: {type(exc).__name__}")
+
+    def self_restart_open_approval_count(self, now: float) -> int:
+        binding = getattr(self, "session_binding", None)
+        session_id = getattr(binding, "session_id", None) if binding is not None else None
+        count = 0
+        for card in getattr(self, "approval_cards", []) or []:
+            if not isinstance(card, dict) or card.get("completion") or card.get("observed_closed"):
+                continue
+            if card.get("session_id") != session_id:
+                continue
+            expires_at = card.get("expires_at")
+            if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool) and now >= float(expires_at):
+                continue
+            count += 1
+        return count
+
+    def self_restart_wait_reason(self, now: float) -> str:
+        """Idle means the same thing as the watchdog, judged from this process's memory.
+
+        Child-process slots that also have to be empty: owner_sms_job (SMS and call),
+        approval_speech_job, and MESH_SEND_INFLIGHT_PGIDS.
+        """
+        if getattr(self, "active_turn", None) is not None:
+            return "active_turn"
+        pending = getattr(self, "pending", None)
+        pending_count = len(pending) if isinstance(pending, list) else 0
+        if pending_count:
+            return f"queue_pending:{pending_count}"
+        if self.native_question_open():  # self-restart question gate
+            return "question_card_open"
+        open_approvals = self.self_restart_open_approval_count(now)
+        if open_approvals:
+            return f"approval_card_open:{open_approvals}"
+        if self.owner_sms_job is not None:  # self-restart sms gate
+            return "owner_sms_job"
+        if getattr(self, "approval_speech_job", None) is not None:
+            return "approval_speech_job"
+        inflight = self.self_restart_mesh_inflight_count()
+        if inflight:
+            return f"mesh_send_inflight:{inflight}"
+        return ""
+
+    def self_restart_mesh_inflight_count(self) -> int:
+        """In-flight mesh sends. The public export strips that table, so a missing name is idle."""
+        lock = globals().get("MESH_SEND_INFLIGHT_LOCK")
+        pgids = globals().get("MESH_SEND_INFLIGHT_PGIDS")
+        if lock is None or pgids is None:
+            return 0
+        with lock:
+            return len(pgids)
+
+    def exit_for_self_restart(self) -> None:
+        """Normal shutdown (stop flag, typing, lock) then a non-zero exit. No os.execv."""
+        stop = getattr(self, "stop_event", None)
+        if isinstance(stop, threading.Event):
+            stop.set()
+        if getattr(self, "typing_lock", None) is not None:
+            try:
+                self.stop_typing()
+            except Exception:
+                log("SELF_RESTART", "stop_typing failed")
+        if "release_lock" in self.__dict__ or getattr(self, "pid_handle", None) is not None:
+            try:
+                self.release_lock()
+            except Exception:
+                log("SELF_RESTART", "release_lock failed")
+        self.terminate_process(SELF_RESTART_EXIT_CODE)
+
+    def terminate_process(self, code: int) -> None:
+        self._self_restart_exit_code = int(code)
+        stop = getattr(self, "stop_event", None)
+        if isinstance(stop, threading.Event):
+            stop.set()
+        if threading.current_thread() is threading.main_thread():
+            raise SystemExit(int(code))
+
+    def maybe_self_restart_on_deploy(self, now: float | None = None) -> bool:
+        """Return True when this process has asked to exit so launchd can reload it.
+
+        Hash the bridge file at most once per 60s. A new hash must stay put for
+        CLB_SELF_RESTART_COALESCE_SECONDS (default 120, minimum 30) and the bridge
+        must be idle. Telegram is not notified. Tests replace terminate_process.
+        """
+        with self._self_restart_mutex():
+            pending_code = getattr(self, "_self_restart_exit_code", None)
+            if pending_code:
+                self.terminate_process(int(pending_code))
+                return True
+            if not self.self_restart_enabled():
+                return False
+            now = time.time() if now is None else float(now)
+            digest = self.self_restart_current_digest(now)
+            if digest is None:
+                return False
+            baseline = getattr(self, "_self_restart_baseline", None)
+            if baseline is None:
+                self._self_restart_baseline = digest
+                self._self_restart_pending_hash = ""
+                self._self_restart_changed_at = 0.0
+                return False
+            if digest == baseline:
+                self._self_restart_pending_hash = ""
+                self._self_restart_changed_at = 0.0
+                self._self_restart_wait_reason = ""
+                return False
+            if digest != getattr(self, "_self_restart_pending_hash", ""):
+                self._self_restart_pending_hash = digest
+                self._self_restart_changed_at = now
+                self._self_restart_wait_reason = ""
+                return False
+            coalesce = int_env(
+                "CLB_SELF_RESTART_COALESCE_SECONDS",
+                SELF_RESTART_COALESCE_DEFAULT_SECONDS,
+                minimum=SELF_RESTART_COALESCE_MIN_SECONDS,
+            )
+            if now - self._self_restart_changed_at < coalesce:  # self-restart stability gate
+                return False
+            reason = self.self_restart_wait_reason(now)
+            if reason:
+                if reason != getattr(self, "_self_restart_wait_reason", ""):
+                    self._self_restart_wait_reason = reason
+                    log("SELF_RESTART", f"wait reason={reason}")
+                return False
+            if self.self_restart_repeat_blocked(now):
+                if getattr(self, "_self_restart_repeat_note", "") != "suppressed":
+                    self._self_restart_repeat_note = "suppressed"
+                    log("SELF_RESTART", f"repeat suppressed old={baseline[:12]} new={digest[:12]}")
+                return False
+            self._self_restart_repeat_note = ""
+            self.persist_state()
+            self.self_restart_record(now)
+            log("SELF_RESTART", f"deploy old={baseline[:12]} new={digest[:12]}")
+            self.exit_for_self_restart()
+            return True
+
     def jsonl_loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                if self.maybe_self_restart_on_deploy():
+                    return
                 self.retry_pending_flow_closures()
                 binding = self.ensure_session_binding()
                 self.maybe_confirm_pending_clear(binding)
@@ -22337,6 +23292,8 @@ class Bridge:
                     raise RuntimeError("Telegram getUpdates 409; token ownership lost, fail-closed") from exc
                 raise
             self.record_poll_heartbeat()
+            if getattr(self, "_self_restart_exit_code", None):
+                break
             for update in updates:
                 if not isinstance(update, dict) or "update_id" not in update:
                     continue
@@ -22443,6 +23400,7 @@ class Bridge:
                 control = start_control(self.config.node, 'claude', self, globals())
             except ImportError:
                 log('CONTROL', 'optional control module unavailable; bridge preserved')
+        restart_code = None
         try:
             if self.config.voice_only:
                 self.voice_loop()
@@ -22454,6 +23412,9 @@ class Bridge:
             self.stop_event.set()
             self.stop_typing()
             self.release_lock()
+            restart_code = getattr(self, "_self_restart_exit_code", None)
+        if restart_code:
+            raise SystemExit(int(restart_code))
 
 
 def handle_stop_signal(bridge: Bridge, signum: int) -> None:
