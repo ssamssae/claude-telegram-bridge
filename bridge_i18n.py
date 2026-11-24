@@ -232,6 +232,7 @@ _message('The model list could not be loaded. Nothing was changed.', '모델 목
 _message('The terminal is busy or contains unfinished input. Nothing was changed.', '터미널이 대기 상태가 아니거나 작성 중인 입력이 있습니다. 변경하지 않았습니다.')
 _message('The current session already uses {v0}.', '현재 세션은 이미 {v0}입니다.')
 _message('Model change confirmed: {v0}\nThe CLI default model changes as well.', '모델 변경 확인: {v0}\nCLI 기본 모델도 함께 변경됩니다.')
+_message('This was a background agent task, so the main terminal may not show the result. Only a summary appears when it finishes.', '보조 에이전트 일이라 본 터미널에는 결과가 안 보일 수 있어요. 끝나면 요약만 올라와요.')
 _message('The model change is unconfirmed. Nothing was resent automatically. Use /model to check.', '모델 변경 결과 미확인. 자동 재전송하지 않았습니다. /model로 현재 상태를 확인하세요.')
 _message('The model change is unconfirmed. Check the terminal.', '모델 변경 결과 미확인. 터미널 상태를 확인하세요.')
 _message('Voice input: {v0}', '음성 입력: {v0}')

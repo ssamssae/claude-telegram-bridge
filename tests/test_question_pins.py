@@ -196,6 +196,23 @@ class QuestionPinsTest(unittest.TestCase):
         self.assertEqual(self.telegram.calls_for("sendMessage"), [])
         self.assertEqual(len(self.telegram.calls_for("editMessageText")), 1)
 
+    def test_card_from_before_option_rows_keeps_numbered_labels_and_still_unpins(self):
+        # T-261117-001: 보기 기록(options)이 생기기 전 카드도 재기동 뒤 답하면 보기 이름이 남고 고정은 풀린다.
+        self.open(55)
+        self.tick()
+        self.restart()
+        self.b.question_tool = {"tool_id": "tool-55", "session_id": SESSION,
+                                "questions": [{"question": "승인 대상", "header": "승인"}]}
+        self.b.observe_question_record({
+            "type": "user", "sessionId": SESSION,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "tool-55"}]},
+            "toolUseResult": {"answers": {"승인 대상": "승인"}}})
+        self.assertEqual([edit["text"] for edit in self.telegram.calls_for("editMessageText")],
+                         ["❓ 승인 대상\n\n✅ 1. 승인\n2. 거절\n\n✅ 선택: 승인"])
+        self.tick()
+        self.assertEqual(self.telegram.pinned, {999})
+        self.assertEqual(self.b.question_pins, [])
+
     def test_unconfirmed_submission_keeps_visible_question_without_resending(self):
         self.open(55, submitted=True)  # typed answer not yet confirmed by the native record
         self.tick(); self.tick()

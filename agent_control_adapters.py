@@ -284,7 +284,21 @@ class TerminalAdapter:
             # 'waiting'으로 알린다(D200 「입력 대기」). 답하기 버튼(question)은 만들지 않는다 — 그 화면의 키는
             # 브릿지 피드백 카드만 누른다. 예전에는 입력줄이 안 보여 'unknown'(「확인 필요」)이었다.
             feedback = bool(g.get('screen_has_feedback_dialog', lambda _screen: False)(screen))
-            draft = bool(g['composer_residual_text'](screen)) if visible else not (question or feedback)
+            residual = g['composer_residual_text'](screen) if visible else ''
+            draft = bool(residual) if visible else not (question or feedback)
+            suggestion_text = g.get('composer_suggestion_text')
+            if draft and residual and suggestion_text and not (question or feedback):
+                # T-261123-017: 흐린 「다음 할 일 제안」·첫 화면 안내는 사람 초안이 아니다. 색 있는 캡처에서
+                # 입력줄 글자가 모두 흐리고, 색 없는 캡처의 글과 같을 때만 초안이 아니라고 본다. 캡처가
+                # 실패하거나 두 캡처 사이에 글이 바뀌면 지금처럼 초안으로 둔다(사람 초안 보호 우선).
+                # 붙여 넣으면 제안이 사라지고 이어붙지 않는다. 제안만 있을 때 Enter 는 제안을 보내지
+                # 않는다(11/23 작업 노드 시험 세션 실측) — 그래서 보내기에 제안 지우기 단계를 두지 않는다.
+                try:
+                    ghost = suggestion_text(b.repl.capture_pane(80, ansi=True))
+                except Exception:
+                    ghost = ''
+                if ghost and ' '.join(ghost.split()) == ' '.join(residual.split()):
+                    draft = False
             status = 'waiting' if question or feedback else 'busy' if busy else 'idle' if visible else 'unknown'
             capabilities = ['send', 'stop']
             if getattr(b, 'pending', None) or getattr(b, 'clear_watch', None):

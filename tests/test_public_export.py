@@ -181,6 +181,7 @@ class PublicExportTest(unittest.TestCase):
             with_emoji_prefix=lambda text, **kwargs: text,
         )
         bridge.persist_state = mock.Mock()
+        bridge.lock = threading.RLock()  # Bridge.__init__ makes it; the question hold notice reads it.
         bridge.question_card = None
         bridge.question_tool = None
         bridge.question_receipts = []
